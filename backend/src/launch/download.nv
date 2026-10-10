@@ -1,0 +1,280 @@
+package launch
+
+import crypto
+import json
+import os
+import path
+import strings
+import thread
+import core
+
+// HTTP for the launch module, driven by the curl command line tool directly
+// (std/http.request keeps whole bodies in memory and names its temporary
+// files with a counter that is not thread safe; jobs run concurrently).
+//
+// Download rules (from the Java launcher's HttpFetcher):
+//   - the expected hash picks the algorithm by its length: 128 hex = SHA-512,
+//     64 = SHA-256, anything else SHA-1; an empty hash means "existence only"
+//   - a file that already exists with the right hash is not downloaded again
+//   - the body goes to a temporary file next to the target, is checked, then
+//     renamed over the target; 3 attempts with 0.5 s / 1 s backoff
+//   - a final failure is a 502 upstream error
+
+final LAUNCH_DOWNLOAD_ATTEMPTS = 3
+final LAUNCH_BATCH_SIZE = 256
+final LAUNCH_PARALLEL = 16
+
+method launchUserAgent(): string {
+    return "VoltLauncher/" + core.version()
+}
+
+method launchQ(string text): string {
+    return os.shellQuote(text)
+}
+
+method launchTempName(string target): string {
+    return target + ".part-" + crypto.hex(crypto.random(4))
+}
+
+// --- hashes ------------------------------------------------------------------
+
+method launchHashKind(string expected): string {
+    var n = expected.trim().length()
+    if (n == 128) {
+        return "sha512"
+    }
+    if (n == 64) {
+        return "sha256"
+    }
+    return "sha1"
+}
+
+// Lower case hex digest of a file ("" when it cannot be computed).
+method launchFileDigest(string file, string kind): string {
+    if (kind == "sha1") {
+        return crypto.hex(crypto.sha1(os.readFile(file)))
+    }
+    if (kind == "sha256") {
+        return crypto.hex(crypto.sha256(os.readFile(file)))
+    }
+    // SHA-512 has no native in std/crypto: ask the system tools.
+    var text = ""
+    if (launchIsWindows()) {
+        var lines = os.run("certutil -hashfile " + launchQ(file) + " SHA512")["output"].split("\n")
+        if (lines.length() >= 2) {
+            text = lines[1].replace(" ", "").trim()
+        }
+    } else {
+        var out = os.run("sha512sum " + launchQ(file) + launchQuietNull())["output"].trim()
+        if (out == "") {
+            out = os.run("shasum -a 512 " + launchQ(file) + launchQuietNull())["output"].trim()
+        }
+        var words = strings.words(out)
+        if (words.length() > 0) {
+            text = words[0]
+        }
+    }
+    return text.toLower()
+}
+
+// The file exists and (when a hash is given) has it.
+method launchHashOk(string file, string expected): bool {
+    if (os.isFile(file) == false) {
+        return false
+    }
+    var want = expected.trim().toLower()
+    if (want == "") {
+        return true
+    }
+    return launchFileDigest(file, launchHashKind(want)) == want
+}
+
+// --- curl ----------------------------------------------------------------------
+
+// One GET into `target`: {status, error}. status 0 = transport failure.
+method launchCurl(string url, string target): map<string, object> {
+    var errFile = target + ".err"
+    var cmd = "curl -sS -L --max-redirs 10 --connect-timeout 20 -A " + launchQ(launchUserAgent())
+    cmd = cmd + " -o " + launchQ(target) + " --stderr " + launchQ(errFile)
+    cmd = cmd + " -w " + launchQ("%{http_code}") + " " + launchQ(url)
+    var result = os.run(cmd)
+    var statusText = result["output"].trim()
+    var status = 0
+    if (statusText != "" && strings.isNumeric(statusText) && statusText.contains(".") == false) {
+        status = parseInt(statusText)
+    }
+    var error = ""
+    if (os.isFile(errFile)) {
+        error = os.readFile(errFile).trim()
+        os.remove(errFile)
+    }
+    if (status == 0 && error == "") {
+        error = "curl failed with exit code " + result["code"] + " (is curl installed?)"
+    }
+    return {"status": status, "error": error}
+}
+
+method launchRetryable(integer status): bool {
+    return status == 0 || status == 408 || status == 429 || status >= 500
+}
+
+method launchDescribe(map<string, object> result): string {
+    if (result["status"] == 0) {
+        return result["error"]
+    }
+    return "HTTP " + result["status"]
+}
+
+// GET as text; 502 after the attempts are used up.
+method launchFetchText(string url): string {
+    var last = ""
+    var attempt = 1
+    while (attempt <= LAUNCH_DOWNLOAD_ATTEMPTS) {
+        var temp = path.join(os.temp(), "volt-launch-" + crypto.hex(crypto.random(6)) + ".body")
+        var result = launchCurl(url, temp)
+        var status = result["status"]
+        if (status >= 200 && status < 300) {
+            var text = os.readFile(temp)
+            os.remove(temp)
+            return text
+        }
+        os.remove(temp)
+        last = launchDescribe(result)
+        if (launchRetryable(status) == false) {
+            break
+        }
+        if (attempt < LAUNCH_DOWNLOAD_ATTEMPTS) {
+            thread.sleep(500 * attempt)
+        }
+        attempt = attempt + 1
+    }
+    core.upstream("GET " + url + " failed: " + last)
+    return ""
+}
+
+method launchFetchJson(string url): object {
+    var text = launchFetchText(url)
+    var value = json.tryParse(text)
+    if (core.isNull(value)) {
+        core.upstream("GET " + url + ": the answer is not valid JSON")
+    }
+    return value
+}
+
+// Moves a checked temporary file over the target.
+method launchReplace(string temp, string target): bool {
+    if (launchIsWindows() && os.exists(target)) {
+        os.remove(target)
+    }
+    if (os.rename(temp, target)) {
+        return true
+    }
+    os.remove(temp)
+    return false
+}
+
+// Downloads `url` to `target` unless it is already there with `hash`.
+// Returns true when something was downloaded; a failure is a 502.
+method launchDownload(string url, string target, string hash): bool {
+    if (launchHashOk(target, hash)) {
+        return false
+    }
+    launchEnsureDir(path.dirname(target))
+    var want = hash.trim().toLower()
+    var last = ""
+    var attempt = 1
+    while (attempt <= LAUNCH_DOWNLOAD_ATTEMPTS) {
+        var temp = launchTempName(target)
+        var result = launchCurl(url, temp)
+        var status = result["status"]
+        if (status >= 200 && status < 300) {
+            if (want == "" || launchFileDigest(temp, launchHashKind(want)) == want) {
+                if (launchReplace(temp, target)) {
+                    return true
+                }
+                last = "cannot move the download to '" + target + "'"
+            } else {
+                last = "hash mismatch (expected " + want + ")"
+            }
+        } else {
+            last = launchDescribe(result)
+        }
+        os.remove(temp)
+        if (status != 0 && launchRetryable(status) == false && last.startsWith("HTTP")) {
+            break
+        }
+        if (attempt < LAUNCH_DOWNLOAD_ATTEMPTS) {
+            thread.sleep(500 * attempt)
+        }
+        attempt = attempt + 1
+    }
+    core.upstream("download of " + url + " failed: " + last)
+    return false
+}
+
+// A curl config file value: double quoted, \ and " escaped.
+method launchCurlConfigValue(string text): string {
+    return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+}
+
+// Downloads many files: items are maps {url, path, hash}, all of them
+// missing or wrong already. Runs curl --parallel (16 transfers) over chunks
+// of LAUNCH_BATCH_SIZE, checks every file, and retries what failed one by one
+// with the normal rules. Reports progress between `from` and `to` and honours
+// cancel requests between chunks.
+method launchDownloadMany(array items, string jobId, float from, float to, string label) {
+    var total = items.length()
+    if (total == 0) {
+        return
+    }
+    var done = 0
+    var start = 0
+    while (start < total) {
+        core.checkCancelled(jobId)
+        var end = start + LAUNCH_BATCH_SIZE
+        if (end > total) {
+            end = total
+        }
+        var config = ""
+        var temps = []
+        var i = start
+        while (i < end) {
+            var item = items[i]
+            var temp = launchTempName(item["path"])
+            temps.append(temp)
+            launchEnsureDir(path.dirname(item["path"]))
+            config = config + "url = " + launchCurlConfigValue(item["url"]) + "\n"
+            config = config + "output = " + launchCurlConfigValue(temp) + "\n"
+            i = i + 1
+        }
+        var configFile = path.join(os.temp(), "volt-launch-" + crypto.hex(crypto.random(6)) + ".curl")
+        os.writeFile(configFile, config)
+        var cmd = "curl --parallel --parallel-max " + LAUNCH_PARALLEL + " -sS -L --fail --connect-timeout 20"
+        cmd = cmd + " --retry 2 -A " + launchQ(launchUserAgent()) + " -K " + launchQ(configFile)
+        os.run(cmd + launchQuietNull())
+        os.remove(configFile)
+
+        i = start
+        while (i < end) {
+            var item = items[i]
+            var temp = temps[i - start]
+            var placed = false
+            if (os.isFile(temp)) {
+                var want = item["hash"].trim().toLower()
+                if (want == "" || launchFileDigest(temp, launchHashKind(want)) == want) {
+                    placed = launchReplace(temp, item["path"])
+                } else {
+                    os.remove(temp)
+                }
+            }
+            if (placed == false) {
+                launchDownload(item["url"], item["path"], item["hash"])
+            }
+            i = i + 1
+        }
+        done = end
+        start = end
+        var share = core.toFloat(done) / core.toFloat(total)
+        core.jobProgress(jobId, from + (to - from) * share, label + " " + done + " / " + total)
+    }
+}

@@ -1,0 +1,61 @@
+package core
+
+import log
+import os
+import path
+
+// Process wide configuration, fixed once at startup by main.
+
+final VERSION = "0.1.0"
+
+var dataDirectory = ""
+var testRoutesEnabled = false
+
+// Creates the data directory layout and loads the persisted stores.
+method init(string dataDir, bool testRoutes) {
+    dataDirectory = path.normalize(dataDir)
+    testRoutesEnabled = testRoutes
+    ensureDir(dataDirectory)
+    ensureDir(profilesRoot())
+    loadSettings()
+    loadProfiles()
+}
+
+method dataDir(): string {
+    return dataDirectory
+}
+
+method version(): string {
+    return VERSION
+}
+
+method testRoutes(): bool {
+    return testRoutesEnabled
+}
+
+// <dataDir>/profiles - one game directory per profile below it.
+method profilesRoot(): string {
+    return path.join(dataDirectory, "profiles")
+}
+
+// Creates `dir` with its parents; a failure is a 500.
+method ensureDir(string dir): string {
+    if (os.isDir(dir) == false && os.mkdir(dir) == false) {
+        internal("cannot create directory '${dir}'")
+    }
+    return dir
+}
+
+// --- logging (stderr, with ISO timestamps) ------------------------------------
+
+method logInfo(string message) {
+    log.info(message)
+}
+
+method logWarn(string message) {
+    log.warn(message)
+}
+
+method logError(string message) {
+    log.error(message)
+}

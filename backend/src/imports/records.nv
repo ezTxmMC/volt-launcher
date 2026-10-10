@@ -1,0 +1,221 @@
+package imports
+
+import arrays
+import core
+import crypto
+import os
+import path
+
+// Profile records: what a launcher reader maps an instance to. A record is a map with
+//   launcher, path (shown to the user), key (stable id), name, minecraftVersion,
+//   loader, loaderVersion (text or null), javaPath (text or null), jvmArgs (text),
+//   memoryMb (integer or null), gameDir (the folder that gets copied, "" for none),
+//   importable (bool), reason (why not, "" when importable), notes (array of text).
+// Readers call refuse() for anything the import cannot do; finishRecord() runs last.
+
+method keyFor(string launcher, string source): string {
+    return crypto.hex(crypto.sha256(launcher + "|" + source)).substring(0, 16)
+}
+
+method newRecord(string launcher, string location, string keySource, string name): map<string, object> {
+    return {
+        "launcher": launcher,
+        "path": location,
+        "key": keyFor(launcher, keySource),
+        "name": name,
+        "minecraftVersion": "",
+        "loader": "",
+        "loaderVersion": core.none(),
+        "javaPath": core.none(),
+        "jvmArgs": "",
+        "memoryMb": core.none(),
+        "gameDir": "",
+        "importable": true,
+        "reason": "",
+        "notes": []
+    }
+}
+
+// Marks a record as not importable. The first reason stays.
+method refuse(map<string, object> rec, string reason) {
+    if (rec["importable"] == true) {
+        rec["importable"] = false
+        rec["reason"] = reason
+    }
+}
+
+method addNote(map<string, object> rec, string text) {
+    array notes = rec["notes"]
+    notes.append(text)
+    rec["notes"] = notes
+}
+
+// Last checks: a name, a Minecraft version, a known loader, and a game folder that is
+// a real folder (a link is never followed).
+method finishRecord(map<string, object> rec) {
+    var gameDir = rec["gameDir"]
+    if (gameDir != "" && os.isSymlink(gameDir)) {
+        refuse(rec, "the game folder is a symbolic link: links are not followed")
+    } else if (gameDir != "" && os.isDir(gameDir) == false) {
+        refuse(rec, "the game folder does not exist")
+    }
+    if (rec["name"] == "") {
+        rec["name"] = path.basename(rec["path"])
+    }
+    if (rec["minecraftVersion"] == "") {
+        refuse(rec, "the Minecraft version is not recorded")
+    }
+    if (LOADER_IDS.contains(rec["loader"]) == false) {
+        refuse(rec, "the loader '" + rec["loader"] + "' is not supported")
+    }
+}
+
+// A record for an entry that is a symbolic link: listed, never followed.
+method linkRecord(string launcher, string folder, string name): map<string, object> {
+    var rec = newRecord(launcher, folder, folder, name)
+    refuse(rec, "symbolic link: not followed")
+    return rec
+}
+
+// The loader id of a name such as "Fabric" or "neoforge"; "" when it is not a loader id.
+method loaderByName(string text): string {
+    var name = text.trim().toLower()
+    if (LOADER_IDS.contains(name)) {
+        return name
+    }
+    return ""
+}
+
+// --- reading JSON values (a missing key, null or a wrong type reads as absent) ---------
+
+// The text of a JSON value: strings as they are, whole numbers as text, anything else "".
+method textValue(object value): string {
+    var kind = typeOf(value)
+    if (kind == "string") {
+        return value
+    }
+    if (kind == "integer") {
+        return "" + value
+    }
+    if (kind == "float" && core.isWholeNumber(value)) {
+        return "" + core.toInteger(value)
+    }
+    return ""
+}
+
+method textOf(object m, string key): string {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return ""
+    }
+    return textValue(m[key])
+}
+
+method boolOf(object m, string key, bool fallback): bool {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return fallback
+    }
+    var value = m[key]
+    if (core.isBool(value)) {
+        return value
+    }
+    return fallback
+}
+
+// true, a non-zero number, or the text "true" or "1" (SQLite returns 0 and 1 for booleans).
+method truthy(object value): bool {
+    if (core.isBool(value)) {
+        return value
+    }
+    if (typeOf(value) == "integer") {
+        return value != 0
+    }
+    if (core.isString(value)) {
+        return value == "true" || value == "1"
+    }
+    return false
+}
+
+method mapAt(object m, string key): map<string, object> {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return {}
+    }
+    var value = m[key]
+    if (core.isMap(value)) {
+        return value
+    }
+    return {}
+}
+
+method arrayAt(object m, string key): array {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return []
+    }
+    var value = m[key]
+    if (core.isArray(value)) {
+        return value
+    }
+    return []
+}
+
+// --- folders -------------------------------------------------------------------------------
+
+// The entries of `dir` (sorted by name) that are instance folders: a directory that holds
+// `marker`. A symbolic link is returned too, flagged, so the reader can report it.
+// Each entry is {"name", "folder", "link"}. A missing `dir` gives [].
+method instanceFolders(string dir, string marker): array {
+    var found = []
+    if (os.isDir(dir) == false) {
+        return found
+    }
+    for (name in arrays.sort(os.listDir(dir))) {
+        var folder = path.join(dir, name)
+        if (os.isSymlink(folder)) {
+            found.append({"name": name, "folder": folder, "link": true})
+        } else if (os.isDir(folder) && os.isFile(path.join(folder, marker))) {
+            found.append({"name": name, "folder": folder, "link": false})
+        }
+    }
+    return found
+}
+
+// The bytes and entries below `root`, links not followed. The count stops early (complete
+// false) past maxEntries or maxBytes; 0 means no limit for that measure.
+method measureTree(string root, integer maxEntries, integer maxBytes): map<string, object> {
+    var state = {"bytes": 0, "entries": 0, "complete": true}
+    measureWalk(root, maxEntries, maxBytes, state)
+    return state
+}
+
+method measureWalk(string dir, integer maxEntries, integer maxBytes, map<string, object> state) {
+    for (name in os.listDir(dir)) {
+        if (state["complete"] == false) {
+            return
+        }
+        var full = path.join(dir, name)
+        if (os.isSymlink(full)) {
+            continue
+        }
+        state["entries"] = state["entries"] + 1
+        if (maxEntries > 0 && state["entries"] > maxEntries) {
+            state["complete"] = false
+            return
+        }
+        if (os.isDir(full)) {
+            measureWalk(full, maxEntries, maxBytes, state)
+        } else if (os.isFile(full)) {
+            state["bytes"] = state["bytes"] + os.fileSize(full)
+            if (maxBytes > 0 && state["bytes"] > maxBytes) {
+                state["complete"] = false
+                return
+            }
+        }
+    }
+}
+
+// Whether a folder is, contains or lies inside the VoltLauncher data folder.
+method overlapsDataDir(string folder): bool {
+    var sep = path.separator()
+    var data = path.normalize(core.dataDir())
+    var game = path.normalize(folder)
+    return game == data || game.startsWith(data + sep) || data.startsWith(game + sep)
+}

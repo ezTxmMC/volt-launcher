@@ -1,0 +1,210 @@
+package server
+
+import json
+import core
+import mods
+import providers
+import launch
+import profilemgmt
+import system
+import accounts
+import gamedata
+import migration
+import logo
+import imports
+import autoprofiles
+
+// Routing: /api/<segment>/... to the core or a feature module.
+//
+//   /api/health                       server (no token needed)
+//   /api/settings                     core (reset: system for directories)
+//   /api/settings/directories[/...]   system
+//   /api/jobs[/...]                   core
+//   /api/migration                    migration (GET only: the result of the legacy migration)
+//   /api/profiles[/:id]               core
+//   /api/profiles/:id/mods/...        mods
+//   /api/profiles/:id/content/<type>/...   mods (types mods, resourcepacks, shaderpacks, datapacks)
+//   /api/profiles/:id/content/install      providers
+//   /api/profiles/:id/modpack[/...], /export   providers (modpack.nv, export.nv)
+//   /api/modpacks/import              providers (modpack.nv)
+//   /api/profiles/:id/install-game    launch
+//   /api/profiles/:id/launch          launch
+//   /api/profiles/:id/worlds|servers|screenshots|logs|backups/...   gamedata
+//   /api/profiles/:id/game[/...]      launch
+//   /api/providers/...                providers
+//   /api/java                         launch
+//   /api/java/runtimes[/...]          system
+//   /api/updates[/...]                system
+//   /api/integrations/discord         system
+//   /api/platforms                    system
+//   /api/imports/scan, /api/imports   imports (profiles of other launchers)
+//   /api/accounts[/...], /api/skins[/...]   accounts
+//   /api/_test/...                    core test routes (only with --enable-test-routes)
+//
+// Every route gets the segments after /api, the query map and the parsed
+// JSON body (null when the request has none) and returns
+// {"status": ..., "body": ...} or raises through core.fail().
+
+// Runs one request with runtime errors trapped (see core/errors.nv).
+define class RouteTask {
+    private Request request: get, set
+
+    method run(): object {
+        return dispatch(request)
+    }
+}
+
+// {"status": integer, "body": object} for a request; never raises.
+method handle(Request request, string token): map<string, object> {
+    var segments = pathSegments(request.pathname())
+    if (segments.length() == 0 || segments[0] != "api") {
+        return core.respond(404, core.errorBody("not_found", "no such endpoint: " + request.pathname()))
+    }
+    var isHealth = segments.length() == 2 && segments[1] == "health"
+    if (isHealth == false && tokenMatches(request.headers(), token) == false) {
+        // "unauthorized" is not in the contract's code list; 401 has no better fit.
+        return core.respond(401, core.errorBody("unauthorized", "missing or invalid X-Volt-Token"))
+    }
+    var outcome = core.runTrapped(RouteTask{request = request})
+    if (outcome.failed()) {
+        var failure = core.decodeFailure(outcome.error())
+        if (failure["status"] >= 500) {
+            core.logError(request.verb() + " " + request.pathname() + ": " + failure["message"])
+        }
+        return core.respond(failure["status"], core.errorBody(failure["code"], failure["message"]))
+    }
+    var result = outcome.result()
+    if (typeOf(result) != "map" || result.has("status") == false || result.has("body") == false) {
+        return core.respond(500, core.errorBody("internal", "route returned no {status, body}"))
+    }
+    return result
+}
+
+// Compares the token without stopping at the first difference.
+method tokenMatches(map<string, string> headers, string token): bool {
+    if (headers.has("x-volt-token") == false) {
+        return false
+    }
+    var given = headers["x-volt-token"]
+    if (given.length() != token.length() || token == "") {
+        return false
+    }
+    var difference = 0
+    var i = 0
+    while (i < token.length()) {
+        difference = difference | (ord(given.charAt(i)) ^ ord(token.charAt(i)))
+        i = i + 1
+    }
+    return difference == 0
+}
+
+// The request body as JSON: null when empty, 400 when not valid JSON.
+method parseBody(Request request): object {
+    var text = request.body().trim()
+    if (text == "") {
+        return core.none()
+    }
+    if (json.isValid(text) == false) {
+        core.badRequest("request body is not valid JSON")
+    }
+    return json.parse(text)
+}
+
+method dispatch(Request request): map<string, object> {
+    var verb = request.verb()
+    var all = pathSegments(request.pathname())
+    var segments = []
+    var i = 1
+    while (i < all.length()) {
+        segments.append(all[i])
+        i = i + 1
+    }
+    var query = request.query()
+    if (segments.length() == 0) {
+        core.notFound("no such endpoint: " + request.pathname())
+    }
+    var body = parseBody(request)
+    var first = segments[0]
+
+    if (first == "health") {
+        if (segments.length() != 1) {
+            core.notFound("no such endpoint")
+        }
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok({"status": "ok", "version": core.version(), "dataDir": core.dataDir()})
+    }
+    if (first == "settings") {
+        if (segments.length() > 1 && segments[1] == "directories") {
+            return system.route(verb, segments, query, body)
+        }
+        return core.settingsRoute(verb, segments, query, body)
+    }
+    if (first == "updates" || first == "integrations" || first == "platforms") {
+        return system.route(verb, segments, query, body)
+    }
+    if (first == "migration") {
+        return migration.route(verb, segments, query, body)
+    }
+    if (first == "jobs") {
+        return core.jobsRoute(verb, segments, query, body)
+    }
+    if (first == "profiles") {
+        if (segments.length() <= 2) {
+            return profilemgmt.route(verb, segments, query, body)
+        }
+        var section = segments[2]
+        if (section == "duplicate" || section == "icon" || section == "verify") {
+            return profilemgmt.route(verb, segments, query, body)
+        }
+        if (section == "logo") {
+            return logo.route(verb, segments, query, body)
+        }
+        if (section == "mods") {
+            return mods.route(verb, segments, query, body)
+        }
+        if (section == "content") {
+            // content/install belongs to providers; content/<type>... to mods (content types).
+            if (segments.length() > 3 && segments[3] != "install") {
+                return mods.route(verb, segments, query, body)
+            }
+            return providers.route(verb, segments, query, body)
+        }
+        if (section == "modpack" || section == "export") {
+            return providers.route(verb, segments, query, body)
+        }
+        if (section == "install-game" || section == "launch" || section == "game") {
+            return launch.route(verb, segments, query, body)
+        }
+        if (section == "worlds" || section == "servers" || section == "screenshots" || section == "logs" || section == "backups") {
+            return gamedata.route(verb, segments, query, body)
+        }
+        return core.notFound("no such endpoint: " + request.pathname())
+    }
+    if (first == "versions" || first == "loader-versions") {
+        return profilemgmt.route(verb, segments, query, body)
+    }
+    if (first == "imports") {
+        return imports.route(verb, segments, query, body)
+    }
+    if (first == "providers" || first == "modpacks") {
+        return providers.route(verb, segments, query, body)
+    }
+    if (first == "java") {
+        if (segments.length() > 1 && segments[1] == "runtimes") {
+            return system.route(verb, segments, query, body)
+        }
+        return launch.route(verb, segments, query, body)
+    }
+    if (first == "accounts" || first == "skins") {
+        return accounts.route(verb, segments, query, body)
+    }
+    if (first == "autoprofiles") {
+        return autoprofiles.route(verb, segments, query, body)
+    }
+    if (first == "_test" && core.testRoutes()) {
+        return core.testRoute(verb, segments, query, body)
+    }
+    return core.notFound("no such endpoint: " + request.pathname())
+}

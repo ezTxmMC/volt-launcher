@@ -1,0 +1,562 @@
+package launch
+
+import json
+import os
+import path
+import strings
+import core
+
+// Version metadata: Mojang's manifest, inheritance, and the loader profiles
+// of Fabric, Quilt, Forge and NeoForge merged on top of vanilla.
+//
+// Version ids:
+//   vanilla           the Minecraft version ("1.21.1")
+//   fabric / quilt    "<loader>:<mc>:<loaderVersion>" (as the Java launcher)
+//   forge / neoforge  the id of the installer's version.json
+//                     ("1.21.1-forge-52.0.16", "neoforge-21.1.77"); that is the
+//                     folder the official installer writes and the name the
+//                     loader's own arguments (-DignoreList=...${version_name}.jar)
+//                     expect for the client jar copy.
+//
+// Caching: the vanilla JSON is kept at versions/<id>/<id>.json and checked
+// against the manifest's sha1; Fabric/Quilt profiles at
+// versions/<folder>/<folder>.json (immutable per loader build). When the
+// manifest cannot be fetched, the cached files are used (offline launch).
+
+final LAUNCH_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+final LAUNCH_FABRIC_META = "https://meta.fabricmc.net/v2/versions/loader/"
+final LAUNCH_QUILT_META = "https://meta.quiltmc.org/v3/versions/loader/"
+final LAUNCH_FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge/"
+final LAUNCH_NEOFORGE_MAVEN = "https://maven.neoforged.net/releases/net/neoforged/neoforge/"
+
+define class LaunchFetchJsonTask {
+    private string url: get, set
+
+    method run(): object {
+        return launchFetchJson(url)
+    }
+}
+
+// 422 with the contract's error shape (the code list has no own entry).
+method launchUnprocessable(string message): object {
+    return core.fail(422, "bad_request", message)
+}
+
+method launchReadJsonMap(string file): map<string, object> {
+    var value = core.readJsonFile(file, core.none())
+    if (core.isMap(value) == false) {
+        core.internal("cannot read '" + file + "'")
+    }
+    return value
+}
+
+method launchWriteJson(string file, object value) {
+    var problem = core.writeFileAtomic(file, json.stringify(value))
+    if (problem != "") {
+        core.internal("cannot write '" + file + "': " + problem)
+    }
+}
+
+// --- vanilla -------------------------------------------------------------------
+
+// The version manifest, or null when it cannot be fetched.
+method launchManifestOrNull(): object {
+    var outcome = core.runTrapped(LaunchFetchJsonTask{url = LAUNCH_MANIFEST_URL})
+    if (outcome.failed()) {
+        core.logWarn("launch: version manifest unavailable: " + core.decodeFailure(outcome.error())["message"])
+        return core.none()
+    }
+    return outcome.result()
+}
+
+method launchManifestEntry(object manifest, string id): object {
+    if (core.isMap(manifest) == false || core.isArray(core.getOr(manifest, "versions", 0)) == false) {
+        return core.none()
+    }
+    for (entry in manifest["versions"]) {
+        if (core.isMap(entry) && core.getOr(entry, "id", "") == id) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// The version JSON of one Minecraft version as Mojang publishes it.
+method launchVanillaRaw(string id, object manifest): map<string, object> {
+    var cache = launchVersionJson(id)
+    if (core.isMap(manifest)) {
+        var entry = launchManifestEntry(manifest, id)
+        if (core.isNull(entry)) {
+            if (os.isFile(cache)) {
+                return launchReadJsonMap(cache)
+            }
+            launchUnprocessable("Minecraft version '" + id + "' does not exist")
+        }
+        launchDownload(entry["url"], cache, core.getOr(entry, "sha1", ""))
+        return launchReadJsonMap(cache)
+    }
+    if (os.isFile(cache)) {
+        core.logWarn("launch: using the cached metadata of " + id + " (offline)")
+        return launchReadJsonMap(cache)
+    }
+    core.upstream("the Minecraft version manifest cannot be fetched and " + id + " is not cached")
+    return {}
+}
+
+// Resolves `id` with its inheritsFrom chain.
+method launchVanillaMeta(string id, object manifest): map<string, object> {
+    return launchVanillaChain(id, manifest, [])
+}
+
+method launchVanillaChain(string id, object manifest, array visited): map<string, object> {
+    if (visited.contains(id)) {
+        core.internal("circular version inheritance at " + id)
+    }
+    visited.append(id)
+    var raw = launchVanillaRaw(id, manifest)
+    var parentId = core.getOr(raw, "inheritsFrom", "")
+    if (core.isString(parentId) && parentId != "") {
+        return launchMergeInherit(launchVanillaChain(parentId, manifest, visited), raw)
+    }
+    return raw
+}
+
+method launchAppendAll(array target, object source) {
+    if (core.isArray(source)) {
+        for (item in source) {
+            target.append(core.copyJson(item))
+        }
+    }
+}
+
+method launchArgList(object arguments, string key): object {
+    if (core.isMap(arguments)) {
+        return core.getOr(arguments, key, core.none())
+    }
+    return core.none()
+}
+
+// {game, jvm}: parent's entries then child's; null when both are empty.
+method launchMergeArguments(object parentArgs, object childArgs): object {
+    var merged = {}
+    for (key in ["game", "jvm"]) {
+        var list = []
+        launchAppendAll(list, launchArgList(parentArgs, key))
+        launchAppendAll(list, launchArgList(childArgs, key))
+        if (list.length() > 0) {
+            merged[key] = list
+        }
+    }
+    if (merged.length() == 0) {
+        return core.none()
+    }
+    return merged
+}
+
+method launchMergeObjects(map<string, object> parent, map<string, object> child): map<string, object> {
+    var merged = core.copyJson(parent)
+    for (key in child) {
+        var value = child[key]
+        if (core.isMap(value) && core.isMap(core.getOr(merged, key, 0))) {
+            merged[key] = launchMergeObjects(merged[key], value)
+        } else {
+            merged[key] = core.copyJson(value)
+        }
+    }
+    return merged
+}
+
+// Mojang's inheritance: libraries and arguments concatenated (parent
+// first), objects deep-merged, everything else from the child.
+method launchMergeInherit(map<string, object> parent, map<string, object> child): map<string, object> {
+    var merged = core.copyJson(parent)
+    if (parent.has("libraries") || child.has("libraries")) {
+        var libraries = []
+        launchAppendAll(libraries, core.getOr(parent, "libraries", core.none()))
+        launchAppendAll(libraries, core.getOr(child, "libraries", core.none()))
+        merged["libraries"] = libraries
+    }
+    if (parent.has("arguments") || child.has("arguments")) {
+        var args = launchMergeArguments(core.getOr(parent, "arguments", core.none()), core.getOr(child, "arguments", core.none()))
+        if (core.isNull(args) == false) {
+            merged["arguments"] = args
+        }
+    }
+    for (key in child) {
+        if (key == "inheritsFrom" || key == "libraries" || key == "arguments") {
+            continue
+        }
+        var value = child[key]
+        if (core.isMap(value) && core.isMap(core.getOr(merged, key, 0))) {
+            merged[key] = launchMergeObjects(merged[key], value)
+        } else {
+            merged[key] = core.copyJson(value)
+        }
+    }
+    merged["id"] = child["id"]
+    return merged
+}
+
+// --- loader profiles -------------------------------------------------------------
+
+// group:artifact:version[:classifier] -> group:artifact[:classifier]
+method launchLibraryKey(string name): string {
+    var parts = name.split(":")
+    if (parts.length() < 3) {
+        return name
+    }
+    var key = parts[0] + ":" + parts[1]
+    if (parts.length() >= 4) {
+        key = key + ":" + parts[3]
+    }
+    return key
+}
+
+// Merges a loader profile (Fabric/Quilt profile, Forge/NeoForge version.json)
+// into resolved vanilla metadata, in place: the profile's inheritsFrom is
+// ignored; libraries are appended and de-duplicated by
+// group:artifact[:classifier] (first position, last value, so the loader's
+// ASM wins over Mojang's); arguments concatenated; mainClass,
+// minecraftArguments and javaVersion overwritten.
+method launchMergeProfile(map<string, object> base, map<string, object> profile) {
+    var all = []
+    launchAppendAll(all, core.getOr(base, "libraries", core.none()))
+    launchAppendAll(all, core.getOr(profile, "libraries", core.none()))
+    if (all.length() > 0) {
+        var order = []
+        var byKey = {}
+        var unnamed = []
+        for (lib in all) {
+            if (core.isMap(lib) == false) {
+                continue
+            }
+            var name = core.getOr(lib, "name", "")
+            if (core.isString(name) == false || name.trim() == "") {
+                unnamed.append(lib)
+                continue
+            }
+            var key = launchLibraryKey(name.trim())
+            if (byKey.has(key) == false) {
+                order.append(key)
+            }
+            byKey[key] = lib
+        }
+        var libraries = []
+        for (key in order) {
+            libraries.append(byKey[key])
+        }
+        for (lib in unnamed) {
+            libraries.append(lib)
+        }
+        base["libraries"] = libraries
+    }
+    if (base.has("arguments") || profile.has("arguments")) {
+        var args = launchMergeArguments(core.getOr(base, "arguments", core.none()), core.getOr(profile, "arguments", core.none()))
+        if (core.isNull(args) == false) {
+            base["arguments"] = args
+        }
+    }
+    for (key in ["mainClass", "minecraftArguments", "javaVersion"]) {
+        if (profile.has(key) && core.isNull(profile[key]) == false) {
+            base[key] = core.copyJson(profile[key])
+        }
+    }
+}
+
+// --- version ordering --------------------------------------------------------------
+
+method launchIsStableVersion(string version): bool {
+    var lower = version.toLower()
+    for (marker in ["alpha", "beta", "rc", "pre", "snapshot"]) {
+        if (lower.contains(marker)) {
+            return false
+        }
+    }
+    return true
+}
+
+// Numeric-aware comparison of dotted versions: -1, 0, 1.
+method launchCompareVersions(string a, string b): integer {
+    var left = a.replace("-", ".").replace("+", ".").replace("_", ".").split(".")
+    var right = b.replace("-", ".").replace("+", ".").replace("_", ".").split(".")
+    var i = 0
+    while (i < left.length() || i < right.length()) {
+        if (i >= left.length()) {
+            return -1
+        }
+        if (i >= right.length()) {
+            return 1
+        }
+        var x = left[i]
+        var y = right[i]
+        var xNumeric = x != "" && strings.isNumeric(x) && x.contains(".") == false && x.contains("-") == false
+        var yNumeric = y != "" && strings.isNumeric(y) && y.contains(".") == false && y.contains("-") == false
+        if (xNumeric && yNumeric) {
+            var xi = parseInt(x)
+            var yi = parseInt(y)
+            if (xi != yi) {
+                if (xi < yi) {
+                    return -1
+                }
+                return 1
+            }
+        } else if (xNumeric) {
+            return 1
+        } else if (yNumeric) {
+            return -1
+        } else if (x != y) {
+            return strings.compare(x, y)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The newest stable version of a list (the newest of all when none is stable).
+method launchNewest(array versions): string {
+    var best = ""
+    var bestStable = false
+    for (v in versions) {
+        var stable = launchIsStableVersion(v)
+        if (best == "" || (stable && bestStable == false) || (stable == bestStable && launchCompareVersions(v, best) > 0)) {
+            best = v
+            bestStable = stable
+        }
+    }
+    return best
+}
+
+// --- Fabric / Quilt -------------------------------------------------------------------
+
+method launchMetaBase(string loader): string {
+    if (loader == "quilt") {
+        return LAUNCH_QUILT_META
+    }
+    return LAUNCH_FABRIC_META
+}
+
+// The loader version to use: the profile's, else the newest stable one.
+method launchMetaLoaderVersion(string loader, string mc): string {
+    var list = launchFetchJson(launchMetaBase(loader) + mc)
+    if (core.isArray(list) == false || list.length() == 0) {
+        launchUnprocessable("no " + loader + " loader is available for Minecraft " + mc)
+    }
+    var first = ""
+    for (entry in list) {
+        var info = core.getOr(entry, "loader", core.none())
+        if (core.isMap(info) == false) {
+            continue
+        }
+        var version = core.getOr(info, "version", "")
+        if (core.isString(version) == false || version == "") {
+            continue
+        }
+        if (first == "") {
+            first = version
+        }
+        if (core.getOr(info, "stable", true) == true) {
+            return version
+        }
+    }
+    if (first == "") {
+        launchUnprocessable("no " + loader + " loader is available for Minecraft " + mc)
+    }
+    return first
+}
+
+method launchMetaProfile(string loader, string mc, string loaderVersion, string versionId): map<string, object> {
+    var cache = launchVersionJson(versionId)
+    if (os.isFile(cache)) {
+        var cached = core.readJsonFile(cache, core.none())
+        if (core.isMap(cached)) {
+            return cached
+        }
+    }
+    var url = launchMetaBase(loader) + mc + "/" + loaderVersion + "/profile/json"
+    var text = launchFetchText(url)
+    var profile = json.tryParse(text)
+    if (core.isMap(profile) == false) {
+        core.upstream("GET " + url + ": the answer is not a loader profile")
+    }
+    launchEnsureDir(path.dirname(cache))
+    launchWriteJson(cache, profile)
+    return profile
+}
+
+// --- Forge / NeoForge ----------------------------------------------------------------
+
+method launchMavenBase(string loader): string {
+    if (loader == "neoforge") {
+        return LAUNCH_NEOFORGE_MAVEN
+    }
+    return LAUNCH_FORGE_MAVEN
+}
+
+// 1.21.1 -> 21.1, 1.21 -> 21.0 (NeoForge's numbering).
+method launchNeoForgePrefix(string mc): string {
+    if (mc.startsWith("1.") == false) {
+        return mc
+    }
+    var tail = mc.substring(2, mc.length())
+    if (tail.contains(".")) {
+        return tail
+    }
+    return tail + ".0"
+}
+
+// The loader versions published for `mc` (loader-relative: "52.0.16", "21.1.77").
+method launchMavenLoaderVersions(string loader, string mc): array {
+    var xml = launchFetchText(launchMavenBase(loader) + "maven-metadata.xml")
+    var found = []
+    var rest = xml
+    while (true) {
+        var open = rest.indexOf("<version>")
+        if (open < 0) {
+            break
+        }
+        rest = rest.substring(open + 9, rest.length())
+        var close = rest.indexOf("</version>")
+        if (close < 0) {
+            break
+        }
+        var version = rest.substring(0, close).trim()
+        rest = rest.substring(close + 10, rest.length())
+        if (version == "") {
+            continue
+        }
+        if (version.startsWith(mc + "-")) {
+            // Forge, and NeoForge's first line (1.20.1-47.1.x)
+            found.append(version.substring(mc.length() + 1, version.length()))
+        } else if (loader == "neoforge") {
+            var prefix = launchNeoForgePrefix(mc)
+            if (version == prefix || version.startsWith(prefix + ".") || version.startsWith(prefix + "-")) {
+                found.append(version)
+            }
+        }
+    }
+    return found
+}
+
+method launchMavenLoaderVersion(string loader, string mc): string {
+    var versions = launchMavenLoaderVersions(loader, mc)
+    if (versions.length() == 0) {
+        launchUnprocessable("no " + loader + " build is available for Minecraft " + mc)
+    }
+    return launchNewest(versions)
+}
+
+// The Maven version of the installer artifact.
+method launchInstallerCoordinate(string loader, string mc, string loaderVersion): string {
+    if (loader == "neoforge" && loaderVersion.startsWith(launchNeoForgePrefix(mc))) {
+        return loaderVersion
+    }
+    return mc + "-" + loaderVersion
+}
+
+method launchInstallerUrl(string loader, string mc, string loaderVersion): string {
+    var coordinate = launchInstallerCoordinate(loader, mc, loaderVersion)
+    var artifact = "forge"
+    if (loader == "neoforge") {
+        artifact = "neoforge"
+        if (coordinate.startsWith(mc + "-")) {
+            // NeoForge 1.20.1 was published under the old Forge artifact name
+            artifact = "forge"
+        }
+    }
+    return launchMavenBase(loader) + coordinate + "/" + artifact + "-" + coordinate + "-installer.jar"
+}
+
+method launchInstallerPath(string loader, string mc, string loaderVersion): string {
+    return path.join(launchInstallersDir(), loader + "-" + launchInstallerCoordinate(loader, mc, loaderVersion) + "-installer.jar")
+}
+
+// The installer's launch profile: version.json, or (old installers) the
+// versionInfo of install_profile.json.
+method launchInstallerProfile(string installer): map<string, object> {
+    var text = launchZipEntryText(installer, "version.json")
+    if (core.isNull(text)) {
+        var install = launchZipEntryText(installer, "install_profile.json")
+        if (core.isNull(install) == false) {
+            var parsed = json.tryParse(install)
+            if (core.isMap(parsed) && core.isMap(core.getOr(parsed, "versionInfo", 0))) {
+                return parsed["versionInfo"]
+            }
+        }
+        launchUnprocessable("the installer " + path.basename(installer) + " has no version.json")
+    }
+    var profile = json.tryParse(text)
+    if (core.isMap(profile) == false || core.isString(core.getOr(profile, "id", 0)) == false) {
+        core.upstream("the version.json of " + path.basename(installer) + " is not valid")
+    }
+    return profile
+}
+
+// --- resolution -----------------------------------------------------------------------
+
+// Resolves what a profile launches:
+//   {versionId, minecraftVersion, loader, loaderVersion, meta, clientJar,
+//    installer (forge/neoforge: the installer jar, else "")}
+// `meta` is the merged metadata; `clientJar` the vanilla client jar.
+method launchResolve(map<string, object> profile, string jobId): map<string, object> {
+    var mc = core.getOr(profile, "minecraftVersion", "")
+    if (core.isString(mc) == false || mc.trim() == "") {
+        core.badRequest("the profile has no minecraftVersion")
+    }
+    mc = mc.trim()
+    var loader = core.getOr(profile, "loader", "vanilla")
+    if (["vanilla", "fabric", "quilt", "forge", "neoforge"].contains(loader) == false) {
+        launchUnprocessable("loader '" + loader + "' is not supported")
+    }
+    var loaderVersion = core.getOr(profile, "loaderVersion", "")
+    if (core.isString(loaderVersion) == false) {
+        loaderVersion = ""
+    }
+    loaderVersion = loaderVersion.trim()
+
+    core.jobProgress(jobId, 0.01, "Lade Versionsdaten für " + mc)
+    var manifest = launchManifestOrNull()
+    var meta = launchVanillaMeta(mc, manifest)
+    var result = {
+        "minecraftVersion": mc,
+        "loader": loader,
+        "loaderVersion": core.none(),
+        "clientJar": launchVersionJar(mc),
+        "installer": ""
+    }
+    if (loader == "vanilla") {
+        result["versionId"] = core.getOr(meta, "id", mc)
+        result["meta"] = meta
+        return result
+    }
+    if (loader == "fabric" || loader == "quilt") {
+        if (loaderVersion == "") {
+            core.jobMessage(jobId, "Suche die neueste " + loader + "-Version")
+            loaderVersion = launchMetaLoaderVersion(loader, mc)
+        }
+        var versionId = loader + ":" + mc + ":" + loaderVersion
+        launchMergeProfile(meta, launchMetaProfile(loader, mc, loaderVersion, versionId))
+        meta["id"] = versionId
+        meta["jar"] = mc
+        result["versionId"] = versionId
+        result["loaderVersion"] = loaderVersion
+        result["meta"] = meta
+        return result
+    }
+    // forge / neoforge
+    if (loaderVersion == "") {
+        core.jobMessage(jobId, "Suche die neueste " + loader + "-Version")
+        loaderVersion = launchMavenLoaderVersion(loader, mc)
+    }
+    var installer = launchInstallerPath(loader, mc, loaderVersion)
+    core.jobMessage(jobId, "Lade den " + loader + "-Installer")
+    launchDownload(launchInstallerUrl(loader, mc, loaderVersion), installer, "")
+    var loaderProfile = launchInstallerProfile(installer)
+    launchMergeProfile(meta, loaderProfile)
+    meta["id"] = loaderProfile["id"]
+    meta["jar"] = mc
+    result["versionId"] = loaderProfile["id"]
+    result["loaderVersion"] = loaderVersion
+    result["installer"] = installer
+    result["meta"] = meta
+    return result
+}

@@ -1,0 +1,122 @@
+package profilemgmt
+
+import os
+import path
+import core
+import launch
+
+// Duplicating a profile: a new profile with the same settings and a copy of the game
+// directory (mods, configs, worlds) in its managed directory. A custom gameDirectory is
+// not shared with the copy: its files are copied, and the copy uses its own directory.
+// The source is claimed (launch "duplicate" marker) while the copy runs, so it cannot
+// be launched or installed in the meantime.
+
+// The profile fields a copy inherits (the rest is new: id, dates, playtime, favourite).
+final COPIED_FIELDS = ["memoryMb", "javaPath", "jvmArgs", "source", "wrapperCommand", "preLaunchCommand",
+    "postExitCommand", "envVars", "fullscreen", "hideLauncher", "group", "iconUrl"]
+
+// Copies a directory tree. Symbolic links are skipped; a failed file copy raises.
+method copyTree(string from, string to, string jobId) {
+    core.ensureDir(to)
+    for (entry in os.listDir(from)) {
+        var source = path.join(from, entry)
+        var target = path.join(to, entry)
+        if (os.isSymlink(source)) {
+            continue
+        }
+        if (os.isDir(source)) {
+            copyTree(source, target, jobId)
+        } else if (os.copy(source, target) == false) {
+            core.internal("cannot copy '" + source + "'")
+        }
+    }
+}
+
+define class CopyTreeTask {
+    private string from: get, set
+    private string to: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        copyTree(from, to, jobId)
+        return true
+    }
+}
+
+// The whole duplication; returns {profileId, name}. Raises on failure after removing
+// the half-made copy.
+method duplicateProfile(string profileId, string requestedName, string jobId): map<string, object> {
+    var source = core.requireProfile(profileId)
+    var name = requestedName
+    if (name == "") {
+        name = source["name"] + " (Kopie)"
+    }
+    var created = core.createProfile({
+        "name": name,
+        "minecraftVersion": source["minecraftVersion"],
+        "loader": source["loader"],
+        "loaderVersion": core.getOr(source, "loaderVersion", core.none())
+    })
+    var newId = created["id"]
+    var copied = {}
+    for (key in COPIED_FIELDS) {
+        copied[key] = core.getOr(source, key, core.none())
+    }
+    core.patchProfile(newId, copied)
+
+    var sourceDir = source["gameDir"]
+    core.jobProgress(jobId, 0.1, "Kopiere " + name)
+    if (os.isDir(sourceDir)) {
+        var outcome = core.runTrapped(CopyTreeTask{from = sourceDir, to = core.managedProfileDir(newId), jobId = jobId})
+        if (outcome.failed()) {
+            core.deleteProfile(newId)
+            core.raise(outcome.error())
+        }
+    }
+    core.logInfo("profile " + profileId + " duplicated as " + newId)
+    return {"profileId": newId, "name": name}
+}
+
+define class DuplicateTask {
+    private string profileId: get, set
+    private string requestedName: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return duplicateProfile(profileId, requestedName, jobId)
+    }
+}
+
+define class DuplicateJob based JobBody {
+    private string profileId: get, set
+    private string requestedName: get, set
+
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(DuplicateTask{profileId = profileId, requestedName = requestedName, jobId = jobId})
+        launch.launchReleaseProfile(profileId)
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+// POST /api/profiles/:id/duplicate: claims the profile and starts the job.
+method startDuplicate(string id, object body): map<string, object> {
+    core.requireProfile(id)
+    var requested = ""
+    if (core.isMap(body)) {
+        var value = core.getOr(body, "name", "")
+        if (core.isString(value)) {
+            requested = value.trim()
+        }
+    }
+    if (launch.launchIsRunning(id)) {
+        core.conflict("the game of this profile is running")
+    }
+    if (launch.launchClaimProfile(id, "duplicate") == false) {
+        core.conflict("this profile is busy (" + launch.launchGameStatus(id)["phase"] + ")")
+    }
+    var name = core.requireProfile(id)["name"]
+    return core.startJob("profile-duplicate", "Dupliziere " + name, DuplicateJob{profileId = id, requestedName = requested})
+}

@@ -1,0 +1,273 @@
+package providers
+
+import core
+import json
+import mods
+import os
+import path
+import time
+
+// POST /api/profiles/:id/export {format: "mrpack" | "curseforge", name?, version?}
+//
+// Writes a shareable pack into <dataDir>/exports/. A Modrinth .mrpack lists the
+// enabled content files whose store entry names a Modrinth version and whose
+// hash matches that version's file; a CurseForge zip lists the files with a
+// CurseForge project and file id. Every other content file, the configuration
+// folders (config, defaultconfigs, kubejs, scripts, ...) and options.txt go into
+// overrides/. Data packs belong to a world and are not exported. Returns
+// 201 {path, fileName, referenced, bundled, notes}.
+
+final EXPORT_FOLDERS = ["mods", "resourcepacks", "shaderpacks"]
+final EXPORT_CONFIG_DIRS = ["config", "defaultconfigs", "kubejs", "scripts", "openloader", "global_packs", "patchouli_books"]
+final EXPORT_CONFIG_FILES = ["options.txt"]
+
+// The enabled content files of the profile: {folder, fileName, sha1, size, source}.
+method exportContent(string profileId): array {
+    var out = []
+    for (folder in EXPORT_FOLDERS) {
+        var loc = mods.contentLoc(profileId, folder, "")
+        for (f in mods.scanContent(loc)) {
+            if (f["enabled"] == true) {
+                out.append({"folder": folder, "fileName": f["fileName"], "sha1": f["sha1"], "size": f["size"], "source": f["source"]})
+            }
+        }
+    }
+    return out
+}
+
+// The digits of a numeric id, as an integer (only called for isDigits text).
+method digitsValue(string text): integer {
+    integer n = 0
+    for (ch in text) {
+        n = n * 10 + (ord(ch) - 48)
+    }
+    return n
+}
+
+define class ExportVersionTask {
+    private string versionId: get, set
+
+    method run(): object {
+        return mrVersionById(versionId)
+    }
+}
+
+// Modrinth loader key for mrpack dependencies, "" for loaders without one.
+method mrpackLoaderKey(string loader): string {
+    if (loader == "fabric") {
+        return "fabric-loader"
+    }
+    if (loader == "quilt") {
+        return "quilt-loader"
+    }
+    if (loader == "forge" || loader == "neoforge") {
+        return loader
+    }
+    return ""
+}
+
+// The CurseForge modLoaders entry id ("fabric-0.16.5"), "" for vanilla.
+method cfLoaderId(string loader, string loaderVersion): string {
+    if (loaderVersion == "" || loader == "vanilla") {
+        return ""
+    }
+    return loader + "-" + loaderVersion
+}
+
+// The index (mrpack) or manifest (CurseForge) of the profile's content, as
+// {"name": "modrinth.index.json" | "manifest.json", "data": json, "referenced": {rel: true}, "files": n}.
+method packIndex(string format, string profileId, map<string, object> profile, array items, string name, string version): map<string, object> {
+    var refs = {}
+    var files = []
+    var loader = jstr(profile, "loader")
+    var loaderVersion = jstr(profile, "loaderVersion")
+    var minecraft = jstr(profile, "minecraftVersion")
+    if (format == "mrpack") {
+        var infos = {}
+        for (item in items) {
+            var source = item["source"]
+            if (core.isMap(source) == false || jstr(source, "provider") != "modrinth" || jstr(source, "versionId") == "") {
+                continue
+            }
+            var vid = jstr(source, "versionId")
+            if (infos.has(vid) == false) {
+                var fetched = core.runTrapped(ExportVersionTask{versionId = vid})
+                infos[vid] = {}
+                if (fetched.failed() == false && core.isMap(fetched.result())) {
+                    infos[vid] = fetched.result()
+                }
+            }
+            var info = infos[vid]
+            var rel = item["folder"] + "/" + item["fileName"]
+            if (jstr(info, "sha1") == item["sha1"] && jstr(info, "downloadUrl") != "") {
+                files.append({
+                    "path": rel,
+                    "hashes": {"sha1": jstr(info, "sha1"), "sha512": jstr(info, "sha512")},
+                    "env": {"client": "required", "server": "required"},
+                    "downloads": [jstr(info, "downloadUrl")],
+                    "fileSize": info["size"]
+                })
+                refs[rel] = true
+            }
+        }
+        var deps = {"minecraft": minecraft}
+        var key = mrpackLoaderKey(loader)
+        if (key != "" && loaderVersion != "") {
+            deps[key] = loaderVersion
+        }
+        var index = {
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": version,
+            "name": name,
+            "summary": "Exported from VoltLauncher",
+            "files": files,
+            "dependencies": deps
+        }
+        return {"name": "modrinth.index.json", "data": json.pretty(index) + "\n", "referenced": refs, "files": files.length()}
+    }
+    var cfFiles = []
+    for (item in items) {
+        var source = item["source"]
+        if (core.isMap(source) == false || jstr(source, "provider") != "curseforge") {
+            continue
+        }
+        var projectId = jstr(source, "projectId")
+        var fileId = jstr(source, "versionId")
+        if (isDigits(projectId) && isDigits(fileId)) {
+            cfFiles.append({"projectID": digitsValue(projectId), "fileID": digitsValue(fileId), "required": true})
+            refs[item["folder"] + "/" + item["fileName"]] = true
+        }
+    }
+    var modLoaders = []
+    var loaderId = cfLoaderId(loader, loaderVersion)
+    if (loaderId != "") {
+        modLoaders.append({"id": loaderId, "primary": true})
+    }
+    var manifest = {
+        "minecraft": {"version": minecraft, "modLoaders": modLoaders},
+        "manifestType": "minecraftModpack",
+        "manifestVersion": 1,
+        "name": name,
+        "version": version,
+        "author": "VoltLauncher",
+        "files": cfFiles,
+        "overrides": "overrides"
+    }
+    return {"name": "manifest.json", "data": json.pretty(manifest) + "\n", "referenced": refs, "files": cfFiles.length()}
+}
+
+// Builds the archive entries: the index, the bundled content files and the
+// configuration folders below overrides/.
+method exportEntries(string format, string profileId, map<string, object> profile, string name, string version): map<string, object> {
+    var gameDir = core.profileDir(profileId)
+    var items = exportContent(profileId)
+    var index = packIndex(format, profileId, profile, items, name, version)
+    var refs = index["referenced"]
+    var entries = [{"name": index["name"], "data": index["data"]}]
+    var bundled = 0
+    for (item in items) {
+        var rel = item["folder"] + "/" + item["fileName"]
+        if (refs.has(rel)) {
+            continue
+        }
+        entries.append({"name": "overrides/" + rel, "file": path.join(gameDir, rel)})
+        bundled = bundled + 1
+    }
+    for (dir in EXPORT_CONFIG_DIRS) {
+        var source = path.join(gameDir, dir)
+        if (os.isDir(source) == false) {
+            continue
+        }
+        var found = []
+        walkFiles(source, "", found)
+        for (rel in found) {
+            entries.append({"name": "overrides/" + dir + "/" + rel, "file": path.join(source, rel)})
+        }
+    }
+    for (fileName in EXPORT_CONFIG_FILES) {
+        var source = path.join(gameDir, fileName)
+        if (os.isFile(source)) {
+            entries.append({"name": "overrides/" + fileName, "file": source})
+        }
+    }
+    return {"entries": entries, "referenced": refs.length(), "bundled": bundled}
+}
+
+define class ExportTask {
+    private string target: get, set
+    private string profileId: get, set
+    private map<string, object> profile: get, set
+    private string format: get, set
+    private string name: get, set
+    private string version: get, set
+
+    method run(): object {
+        var built = exportEntries(format, profileId, profile, name, version)
+        var entries = zipWriteEntries(target, built["entries"])
+        var hostName = "Modrinth"
+        if (format == "curseforge") {
+            hostName = "CurseForge"
+        }
+        var notes = []
+        if (built["bundled"] > 0) {
+            notes.append(built["bundled"] + " file(s) are not on " + hostName + " and were bundled into overrides/ instead.")
+        }
+        return {
+            "path": target,
+            "fileName": path.basename(target),
+            "referenced": built["referenced"],
+            "bundled": built["bundled"],
+            "entries": entries,
+            "notes": notes
+        }
+    }
+}
+
+// POST /api/profiles/:id/export
+method exportProfile(string profileId, object body): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    if (core.isMap(body) == false) {
+        core.badRequest("expected a JSON object {format: \"mrpack\" | \"curseforge\", name?, version?}")
+    }
+    var format = bodyText(body, "format").toLower()
+    if (format != "mrpack" && format != "curseforge") {
+        core.badRequest("'format' must be \"mrpack\" (Modrinth) or \"curseforge\"")
+    }
+    if (busyWith(profileId) != "") {
+        core.conflict("profile '" + profileId + "' is busy (" + busyWith(profileId) + ")")
+    }
+    var name = bodyText(body, "name")
+    if (name == "") {
+        name = jstr(profile, "name")
+    }
+    var version = bodyText(body, "version")
+    if (version == "") {
+        version = "1.0.0"
+    }
+    var ext = ".mrpack"
+    if (format == "curseforge") {
+        ext = ".zip"
+    }
+    var stem = safeStem(name)
+    var stamp = time.format(time.now(), "%Y%m%d-%H%M%S")
+    var exportsDir = core.ensureDir(path.join(core.dataDir(), "exports"))
+    var target = path.join(exportsDir, stem + "-" + stamp + ext)
+    var n = 1
+    while (os.exists(target)) {
+        target = path.join(exportsDir, stem + "-" + stamp + "-" + n + ext)
+        n = n + 1
+    }
+    var outcome = core.runTrapped(ExportTask{
+        target = target, profileId = profileId, profile = profile,
+        format = format, name = name, version = version
+    })
+    if (outcome.failed()) {
+        os.remove(target + ".tmp")
+        core.raise(outcome.error())
+    }
+    var result = outcome.result()
+    result.remove("entries")
+    core.logInfo("export: " + profileId + " -> " + target + " (" + result["referenced"] + " referenced, " + result["bundled"] + " bundled)")
+    return core.respond(201, result)
+}

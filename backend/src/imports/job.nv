@@ -1,0 +1,294 @@
+package imports
+
+import core
+import fmt
+import os
+import path
+
+// POST /api/imports {"items": [{"launcher", "key"}]} -> 202 job (kind "import").
+//
+// Every item is checked before anything is created: an unknown launcher or key is 404,
+// a profile that is not importable (or a duplicate item) is 400, a game folder over the
+// size limit or overlapping the VoltLauncher data folder is 409 or 400. Then the job
+// creates one new profile per item, with a free name ("Name (2)", "Name (3)", ...), and
+// copies the game folder into the profile's folder. The source is only read.
+//
+// The copy never follows a link: a link is listed in notCopied with its path. Per item
+// the result is "done", "partial" (notCopied lists what could not be copied) or
+// "failed" (the message says why; a profile created before the failure stays).
+
+// The items of a request, checked for shape only: [{"launcher", "key"}].
+method importItems(object body): array {
+    if (core.isMap(body) == false || body.has("items") == false) {
+        core.badRequest("expected an object with an items array of {launcher, key} objects")
+    }
+    var list = body["items"]
+    if (core.isArray(list) == false || list.length() == 0) {
+        core.badRequest("'items' must be a non-empty array")
+    }
+    if (list.length() > MAX_IMPORT_ITEMS) {
+        core.badRequest("'items' has more than " + MAX_IMPORT_ITEMS + " entries")
+    }
+    var out = []
+    for (entry in list) {
+        var launcher = textOf(entry, "launcher")
+        var key = textOf(entry, "key")
+        if (launcher == "" || key == "") {
+            core.badRequest("each item needs a launcher and a key")
+        }
+        out.append({"launcher": launcher, "key": key})
+    }
+    return out
+}
+
+// The record with this key, or null.
+method findRecord(array records, string key): object {
+    for (rec in records) {
+        if (rec["key"] == key) {
+            return rec
+        }
+    }
+    return core.none()
+}
+
+// The game folder must not overlap the data folder, and must fit the size limit (40 GB).
+// The count stops as soon as the limit is passed, so a huge folder is cheap to refuse.
+method checkImportable(map<string, object> rec) {
+    var gameDir = rec["gameDir"]
+    if (gameDir == "") {
+        return
+    }
+    if (overlapsDataDir(gameDir)) {
+        core.badRequest("the game folder of '" + rec["name"] + "' lies inside the VoltLauncher data folder, or holds it")
+    }
+    var size = measureTree(gameDir, 0, IMPORT_LIMIT_BYTES)
+    if (size["complete"] == false) {
+        core.conflict("the game folder of '" + rec["name"] + "' is larger than the 40 GB limit (more than " + fmt.bytes(size["bytes"]) + " counted)")
+    }
+}
+
+// Checks the items and starts the job; returns the job (the 202 body).
+method startImport(object body): map<string, object> {
+    var items = importItems(body)
+    var resolved = []
+    var cache = {}
+    var seen = {}
+    for (item in items) {
+        var launcher = item["launcher"]
+        var key = item["key"]
+        if (seen.has(key)) {
+            core.badRequest("the item '" + key + "' is listed twice")
+        }
+        seen[key] = true
+        if (knownLauncher(launcher) == false) {
+            core.notFound("no such launcher: " + launcher)
+        }
+        if (cache.has(launcher) == false) {
+            cache[launcher] = launcherRecords(launcher)
+        }
+        var rec = findRecord(cache[launcher], key)
+        if (core.isNull(rec)) {
+            core.notFound("no profile with key '" + key + "' in " + launcher + " (run GET /api/imports/scan again)")
+        }
+        if (rec["importable"] == false) {
+            core.badRequest(rec["name"] + " cannot be imported: " + rec["reason"])
+        }
+        checkImportable(rec)
+        resolved.append(rec)
+    }
+    return core.startJob("import", "Import profiles", ImportJob{items = resolved})
+}
+
+// A name not taken by any profile: the name itself, else "Name (2)", "Name (3)", ...
+// Names are limited to PROFILE_NAME_LIMIT characters, the suffix included.
+method uniqueName(string requested): string {
+    var taken = []
+    for (p in core.profiles()) {
+        taken.append(p["name"])
+    }
+    var base = requested.trim()
+    if (base == "") {
+        base = "Imported profile"
+    }
+    if (base.length() > PROFILE_NAME_LIMIT) {
+        base = base.substring(0, PROFILE_NAME_LIMIT)
+    }
+    if (taken.contains(base) == false) {
+        return base
+    }
+    var n = 2
+    while (n < 100000) {
+        var suffix = " (" + n + ")"
+        var stem = base
+        if (stem.length() + suffix.length() > PROFILE_NAME_LIMIT) {
+            stem = stem.substring(0, PROFILE_NAME_LIMIT - suffix.length())
+        }
+        var candidate = stem.trim() + suffix
+        if (taken.contains(candidate) == false) {
+            return candidate
+        }
+        n = n + 1
+    }
+    core.internal("no free profile name for '" + base + "'")
+    return base
+}
+
+// Copies the entries of `source` into `target` (which exists). Links are listed, not
+// followed; a file or folder that cannot be copied is listed with the reason. Only a
+// failure of the listing itself raises. `counter` gets the number of files copied.
+method copyDirectory(string source, string target, string jobId, string relative, array missing, map<string, object> counter) {
+    for (name in os.listDir(source)) {
+        core.checkCancelled(jobId)
+        var from = path.join(source, name)
+        var to = path.join(target, name)
+        var shown = name
+        if (relative != "") {
+            shown = relative + "/" + name
+        }
+        if (os.isSymlink(from)) {
+            missing.append({"path": shown, "reason": "symbolic link: not followed"})
+        } else if (os.isDir(from)) {
+            if (os.mkdir(to) == false && os.isDir(to) == false) {
+                missing.append({"path": shown, "reason": "cannot create the folder"})
+            } else {
+                copyDirectory(from, to, jobId, shown, missing, counter)
+            }
+        } else if (os.isFile(from)) {
+            if (os.copy(from, to)) {
+                counter["copied"] = counter["copied"] + 1
+            } else {
+                missing.append({"path": shown, "reason": "cannot copy the file"})
+            }
+        } else {
+            missing.append({"path": shown, "reason": "not a regular file"})
+        }
+    }
+}
+
+define class CopyTask {
+    private string source: get, set
+    private string target: get, set
+    private string jobId: get, set
+    private array missing: get, set
+    private map<string, object> counter: get, set
+
+    method run(): object {
+        copyDirectory(source, target, jobId, "", missing, counter)
+        return true
+    }
+}
+
+// One item: a new profile, then the copy. Raises only before the profile exists.
+method importOne(map<string, object> rec, string jobId): map<string, object> {
+    var body = {"name": uniqueName(rec["name"]), "minecraftVersion": rec["minecraftVersion"], "loader": rec["loader"]}
+    if (core.isString(rec["loaderVersion"])) {
+        body["loaderVersion"] = rec["loaderVersion"]
+    }
+    if (core.isString(rec["javaPath"])) {
+        body["javaPath"] = rec["javaPath"]
+    }
+    if (rec["jvmArgs"] != "") {
+        body["jvmArgs"] = rec["jvmArgs"]
+    }
+    if (core.isWholeNumber(rec["memoryMb"])) {
+        body["memoryMb"] = core.toInteger(rec["memoryMb"])
+    }
+    var created = core.createProfile(body)
+    var missing = []
+    var counter = {"copied": 0}
+    if (rec["gameDir"] != "") {
+        var target = core.managedProfileDir(created["id"])
+        var outcome = core.runTrapped(CopyTask{source = rec["gameDir"], target = target, jobId = jobId, missing = missing, counter = counter})
+        if (outcome.failed()) {
+            if (core.isCancelFailure(outcome.error())) {
+                core.raiseCancelled()
+            }
+            return itemResult(rec, created, "failed", counter, missing, core.decodeFailure(outcome.error())["message"])
+        }
+    }
+    var state = "done"
+    if (missing.length() > 0) {
+        state = "partial"
+    }
+    return itemResult(rec, created, state, counter, missing, "")
+}
+
+method itemResult(map<string, object> rec, map<string, object> created, string state, map<string, object> counter, array missing, string message): map<string, object> {
+    return {
+        "launcher": rec["launcher"],
+        "key": rec["key"],
+        "name": created["name"],
+        "profileId": created["id"],
+        "result": state,
+        "copiedFiles": counter["copied"],
+        "notCopied": missing,
+        "notes": rec["notes"],
+        "message": message
+    }
+}
+
+method failedItem(map<string, object> rec, string message): map<string, object> {
+    return {
+        "launcher": rec["launcher"],
+        "key": rec["key"],
+        "name": rec["name"],
+        "profileId": core.none(),
+        "result": "failed",
+        "copiedFiles": 0,
+        "notCopied": [],
+        "notes": rec["notes"],
+        "message": message
+    }
+}
+
+define class ImportTask {
+    private object record: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return importOne(record, jobId)
+    }
+}
+
+// Runs the items one after the other; one failing item does not stop the others.
+method runImport(array items, string jobId): map<string, object> {
+    var results = []
+    var total = items.length()
+    var i = 0
+    while (i < total) {
+        var rec = items[i]
+        core.checkCancelled(jobId)
+        core.jobProgress(jobId, core.toFloat(i) / core.toFloat(total), "Importing " + rec["name"])
+        var outcome = core.runTrapped(ImportTask{record = rec, jobId = jobId})
+        if (outcome.failed()) {
+            if (core.isCancelFailure(outcome.error())) {
+                core.raiseCancelled()
+            }
+            results.append(failedItem(rec, core.decodeFailure(outcome.error())["message"]))
+        } else {
+            results.append(outcome.result())
+        }
+        i = i + 1
+    }
+    var done = 0
+    var partial = 0
+    var failed = 0
+    for (result in results) {
+        if (result["result"] == "done") {
+            done = done + 1
+        } else if (result["result"] == "partial") {
+            partial = partial + 1
+        } else {
+            failed = failed + 1
+        }
+    }
+    return {"items": results, "done": done, "partial": partial, "failed": failed}
+}
+
+define class ImportJob based JobBody {
+    private array items: get, set
+
+    method execute(string jobId): object {
+        return runImport(items, jobId)
+    }
+}

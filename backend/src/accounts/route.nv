@@ -1,0 +1,263 @@
+package accounts
+
+import core
+import crypto
+
+// Routes of the accounts module (docs/ARCHITECTURE.md, "Konten und Skins"):
+//
+//   GET    /api/accounts                    {accounts: [...], selectedId, offlineMode}; every account has
+//                                           skinDataUrl (PNG data URL of the current skin, Microsoft only,
+//                                           null otherwise) and skinError (null, or why the skin is missing)
+//   GET    /api/accounts/session            {authenticated, id, name, type} of the selected account
+//   POST   /api/accounts/offline            -> 403 sign_in_required (offline accounts are disabled)
+//   POST   /api/accounts/offline-mode       {enabled: false} -> the account view (switches to the
+//                                           Microsoft account); {enabled: true} -> 403 sign_in_required
+//   POST   /api/accounts/login              {state, url, expiresAt}; the UI opens url in the browser
+//   POST   /api/accounts/callback           {state, code | error, error_description} -> 202 Job
+//                                           (result {id, name}); the redirect target of the login
+//   POST   /api/accounts/logout             removes all Microsoft accounts -> the account view
+//   GET    /api/accounts/skin               current skin of the selected Microsoft account (current.nv):
+//                                           {name, uuid, model, skinUrl, dataUrl, capeDataUrl}; 403 sign_in_required
+//   POST   /api/accounts/:id/select         -> the account view
+//   DELETE /api/accounts/:id                -> the account view (the default offline account stays)
+//   GET    /api/skins                       {skins: [{id, name, slim, createdAt, selected, imageDataUrl}], selectedSkinId}
+//   POST   /api/skins                       {name, slim, imageBase64} -> 201 {skin}
+//   GET    /api/skins/:id                   {id, name, slim, createdAt, selected, imageDataUrl}
+//   PATCH  /api/skins/:id                   {name} -> {skin}
+//   DELETE /api/skins/:id                   -> {}
+//   POST   /api/skins/:id/select            -> 202 Job (result {skin}); uploads the skin to Mojang
+//
+// segments are the path segments after /api. Account ids are dashed UUIDs.
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments[0] == "accounts") {
+        return acAccountsRoute(verb, segments, body)
+    }
+    return acSkinsRoute(verb, segments, body)
+}
+
+// A string field of a request body; "" when missing or not a string.
+method acBodyText(object body, string key): string {
+    if (core.isMap(body) == false) {
+        return ""
+    }
+    var value = core.getOr(body, key, "")
+    if (core.isString(value)) {
+        return value
+    }
+    return ""
+}
+
+method acRequireBody(object body): object {
+    if (core.isMap(body) == false) {
+        core.badRequest("a JSON object is required")
+    }
+    return body
+}
+
+method acAccountsRoute(string verb, array<string> segments, object body): map<string, object> {
+    var count = segments.length()
+    if (count == 1) {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(acListWithSkins())
+    }
+    var first = segments[1]
+    if (acIsUuid(first)) {
+        if (count == 2) {
+            if (verb != "DELETE") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(acChange("remove", {"id": first}))
+        }
+        if (count == 3 && segments[2] == "select") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(acChange("select", {"id": first}))
+        }
+        return core.notFound("no such endpoint")
+    }
+    if (count != 2) {
+        return core.notFound("no such endpoint")
+    }
+    if (first == "session") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(acSession())
+    }
+    if (first == "offline") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return acRefuseOffline()
+    }
+    if (first == "offline-mode") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var enabled = core.getOr(acRequireBody(body), "enabled", false) == true
+        if (enabled) {
+            return acRefuseOffline()
+        }
+        return core.ok(acChange("offline-mode", {"enabled": false}))
+    }
+    if (first == "login") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(acStartLogin())
+    }
+    if (first == "callback") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return acCallback(body)
+    }
+    if (first == "logout") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(acChange("logout", {}))
+    }
+    if (first == "skin") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(acCurrentSkin())
+    }
+    return core.notFound("no such endpoint")
+}
+
+// Offline accounts are disabled: every request that would create or select one answers 403.
+method acRefuseOffline(): map<string, object> {
+    core.fail(403, "sign_in_required", "Offline accounts are disabled. Sign in with a Microsoft account.")
+    return {}
+}
+
+// The selected account without its tokens.
+method acSession(): map<string, object> {
+    var view = acChange("list", {})
+    for (entry in view["accounts"]) {
+        if (entry["selected"] == true) {
+            return {
+                "authenticated": entry["type"] == "microsoft",
+                "id": entry["id"],
+                "name": entry["name"],
+                "type": entry["type"]
+            }
+        }
+    }
+    return {"authenticated": false, "id": core.none(), "name": core.none(), "type": core.none()}
+}
+
+// The redirect of the Microsoft sign-in. The state is single use; the exchange runs as a job.
+method acCallback(object body): map<string, object> {
+    var state = acBodyText(body, "state")
+    if (state == "") {
+        core.badRequest("missing OAuth state")
+    }
+    var verifier = acTakePending(state)
+    if (verifier == "") {
+        core.badRequest("the sign-in attempt expired or was already completed")
+    }
+    var problem = acBodyText(body, "error")
+    if (problem != "") {
+        var description = acBodyText(body, "error_description")
+        if (description == "") {
+            description = problem
+        }
+        core.badRequest("Microsoft did not complete the sign-in: " + description)
+    }
+    var code = acBodyText(body, "code")
+    if (code == "") {
+        core.badRequest("Microsoft did not return an authorization code")
+    }
+    var job = AcLoginJob{code = code, verifier = verifier}
+    return core.respond(202, core.startJob("account-login", "Anmeldung bei Microsoft", job))
+}
+
+method acSkinsRoute(string verb, array<string> segments, object body): map<string, object> {
+    var count = segments.length()
+    if (count == 1) {
+        if (verb == "GET") {
+            return core.ok(acSkinList())
+        }
+        if (verb == "POST") {
+            return acAddSkin(body)
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    var id = segments[1]
+    if (acIsUuid(id) == false) {
+        return core.notFound("skin '" + id + "' not found")
+    }
+    if (count == 2) {
+        if (verb == "GET") {
+            return core.ok(acSkinById(id))
+        }
+        if (verb == "PATCH") {
+            var name = acRequireName(acBodyText(acRequireBody(body), "name"))
+            acSkinChange("rename", {"id": id, "name": name})
+            return core.ok({"skin": acSkinById(id)})
+        }
+        if (verb == "DELETE") {
+            acSkinChange("delete", {"id": id})
+            return core.ok({})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 3 && segments[2] == "select") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        acSkinById(id)
+        var current = acChange("current", {})
+        if (current["type"] != "microsoft") {
+            core.conflict("skins can only be applied to a Microsoft account, sign in first")
+        }
+        var job = AcSkinApplyJob{skinId = id}
+        return core.respond(202, core.startJob("skin-apply", "Skin übernehmen", job))
+    }
+    return core.notFound("no such endpoint")
+}
+
+// The library with the PNG previews, and the id of the applied skin (null when none).
+method acSkinList(): map<string, object> {
+    var library = acSkinChange("list", {})
+    var selected = core.getOr(library, "selectedSkinId", "")
+    var views = []
+    for (skin in core.getOr(library, "skins", [])) {
+        views.append(acSkinView(skin, selected, true))
+    }
+    var selectedId = core.none()
+    if (selected != "") {
+        selectedId = selected
+    }
+    return {"skins": views, "selectedSkinId": selectedId}
+}
+
+// One skin with its preview; a 404 when it does not exist.
+method acSkinById(string id): map<string, object> {
+    var library = acSkinChange("list", {})
+    var selected = core.getOr(library, "selectedSkinId", "")
+    for (skin in core.getOr(library, "skins", [])) {
+        if (skin["id"] == id) {
+            return acSkinView(skin, selected, true)
+        }
+    }
+    core.notFound("skin '" + id + "' not found")
+    return {}
+}
+
+method acAddSkin(object body): map<string, object> {
+    var source = acRequireBody(body)
+    var name = acRequireName(acBodyText(source, "name"))
+    var slim = core.getOr(source, "slim", false) == true
+    var png = acDecodeImage(acBodyText(source, "imageBase64"))
+    acRequireSkinPng(png)
+    var skin = {"id": crypto.uuidText(crypto.uuid4()), "name": name, "slim": slim, "createdAt": core.nowIso()}
+    acSkinChange("add", {"skin": skin, "png": png})
+    return core.respond(201, {"skin": acSkinView(skin, "", true)})
+}

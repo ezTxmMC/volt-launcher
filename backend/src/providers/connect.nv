@@ -1,0 +1,380 @@
+package providers
+
+import core
+import json
+import os
+import path
+
+// Connecting a profile to a modpack release (see docs/ARCHITECTURE.md, "Inhalte und Modpacks"):
+//
+//   POST /api/profiles/:id/modpack/connect      {provider, projectId, versionId} -> 200 modpack status
+//   POST /api/profiles/:id/modpack/disconnect   -> 200 modpack status
+//
+// Connecting installs nothing. It reads the file list of one release, writes it to
+// <gameDir>/.volt/pack-files.json (the record a later update works from) and sets the
+// profile's source, the same shape a pack install sets. The file list comes from:
+//   - Modrinth: the modrinth.index.json of the .mrpack (the archive is downloaded to a
+//     temporary folder and deleted again; the mods are not);
+//   - CurseForge: the manifest.json of the pack zip, resolved through the bridge (502
+//     when the bridge is not running);
+//   - Technic: the entries of a client zip (the same temporary download); a Solder pack
+//     lists mod archives, not the files they extract, so it is refused;
+//   - FTB: the files of the release document.
+// Where the exact list cannot be read the answer is 422 unsupported; an empty or guessed
+// record would let a later update delete files that belong to the pack.
+//
+// The list rules mirror the install code in install.nv (which this module does not
+// change); keep them in step with it.
+
+// A pack whose file list cannot be read exactly.
+method unsupportedPack(string message): object {
+    return core.fail(422, "unsupported", message)
+}
+
+// The game-relative path of a pack file that is a content file (mods/, resourcepacks/,
+// shaderpacks/, datapacks/), or "" for any other path (configs and the like are not
+// recorded, as an install does not record them). A path outside the game directory
+// makes the list unreadable.
+method recordFileOf(string rel): string {
+    var clean = safeRelative(rel)
+    if (clean == "") {
+        unsupportedPack("the pack names the file '" + rel + "' outside the game directory, so its file list cannot be read")
+    }
+    if (isContentRel(clean) == false) {
+        return ""
+    }
+    return clean
+}
+
+// The values without duplicates, in order.
+method uniqueFiles(array values): array {
+    var seen = {}
+    var out = []
+    for (v in values) {
+        if (seen.has(v) == false) {
+            seen[v] = true
+            out.append(v)
+        }
+    }
+    return out
+}
+
+// --- the file lists (pure: they take documents, so unit.nv can test them) ----------------
+
+// The content files of a Modrinth index that the install downloads: entries without a
+// path or without downloads, and those unsupported on the client, are skipped.
+method modrinthIndexFiles(object index): array {
+    var out = []
+    for (f in jarr(index, "files")) {
+        var rel = jstr(f, "path")
+        if (rel == "" || jstr(jobj(f, "env"), "client") == "unsupported" || stringList(jarr(f, "downloads")).length() == 0) {
+            continue
+        }
+        var clean = recordFileOf(rel)
+        if (clean != "") {
+            out.append(clean)
+        }
+    }
+    return uniqueFiles(out)
+}
+
+// The manifest entries the install downloads: optional ones (required false) and
+// entries without a file id are left out.
+method cfRequiredFiles(object manifest): array {
+    var out = []
+    for (f in jarr(manifest, "files")) {
+        if (core.isMap(f) && f.has("required") && core.isBool(f["required"]) && f["required"] == false) {
+            continue
+        }
+        if (jint(f, "fileID", 0) > 0) {
+            out.append(f)
+        }
+    }
+    return out
+}
+
+// The game-relative files of the required manifest entries: the folder of the file's
+// project class, then its file name. `resolved` maps file ids to CurseForge file
+// objects, `mods` project ids to project objects. A file that did not resolve makes the
+// list incomplete: 422.
+method cfPackFiles(array required, map<string, object> resolved, map<string, object> mods): array {
+    var out = []
+    for (f in required) {
+        var key = "" + jint(f, "fileID", 0)
+        if (resolved.has(key) == false) {
+            unsupportedPack("CurseForge did not return file " + key + " of this pack, so its file list cannot be read")
+        }
+        var v = cfVersion(resolved[key])
+        var classId = jint(jobj(mods, jstr(v, "projectId")), "classId", 6)
+        out.append(cfFolderOf(classId) + "/" + safeFileName(jstr(v, "fileName")))
+    }
+    return uniqueFiles(out)
+}
+
+// The content files of a Technic client zip: its entries below the wrapper folder
+// (bin/ is Technic's own and is skipped), as the install extracts them.
+method technicClientFiles(PvZip zip): array {
+    var wrapper = technicWrapper(zip)
+    var out = []
+    for (entry in zip.entries()) {
+        var rel = entryTarget(entry, wrapper, true)
+        if (rel == "") {
+            continue
+        }
+        var clean = recordFileOf(rel)
+        if (clean != "") {
+            out.append(clean)
+        }
+    }
+    return uniqueFiles(out)
+}
+
+// The content files of an FTB release document (server-only files are skipped).
+method ftbReleaseFiles(object release): array {
+    var out = []
+    for (f in jarr(release, "files")) {
+        if (jbool(f, "serveronly")) {
+            continue
+        }
+        var fileName = jstr(f, "name")
+        if (fileName == "") {
+            continue
+        }
+        var dir = jstr(f, "path").replace("\\", "/")
+        var rel = fileName
+        if (dir != "") {
+            rel = dir + "/" + fileName
+        }
+        var clean = recordFileOf(rel)
+        if (clean != "") {
+            out.append(clean)
+        }
+    }
+    return uniqueFiles(out)
+}
+
+// --- the four providers: {projectId, versionId, name, files} -----------------------------
+
+method connectModrinth(string projectId, string versionId, string staging): map<string, object> {
+    var doc = mrVersionDoc(versionId)
+    var packProject = jstr(doc, "project_id")
+    if (sameProject("modrinth", projectId, packProject) == false) {
+        core.badRequest("Modrinth version '" + versionId + "' does not belong to project '" + projectId + "'")
+    }
+    var packFile = {}
+    for (f in jarr(doc, "files")) {
+        if (jstr(f, "filename").endsWith(".mrpack") && (packFile.length() == 0 || jbool(f, "primary"))) {
+            packFile = f
+        }
+    }
+    if (packFile.length() == 0) {
+        unsupportedPack("Modrinth version '" + versionId + "' has no .mrpack file, so its file list cannot be read")
+    }
+    var hashes = jobj(packFile, "hashes")
+    var archive = path.join(staging, "pack.mrpack")
+    downloadFile(jstr(packFile, "url"), archive, hashMap(jstr(hashes, "sha1"), "", "", jstr(hashes, "sha512")), mrHeaders())
+    var zip = zipOpenFile(archive, "the .mrpack archive")
+    var index = json.tryParse(zipReadNamed(zip, "modrinth.index.json"))
+    if (core.isMap(index) == false) {
+        core.upstream("the .mrpack archive has no valid modrinth.index.json")
+    }
+    var name = jstr(index, "name")
+    if (name == "") {
+        name = jstr(doc, "name")
+    }
+    var project = packProject
+    if (project == "") {
+        project = projectId
+    }
+    return {"projectId": project, "versionId": versionId, "name": name, "files": modrinthIndexFiles(index)}
+}
+
+method connectCurseForge(string projectId, string versionId, string staging): map<string, object> {
+    requireBridge()
+    var version = cfVersionById(versionId)
+    var packProject = jstr(version, "projectId")
+    if (sameProject("curseforge", projectId, packProject) == false) {
+        core.badRequest("CurseForge file '" + versionId + "' does not belong to project '" + projectId + "'")
+    }
+    var url = jstr(version, "downloadUrl")
+    if (url == "") {
+        unsupportedPack("this modpack cannot be downloaded automatically (third-party downloads are disabled), so its file list cannot be read")
+    }
+    var archive = path.join(staging, "pack.zip")
+    downloadFile(url, archive, hashMap(jstr(version, "sha1"), jstr(version, "md5"), "", ""), {})
+    var zip = zipOpenFile(archive, "the CurseForge pack archive")
+    var manifest = json.tryParse(zipReadNamed(zip, "manifest.json"))
+    if (core.isMap(manifest) == false) {
+        core.upstream("the CurseForge pack has no valid manifest.json")
+    }
+    var required = cfRequiredFiles(manifest)
+    var fileIds = []
+    var projectIds = []
+    for (f in required) {
+        fileIds.append(jint(f, "fileID", 0))
+        var pid = jint(f, "projectID", 0)
+        if (pid > 0 && projectIds.contains(pid) == false) {
+            projectIds.append(pid)
+        }
+    }
+    var resolved = cfFilesById(fileIds)
+    var mods = cfModsById(projectIds)
+    var name = jstr(manifest, "name")
+    if (name == "") {
+        name = jstr(version, "name")
+    }
+    var project = packProject
+    if (project == "") {
+        project = projectId
+    }
+    return {"projectId": project, "versionId": versionId, "name": name, "files": cfPackFiles(required, resolved, mods)}
+}
+
+method connectTechnic(string projectId, string versionId, string staging): map<string, object> {
+    if (projectId == "") {
+        core.badRequest("'projectId' (the Technic pack slug) is required")
+    }
+    var doc = technicPack(projectId)
+    var slug = jstr(doc, "name")
+    if (slug == "") {
+        slug = technicSlug(projectId)
+    }
+    var build = technicBuildId(slug, versionId)
+    var name = jstr(doc, "displayName")
+    if (name == "") {
+        name = slug
+    }
+    if (technicSolderUrl(doc) != "") {
+        unsupportedPack("Technic pack '" + slug + "' is a Solder pack: its build lists mod archives, not the files they extract, so its file list cannot be read without downloading every mod")
+    }
+    var url = encodeDownloadUrl(jstr(doc, "url"))
+    if (url == "") {
+        unsupportedPack("this Technic pack publishes no download; its author may have restricted it to the Technic launcher")
+    }
+    var packVersion = jstr(doc, "version")
+    if (build != "latest" && packVersion != "" && build != packVersion) {
+        core.badRequest("Technic pack '" + slug + "' only offers build '" + packVersion + "'")
+    }
+    if (build == "latest" && packVersion != "") {
+        build = packVersion
+    }
+    var archive = path.join(staging, "client.zip")
+    downloadFile(url, archive, {}, technicHeaders())
+    var zip = zipOpenFile(archive, "the Technic pack archive")
+    return {"projectId": slug, "versionId": build, "name": name, "files": technicClientFiles(zip)}
+}
+
+method connectFtb(string projectId, string versionId): map<string, object> {
+    if (projectId == "") {
+        core.badRequest("'projectId' (the FTB pack id) is required")
+    }
+    var release = ftbRelease(projectId, versionId)
+    var name = jstr(release, "name")
+    var packName = core.runTrapped(FtbPackTask{packId = projectId})
+    if (packName.failed() == false && jstr(packName.result(), "name") != "") {
+        name = jstr(packName.result(), "name")
+    }
+    var releaseId = jstr(release, "id")
+    if (releaseId == "") {
+        releaseId = versionId
+    }
+    return {"projectId": ftbPackId(projectId), "versionId": releaseId, "name": name, "files": ftbReleaseFiles(release)}
+}
+
+// --- connect and disconnect -----------------------------------------------------------
+
+define class PvConnectTask {
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+    private string staging: get, set
+
+    method run(): object {
+        return connectPack(profileId, provider, projectId, versionId, staging)
+    }
+}
+
+// Reads the file list, writes the record, then sets the source. The record goes first:
+// when it cannot be written the profile stays unlinked. Raises on any failure.
+method connectPack(string profileId, string provider, string projectId, string versionId, string staging): map<string, object> {
+    var found = {}
+    if (provider == "modrinth") {
+        found = connectModrinth(projectId, versionId, staging)
+    } else if (provider == "curseforge") {
+        found = connectCurseForge(projectId, versionId, staging)
+    } else if (provider == "technic") {
+        found = connectTechnic(projectId, versionId, staging)
+    } else {
+        found = connectFtb(projectId, versionId)
+    }
+    var packProject = jstr(found, "projectId")
+    var packVersion = jstr(found, "versionId")
+    var name = jstr(found, "name")
+    if (name == "") {
+        name = packProject
+    }
+    var recordError = writePackRecordText(core.profileDir(profileId), packVersion, jarr(found, "files"))
+    if (recordError != "") {
+        core.internal("cannot record the pack files: " + recordError)
+    }
+    core.updateProfile(profileId, {"source": packSourceMap(provider, packProject, packVersion, name)})
+    return found
+}
+
+// POST /api/profiles/:id/modpack/connect: links the profile to a release, installs nothing.
+method modpackConnect(string profileId, object body): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    if (core.isMap(body) == false) {
+        core.badRequest("expected a JSON object {provider, projectId, versionId}")
+    }
+    var provider = bodyText(body, "provider").toLower()
+    if (provider == "") {
+        core.badRequest("'provider' is required")
+    }
+    if (["modrinth", "curseforge", "technic", "ftb"].contains(provider) == false) {
+        core.badRequest("'provider' must be one of modrinth, curseforge, technic, ftb")
+    }
+    var projectId = bodyText(body, "projectId")
+    if (projectId == "") {
+        core.badRequest("'projectId' is required")
+    }
+    var versionId = bodyText(body, "versionId")
+    if (versionId == "") {
+        core.badRequest("'versionId' is required")
+    }
+    if (core.isNull(packSourceOf(profile)) == false) {
+        core.conflict("this profile is already linked to a modpack; disconnect it first")
+    }
+    var busy = busyWith(profileId)
+    if (busy != "") {
+        core.conflict("profile '" + profileId + "' is busy (" + busy + ")")
+    }
+    var staging = core.ensureDir(path.join(core.dataDir(), "tmp", "connect-" + core.newId()))
+    claimBusy(profileId, "connect")
+    var outcome = core.runTrapped(PvConnectTask{profileId = profileId, provider = provider, projectId = projectId, versionId = versionId, staging = staging})
+    os.removeAll(staging)
+    releaseBusy(profileId)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    return modpackStatus(profileId)
+}
+
+// POST /api/profiles/:id/modpack/disconnect: forgets the pack and its record; the files stay.
+method modpackDisconnect(string profileId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    if (core.isNull(packSourceOf(profile))) {
+        core.conflict("this profile is not linked to a modpack")
+    }
+    var busy = busyWith(profileId)
+    if (busy != "") {
+        core.conflict("profile '" + profileId + "' is busy (" + busy + ")")
+    }
+    var recordError = removePackRecord(core.profileDir(profileId))
+    if (recordError != "") {
+        core.internal(recordError)
+    }
+    core.updateProfile(profileId, {"source": core.none()})
+    return modpackStatus(profileId)
+}

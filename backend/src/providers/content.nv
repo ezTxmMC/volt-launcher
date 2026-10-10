@@ -1,0 +1,331 @@
+package providers
+
+import core
+import mods
+import os
+import path
+
+// POST /api/profiles/:id/content/install: one mod, resource pack, shader or
+// data pack into a profile, plus (for mods) the dependencies the version
+// lists as required, skipping projects the profile already has.
+
+private final PV_MAX_DEPENDENCY_DEPTH = 4
+
+method kindFolder(string kind): string {
+    if (kind == "mod") {
+        return "mods"
+    }
+    if (kind == "resourcepack") {
+        return "resourcepacks"
+    }
+    if (kind == "shader") {
+        return "shaderpacks"
+    }
+    if (kind == "datapack") {
+        return "datapacks"
+    }
+    return ""
+}
+
+define class PvProjectIdTask {
+    private string provider: get, set
+    private string projectId: get, set
+
+    method run(): object {
+        return project(provider, projectId)["id"]
+    }
+}
+
+// Whether `given` (an id or a slug, "" for unknown) names the project `actualId`.
+method sameProject(string provider, string given, string actualId): bool {
+    if (given == "" || actualId == "" || given == actualId) {
+        return true
+    }
+    var canonical = core.runTrapped(PvProjectIdTask{provider = provider, projectId = given})
+    if (canonical.failed()) {
+        return false
+    }
+    return canonical.result() == actualId
+}
+
+method contentVersions(string provider, string projectId, string gameVersion, string loader): array {
+    if (provider == "modrinth") {
+        return mrVersions(projectId, gameVersion, loader)
+    }
+    return cfVersions(projectId, gameVersion, loader)
+}
+
+method contentVersionById(string provider, string versionId): map<string, object> {
+    if (provider == "modrinth") {
+        return mrVersionById(versionId)
+    }
+    return cfVersionById(versionId)
+}
+
+// The newest downloadable version for the profile, or null.
+method newestCompatible(string provider, string projectId, string gameVersion, string loader): object {
+    for (v in contentVersions(provider, projectId, gameVersion, loader)) {
+        if (v["downloadUrl"] != "") {
+            return v
+        }
+    }
+    return core.none()
+}
+
+// The project ids of the mods already in the profile, asked from the provider
+// by file hash (Modrinth: SHA-1, CurseForge: fingerprint).
+method presentProjects(string provider, string modsDir): array {
+    var out = []
+    if (os.isDir(modsDir) == false) {
+        return out
+    }
+    var hashes = []
+    for (name in os.listDir(modsDir)) {
+        var lower = name.toLower()
+        var file = path.join(modsDir, name)
+        if (os.isFile(file) == false) {
+            continue
+        }
+        if (lower.endsWith(".jar") || lower.endsWith(".jar.disabled") || lower.endsWith(".zip")) {
+            var data = os.readFile(file)
+            if (provider == "modrinth") {
+                hashes.append(sha1Hex(data))
+            } else {
+                hashes.append(cfFingerprint(data))
+            }
+        }
+    }
+    if (provider == "modrinth") {
+        var byHash = mrProjectsByHash(hashes)
+        for (h in byHash) {
+            if (out.contains(byHash[h]) == false) {
+                out.append(byHash[h])
+            }
+        }
+        return out
+    }
+    return cfProjectsByFingerprint(hashes)
+}
+
+define class PvPresentTask {
+    private string provider: get, set
+    private string modsDir: get, set
+
+    method run(): object {
+        return presentProjects(provider, modsDir)
+    }
+}
+
+define class PvDependencyTask {
+    private string provider: get, set
+    private map<string, object> dependency: get, set
+    private string gameVersion: get, set
+    private string loader: get, set
+
+    method run(): object {
+        var versionId = jstr(dependency, "versionId")
+        if (versionId != "") {
+            return contentVersionById(provider, versionId)
+        }
+        return newestCompatible(provider, jstr(dependency, "projectId"), gameVersion, loader)
+    }
+}
+
+define class PvContentInstallJob based JobBody {
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+    private string kind: get, set
+    private bool withDependencies: get, set
+    private string world: get, set
+
+    method execute(string jobId): object {
+        claimBusy(profileId, "content-install")
+        var outcome = core.runTrapped(PvContentTask{
+            jobId = jobId, profileId = profileId, provider = provider,
+            projectId = projectId, versionId = versionId, kind = kind,
+            withDependencies = withDependencies, world = world
+        })
+        releaseBusy(profileId)
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+define class PvContentTask {
+    private string jobId: get, set
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+    private string kind: get, set
+    private bool withDependencies: get, set
+    private string world: get, set
+
+    method run(): object {
+        return installContent(jobId, profileId, provider, projectId, versionId, kind, withDependencies, world)
+    }
+}
+
+// Remembers where an installed file came from (its sha1 -> source entry in the
+// content store), so identify is not needed for it and updates and exports know it.
+// The sha1 is taken from the file on disk, not from the provider's metadata
+// (CurseForge does not always list one).
+method recordContentSource(string profileId, string folder, string world, string fileName, map<string, object> version, string provider) {
+    var source = {
+        "provider": provider,
+        "projectId": jstr(version, "projectId"),
+        "versionId": jstr(version, "id"),
+        "versionNumber": jstr(version, "versionNumber"),
+        "name": jstr(version, "name")
+    }
+    var loc = mods.contentLoc(profileId, folder, world)
+    var file = path.join(loc.dir(), fileName)
+    mods.recordSource(loc, fileName, sha1Hex(os.readFile(file)), source)
+}
+
+// Downloads one version into folder; returns the stored file name.
+method installVersionFile(string gameDir, string folder, map<string, object> version, string provider): string {
+    var fileName = version["fileName"]
+    if (fileName == "") {
+        fileName = version["id"] + ".jar"
+    }
+    var target = path.join(gameDir, folder, safeFileName(fileName))
+    var headers = {}
+    if (provider == "modrinth") {
+        headers = mrHeaders()
+    }
+    downloadFile(version["downloadUrl"], target, hashMap(jstr(version, "sha1"), jstr(version, "md5"), "", jstr(version, "sha512")), headers)
+    return path.basename(target)
+}
+
+// withDependencies false installs only the requested file (mods only; other kinds never have dependencies here).
+method installContent(string jobId, string profileId, string provider, string projectId, string versionId, string kind, bool withDependencies, string world): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var gameDir = core.profileDir(profileId)
+    var folder = kindFolder(kind)
+    if (kind == "datapack") {
+        // Minecraft reads data packs from the world they belong to, not from the profile.
+        folder = "saves/" + world + "/datapacks"
+    }
+    var gameVersion = jstr(profile, "minecraftVersion")
+    var loader = jstr(profile, "loader")
+    if (loader == "vanilla") {
+        loader = ""
+    }
+    // Only mods are bound to a mod loader.
+    var loaderFilter = ""
+    if (kind == "mod") {
+        loaderFilter = loader
+    }
+    // Packs are tagged by their own kind on Modrinth (a data pack project may also ship a mod jar).
+    if (kind == "resourcepack") {
+        loaderFilter = "minecraft"
+    }
+    if (kind == "datapack") {
+        loaderFilter = "datapack"
+    }
+    core.jobProgress(jobId, 0.05, "Lese Version")
+    var root = core.none()
+    if (versionId != "") {
+        root = contentVersionById(provider, versionId)
+    } else {
+        root = newestCompatible(provider, projectId, gameVersion, loaderFilter)
+        if (core.isNull(root)) {
+            core.notFound("no version of '" + projectId + "' fits Minecraft " + gameVersion + " / " + profile["loader"])
+        }
+    }
+    if (versionId != "" && sameProject(provider, projectId, root["projectId"]) == false) {
+        core.badRequest("version '" + root["id"] + "' does not belong to project '" + projectId + "'")
+    }
+    if (root["downloadUrl"] == "") {
+        core.upstream(root["name"] + " cannot be downloaded automatically; its author disabled third-party downloads")
+    }
+
+    var installed = []
+    var skipped = []
+    var visited = [root["projectId"]]
+    var present = []
+    var wantDependencies = false
+    if (kind == "mod" && withDependencies) {
+        for (d in root["dependencies"]) {
+            if (d["dependencyType"] == "required") {
+                wantDependencies = true
+            }
+        }
+    }
+    if (wantDependencies) {
+        core.jobProgress(jobId, 0.1, "Prüfe vorhandene Mods")
+        var found = core.runTrapped(PvPresentTask{provider = provider, modsDir = path.join(gameDir, "mods")})
+        if (found.failed()) {
+            skipped.append("could not check which mods are installed: " + failureMessage(found.error()))
+        } else {
+            present = found.result()
+        }
+    }
+
+    core.jobProgress(jobId, 0.2, "Lade " + root["name"])
+    var stored = installVersionFile(gameDir, folder, root, provider)
+    recordContentSource(profileId, kindFolder(kind), world, stored, root, provider)
+    installed.append({"projectId": root["projectId"], "versionId": root["id"], "fileName": stored, "folder": folder, "dependency": false})
+
+    // Breadth first over required dependencies, at most 4 levels deep.
+    var level = [root]
+    var depth = 1
+    while (wantDependencies && level.length() > 0 && depth <= PV_MAX_DEPENDENCY_DEPTH) {
+        core.checkCancelled(jobId)
+        var next = []
+        for (parent in level) {
+            for (d in parent["dependencies"]) {
+                var pid = jstr(d, "projectId")
+                if (d["dependencyType"] != "required" || pid == "" || visited.contains(pid)) {
+                    continue
+                }
+                visited.append(pid)
+                if (present.contains(pid)) {
+                    skipped.append("dependency " + pid + " is already installed")
+                    continue
+                }
+                var resolved = core.runTrapped(PvDependencyTask{provider = provider, dependency = d, gameVersion = gameVersion, loader = loader})
+                if (resolved.failed()) {
+                    skipped.append("dependency " + pid + " could not be resolved: " + failureMessage(resolved.error()))
+                    continue
+                }
+                var dep = resolved.result()
+                if (core.isNull(dep) || dep["downloadUrl"] == "") {
+                    skipped.append("no downloadable build of dependency " + pid + " for Minecraft " + gameVersion + " / " + profile["loader"])
+                    continue
+                }
+                core.jobProgress(jobId, 0.5, "Lade Abhängigkeit " + dep["name"])
+                var depFile = core.runTrapped(PvInstallFileTask{gameDir = gameDir, folder = "mods", version = dep, provider = provider})
+                if (depFile.failed()) {
+                    if (core.isCancelFailure(depFile.error())) {
+                        core.raiseCancelled()
+                    }
+                    skipped.append("dependency " + pid + " could not be installed: " + failureMessage(depFile.error()))
+                    continue
+                }
+                recordContentSource(profileId, "mods", "", depFile.result(), dep, provider)
+                installed.append({"projectId": pid, "versionId": dep["id"], "fileName": depFile.result(), "folder": "mods", "dependency": true})
+                next.append(dep)
+            }
+        }
+        level = next
+        depth = depth + 1
+    }
+    return {"profileId": profileId, "installed": installed, "skipped": skipped}
+}
+
+define class PvInstallFileTask {
+    private string gameDir: get, set
+    private string folder: get, set
+    private map<string, object> version: get, set
+    private string provider: get, set
+
+    method run(): object {
+        return installVersionFile(gameDir, folder, version, provider)
+    }
+}

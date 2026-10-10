@@ -1,0 +1,606 @@
+package system
+
+import base64
+import bytes
+import core
+import crypto
+import json
+import launch
+import os
+import path
+import strings
+import thread
+import time
+
+// Launcher updates from the CDN (the manifest format of Lumen IDE's publish script,
+// scripts/publish-cdn.mjs and electron/features/app/updater.ts). The installer for this
+// platform is downloaded into <dataDir>/updates and checked against the manifest; applying
+// it stays with the user (the renderer opens the folder or the release page).
+//
+//   GET  /api/updates[?force=1]        UpdateInfo, cached for 10 minutes unless forced
+//   POST /api/updates/download         Job (202) -> result {path, fileName, directory, verified}
+//   POST /api/updates/open-release     {url} of the release page
+//
+// The manifest (SYSTEM_UPDATE_MANIFEST_URL, fixed) reads:
+//   {product, version, releaseDate, notes?, platforms: {<platform>: {version, releaseDate,
+//    update: {name, size, sha512}, files: [{name, size, sha512}]}}}
+// sha512 is base64 (electron-builder style). The platform keys are the ones Lumen uses:
+//   linux_amd64, linux_aarch64, windows_x86_64, windows_arm64, macos_arm64.
+// The installer is platforms.<platform>.update, or the first of files when there is none. Its
+// file lies at <feed>/<platform>/<name>.
+//
+// Verification: the downloaded file must have the manifest's size and SHA-512. The base64 value
+// is decoded to 64 bytes and compared as hex with the hex digest of the file (sha512sum,
+// shasum -a 512 or certutil, through launch.launchFileDigest). A failed check deletes the
+// download and the job fails. Versions compare like Lumen's compareVersions (see below).
+//
+// UpdateInfo: {available, currentVersion, latestVersion, name, notes, publishedAt, releaseUrl,
+// assetName, downloadable, assetSize, prerelease, reason, checksumSha512 (hex)}.
+
+final SYSTEM_UPDATE_CACHE_SECONDS = 600
+final SYSTEM_UPDATE_ATTEMPTS = 3
+final SYSTEM_UPDATE_MANIFEST_URL = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest/latest.json"
+final SYSTEM_UPDATE_FEED = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest"
+final SYSTEM_UPDATE_RELEASE_PAGE = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest/"
+final SYSTEM_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+final SYSTEM_URL_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()"
+
+var systemUpdateLock = thread.mutex()
+var systemUpdateCache = {}       // the last UpdateInfo, with downloadUrl
+var systemUpdateCachedAt = 0     // unix seconds of that check
+
+// --- platforms ------------------------------------------------------------------
+
+// The manifest key of a launch.launchOsName() ("linux" | "windows" | "osx") and
+// launch.launchArch() ("amd64" | "aarch64" | ...) pair, or "" for a platform without a build.
+method systemPlatformFor(string system, string arch): string {
+    if (system == "linux" && arch == "amd64") {
+        return "linux_amd64"
+    }
+    if (system == "linux" && arch == "aarch64") {
+        return "linux_aarch64"
+    }
+    if (system == "windows" && arch == "amd64") {
+        return "windows_x86_64"
+    }
+    if (system == "windows" && arch == "aarch64") {
+        return "windows_arm64"
+    }
+    if (system == "osx" && arch == "aarch64") {
+        return "macos_arm64"
+    }
+    return ""
+}
+
+// The manifest key of this machine, or "".
+method systemPlatformKey(): string {
+    return systemPlatformFor(launch.launchOsName(), launch.launchArch())
+}
+
+// --- versions (Lumen's compareVersions) -------------------------------------------
+
+// The version without a leading "v".
+method systemVersionText(string value): string {
+    if (value.startsWith("v")) {
+        return value.substring(1, value.length())
+    }
+    return value
+}
+
+// The part before the first "-".
+method systemVersionCore(string text): string {
+    var dash = text.indexOf("-")
+    if (dash < 0) {
+        return text
+    }
+    return text.substring(0, dash)
+}
+
+// The pre-release part: between the first and the second "-" (as JavaScript's split("-", 2)).
+method systemVersionPre(string text): string {
+    var dash = text.indexOf("-")
+    if (dash < 0) {
+        return ""
+    }
+    var rest = text.substring(dash + 1, text.length())
+    var second = rest.indexOf("-")
+    if (second < 0) {
+        return rest
+    }
+    return rest.substring(0, second)
+}
+
+// The leading digits of a part as a number, 0 when there are none (parseInt(n, 10) || 0).
+method systemLeadingNumber(string text): integer {
+    var digits = ""
+    for (ch in text) {
+        if (strings.isDigit(ch) == false) {
+            break
+        }
+        digits = digits + ch
+    }
+    if (digits == "") {
+        return 0
+    }
+    return parseInt(digits)
+}
+
+// "1.2.10" -> [1, 2, 10].
+method systemVersionNumbers(string text): array {
+    var numbers = []
+    for (part in text.split(".")) {
+        numbers.append(systemLeadingNumber("" + part))
+    }
+    return numbers
+}
+
+// Pre-release identifiers, compared one by one: numbers numerically, text case-insensitively
+// (an approximation of localeCompare with numeric collation for labels like "beta.2").
+method systemPreCompare(string a, string b): integer {
+    var left = a.split(".")
+    var right = b.split(".")
+    var count = left.length()
+    if (right.length() < count) {
+        count = right.length()
+    }
+    var i = 0
+    while (i < count) {
+        var x = "" + left[i]
+        var y = "" + right[i]
+        if (x != y) {
+            if (strings.isNumeric(x) && strings.isNumeric(y)) {
+                var nx = parseInt(x)
+                var ny = parseInt(y)
+                if (nx != ny) {
+                    if (nx > ny) {
+                        return 1
+                    }
+                    return -1
+                }
+            } else {
+                return strings.compare(x.toLower(), y.toLower())
+            }
+        }
+        i = i + 1
+    }
+    if (left.length() == right.length()) {
+        return 0
+    }
+    if (left.length() < right.length()) {
+        return -1
+    }
+    return 1
+}
+
+// -1, 0 or 1: a against b. 1.2.10 > 1.2.9; a pre-release (1.3.0-beta.1) comes before its release.
+method systemCompareVersions(string a, string b): integer {
+    var textA = systemVersionText(a)
+    var textB = systemVersionText(b)
+    var left = systemVersionNumbers(systemVersionCore(textA))
+    var right = systemVersionNumbers(systemVersionCore(textB))
+    var count = left.length()
+    if (right.length() > count) {
+        count = right.length()
+    }
+    var i = 0
+    while (i < count) {
+        integer x = 0
+        integer y = 0
+        if (i < left.length()) {
+            x = left[i]
+        }
+        if (i < right.length()) {
+            y = right[i]
+        }
+        if (x != y) {
+            if (x > y) {
+                return 1
+            }
+            return -1
+        }
+        i = i + 1
+    }
+    var preA = systemVersionPre(textA)
+    var preB = systemVersionPre(textB)
+    if (preA == preB) {
+        return 0
+    }
+    if (preA == "") {
+        return 1
+    }
+    if (preB == "") {
+        return -1
+    }
+    return systemPreCompare(preA, preB)
+}
+
+// A string field of a JSON object, or "" (null and missing fields included).
+method systemText(object source, string key): string {
+    var value = core.getOr(source, key, "")
+    if (core.isString(value)) {
+        return value
+    }
+    return ""
+}
+
+// --- manifest ----------------------------------------------------------------------
+
+// The hex form of a manifest SHA-512 (base64 of 64 bytes). "" when the value is not one.
+method systemSha512Hex(string encoded): string {
+    var text = encoded.trim()
+    if (text.length() != 88) {
+        return ""
+    }
+    var raw = base64.decode(text)
+    if (bytes.size(raw) != 64) {
+        return ""
+    }
+    return crypto.hex(raw).toLower()
+}
+
+// The installer entry of a platform: platforms.<platform>.update, else files[0]; none when neither.
+method systemUpdateFile(map<string, object> entry): object {
+    var main = core.getOr(entry, "update", core.none())
+    if (core.isMap(main)) {
+        return main
+    }
+    var files = core.getOr(entry, "files", [])
+    if (core.isArray(files) && files.length() > 0 && core.isMap(files[0])) {
+        return files[0]
+    }
+    return core.none()
+}
+
+// Percent-encoding of a file name for the URL (encodeURIComponent's unreserved set).
+method systemPercentEncode(string text): string {
+    var out = ""
+    for (ch in text) {
+        if (SYSTEM_URL_SAFE.contains(ch)) {
+            out = out + ch
+        } else {
+            out = out + "%" + crypto.hex(ch).toUpper()
+        }
+    }
+    return out
+}
+
+method systemFileUrl(string platform, string name): string {
+    return SYSTEM_UPDATE_FEED + "/" + platform + "/" + systemPercentEncode(name)
+}
+
+// "not available" with a reason.
+method systemUpdateNone(string reason): map<string, object> {
+    return {
+        "available": false,
+        "currentVersion": core.version(),
+        "latestVersion": core.version(),
+        "name": "",
+        "notes": "",
+        "publishedAt": "",
+        "releaseUrl": SYSTEM_UPDATE_RELEASE_PAGE,
+        "assetName": "",
+        "downloadable": false,
+        "downloadUrl": "",
+        "assetSize": 0,
+        "checksumSha512": "",
+        "prerelease": false,
+        "reason": reason
+    }
+}
+
+// The UpdateInfo of a manifest text for one platform and the running version. Pure: the
+// fetch happens in systemUpdateFetch, so the checks can run it on fixtures.
+method systemUpdateFromManifest(string text, string platform, string current, bool includePre): map<string, object> {
+    if (json.isValid(text) == false) {
+        return systemUpdateNone("The update manifest is not valid JSON.")
+    }
+    var manifest = json.parse(text)
+    if (core.isMap(manifest) == false) {
+        return systemUpdateNone("The update manifest is not an object.")
+    }
+    var platforms = core.getOr(manifest, "platforms", core.none())
+    if (core.isMap(platforms) == false) {
+        return systemUpdateNone("The update manifest has no platforms.")
+    }
+    var entry = core.getOr(platforms, platform, core.none())
+    if (core.isMap(entry) == false) {
+        return systemUpdateNone("No update is published for " + platform + " yet.")
+    }
+    var latest = systemText(entry, "version")
+    if (latest == "") {
+        return systemUpdateNone("The update manifest has no version for " + platform + ".")
+    }
+    var prerelease = systemVersionPre(systemVersionText(latest)) != ""
+    var newer = systemCompareVersions(latest, current) > 0
+    var available = newer
+    var reason = ""
+    if (newer == false) {
+        available = false
+        reason = "You already have the latest version."
+    }
+    if (newer && prerelease && includePre == false) {
+        available = false
+        reason = "Version " + latest + " is a pre-release. Turn on beta updates to see it."
+    }
+    var product = systemText(manifest, "product")
+    if (product == "") {
+        product = "VoltLauncher"
+    }
+    var published = systemText(entry, "releaseDate")
+    if (published == "") {
+        published = systemText(manifest, "releaseDate")
+    }
+    var notes = ""
+    if (systemText(manifest, "version") == latest) {
+        notes = systemText(manifest, "notes")
+    }
+    var assetName = ""
+    var downloadUrl = ""
+    var checksum = ""
+    integer size = 0
+    var pick = systemUpdateFile(entry)
+    if (core.isNull(pick)) {
+        if (available) {
+            reason = "This release has no installer for your platform."
+        }
+    } else {
+        assetName = systemText(pick, "name")
+        checksum = systemSha512Hex(systemText(pick, "sha512"))
+        var declared = core.getOr(pick, "size", 0)
+        if (core.isWholeNumber(declared)) {
+            size = core.toInteger(declared)
+        }
+        if (assetName != "" && checksum != "" && size > 0) {
+            downloadUrl = systemFileUrl(platform, assetName)
+        } else if (available) {
+            reason = "The manifest holds no usable size or SHA-512 for the installer."
+        }
+    }
+    return {
+        "available": available,
+        "currentVersion": current,
+        "latestVersion": latest,
+        "name": product + " " + latest,
+        "notes": notes,
+        "publishedAt": published,
+        "releaseUrl": SYSTEM_UPDATE_RELEASE_PAGE,
+        "assetName": assetName,
+        "downloadable": downloadUrl != "",
+        "downloadUrl": downloadUrl,
+        "assetSize": size,
+        "checksumSha512": checksum,
+        "prerelease": prerelease,
+        "reason": reason
+    }
+}
+
+// --- fetch -------------------------------------------------------------------------
+
+// GET of the manifest: {status, body, error}. status 0 when curl got no answer; retried on
+// no answer and 5xx, with the launch module's rules.
+method systemFetchManifest(): map<string, object> {
+    var temp = path.join(os.temp(), "volt-update-" + crypto.hex(crypto.random(6)) + ".json")
+    var answer = {"status": 0, "body": "", "error": ""}
+    var attempt = 1
+    while (attempt <= SYSTEM_UPDATE_ATTEMPTS) {
+        var result = launch.launchCurl(SYSTEM_UPDATE_MANIFEST_URL, temp)
+        var status = result["status"]
+        answer = {"status": status, "body": "", "error": launch.launchDescribe(result)}
+        if (status >= 200 && status < 300) {
+            answer["body"] = os.readFile(temp)
+        }
+        if (os.isFile(temp)) {
+            os.remove(temp)
+        }
+        if (status >= 200 && status < 300) {
+            return answer
+        }
+        if (launch.launchRetryable(status) == false) {
+            return answer
+        }
+        if (attempt < SYSTEM_UPDATE_ATTEMPTS) {
+            thread.sleep(500 * attempt)
+        }
+        attempt = attempt + 1
+    }
+    return answer
+}
+
+// The check against the CDN. Raises only for an unexpected failure (the caller traps it).
+method systemUpdateFetch(): map<string, object> {
+    var platform = systemPlatformKey()
+    var includePre = core.setting("betaUpdates") == true
+    if (platform == "") {
+        return systemUpdateNone("No launcher update is built for this platform (" + launch.launchOsName() + ", " + launch.launchArch() + ").")
+    }
+    var answer = systemFetchManifest()
+    var status = answer["status"]
+    if (status == 404) {
+        return systemUpdateNone("No update is published yet: " + SYSTEM_UPDATE_MANIFEST_URL + " answers HTTP 404.")
+    }
+    if (status < 200 || status >= 300) {
+        return systemUpdateNone("Could not reach the update manifest: " + answer["error"])
+    }
+    return systemUpdateFromManifest("" + answer["body"], platform, core.version(), includePre)
+}
+
+define class SystemUpdateFetchTask {
+    method run(): object {
+        return systemUpdateFetch()
+    }
+}
+
+// The cached check, or a fresh one when `force` or the cache is older than 10 minutes.
+// Never raises: an unreachable manifest is an UpdateInfo with a reason.
+method systemUpdateCheck(bool force): map<string, object> {
+    var now = time.now()
+    var text = ""
+    var cachedAt = 0
+    sync (systemUpdateLock) {
+        text = json.stringify(systemUpdateCache)
+        cachedAt = systemUpdateCachedAt
+    }
+    var cached = json.parse(text)
+    if (force == false && cached.has("latestVersion") && now - cachedAt < SYSTEM_UPDATE_CACHE_SECONDS) {
+        return cached
+    }
+    var outcome = core.runTrapped(SystemUpdateFetchTask{})
+    var info = {}
+    if (outcome.failed()) {
+        var failure = core.decodeFailure(outcome.error())
+        info = systemUpdateNone("Could not check for updates: " + failure["message"])
+    } else {
+        info = outcome.result()
+    }
+    var stored = json.stringify(info)
+    var copy = json.parse(stored)
+    sync (systemUpdateLock) {
+        systemUpdateCache = copy
+        systemUpdateCachedAt = now
+    }
+    return json.parse(stored)
+}
+
+// The UpdateInfo as the API answers it (without the download address).
+method systemUpdatePublic(map<string, object> info): map<string, object> {
+    var out = json.parse(json.stringify(info))
+    out.remove("downloadUrl")
+    return out
+}
+
+// --- download job -----------------------------------------------------------------
+
+// A file name the disk accepts: other characters become "_".
+method systemSafeFileName(string name): string {
+    var out = ""
+    for (ch in name) {
+        if (SYSTEM_NAME_CHARS.contains(ch)) {
+            out = out + ch
+        } else {
+            out = out + "_"
+        }
+    }
+    if (out == "") {
+        return "voltlauncher-update"
+    }
+    return out
+}
+
+// "" when `file` has the manifest's size and SHA-512 (hex). Otherwise the reason; the file and
+// the target are deleted then, so a failed verification leaves no download behind.
+method systemCheckDownload(string file, string target, string sha512Hex, integer size): string {
+    var problem = ""
+    var actualSize = os.fileSize(file)
+    if (actualSize != size) {
+        problem = "the file has " + actualSize + " bytes, the manifest says " + size
+    } else if (launch.launchFileDigest(file, "sha512") != sha512Hex) {
+        problem = "the SHA-512 does not match the manifest"
+    }
+    if (problem != "") {
+        if (os.isFile(file)) {
+            os.remove(file)
+        }
+        if (os.isFile(target)) {
+            os.remove(target)
+        }
+    }
+    return problem
+}
+
+// Downloads the installer into <dataDir>/updates. The body goes to a temporary file, is
+// checked, then renamed over the target. Transport failures are retried; a failed check is not.
+method systemDownloadUpdate(string jobId, string url, string assetName, string sha512Hex, integer size): map<string, object> {
+    var dir = core.ensureDir(path.join(core.dataDir(), "updates"))
+    var fileName = systemSafeFileName(assetName)
+    var target = path.join(dir, fileName)
+    var temp = target + ".part-" + crypto.hex(crypto.random(4))
+    core.jobProgress(jobId, 0.0, "Lade " + fileName)
+    var last = ""
+    var attempt = 1
+    while (attempt <= SYSTEM_UPDATE_ATTEMPTS) {
+        var result = launch.launchCurl(url, temp)
+        var status = result["status"]
+        if (status >= 200 && status < 300) {
+            var problem = systemCheckDownload(temp, target, sha512Hex, size)
+            if (problem != "") {
+                core.upstream("The download of " + fileName + " failed its check (" + problem + "); it was deleted.")
+            }
+            if (launch.launchReplace(temp, target) == false) {
+                core.internal("cannot move the update to '" + target + "'")
+            }
+            core.jobProgress(jobId, 1.0, "Geladen")
+            return {"path": target, "fileName": fileName, "directory": dir, "verified": true}
+        }
+        if (os.isFile(temp)) {
+            os.remove(temp)
+        }
+        last = launch.launchDescribe(result)
+        if (launch.launchRetryable(status) == false) {
+            break
+        }
+        if (attempt < SYSTEM_UPDATE_ATTEMPTS) {
+            thread.sleep(500 * attempt)
+        }
+        attempt = attempt + 1
+    }
+    core.upstream("The download of " + fileName + " failed: " + last)
+    return {}
+}
+
+define class SystemUpdateDownload based JobBody {
+    private string downloadUrl: get, set
+    private string assetName: get, set
+    private string checksum: get, set
+    private integer size: get, set
+
+    method execute(string jobId): object {
+        return systemDownloadUpdate(jobId, downloadUrl, assetName, checksum, size)
+    }
+}
+
+// --- routes -------------------------------------------------------------------------
+
+method systemUpdatesRoute(string verb, array<string> segments, map<string, string> query): map<string, object> {
+    if (segments.length() == 1) {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var force = false
+        if (query.has("force")) {
+            force = query["force"] == "1" || query["force"] == "true"
+        }
+        return core.ok(systemUpdatePublic(systemUpdateCheck(force)))
+    }
+    if (segments.length() == 2 && segments[1] == "download") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var info = systemUpdateCheck(false)
+        if (core.getOr(info, "available", false) != true) {
+            core.conflict("there is no newer release to download")
+        }
+        if (core.getOr(info, "downloadable", false) != true) {
+            core.conflict("this release has no download for your platform")
+        }
+        var size = 0
+        var declared = core.getOr(info, "assetSize", 0)
+        if (core.isWholeNumber(declared)) {
+            size = core.toInteger(declared)
+        }
+        var job = core.startJob("update-download", "Lade VoltLauncher " + systemText(info, "latestVersion"), SystemUpdateDownload{
+            downloadUrl = systemText(info, "downloadUrl"),
+            assetName = systemText(info, "assetName"),
+            checksum = systemText(info, "checksumSha512"),
+            size = size
+        })
+        return core.respond(202, job)
+    }
+    if (segments.length() == 2 && segments[1] == "open-release") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok({"url": SYSTEM_UPDATE_RELEASE_PAGE})
+    }
+    core.notFound("no such endpoint")
+    return {}
+}

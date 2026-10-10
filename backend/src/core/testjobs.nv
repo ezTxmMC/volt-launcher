@@ -1,0 +1,62 @@
+package core
+
+import thread
+
+// Test-only endpoints, mounted under /api/_test only when the backend was
+// started with --enable-test-routes (the smoke test does that; Electron
+// never does).
+//
+//   POST /api/_test/jobs  {"steps": 5, "delayMs": 50, "fail": false}  -> 202 Job
+//
+// The job counts through `steps`, sleeping `delayMs` each, honours cancel
+// requests and fails at the end when "fail" is true.
+
+define class CountingJob based JobBody {
+    private integer steps: get, set
+    private integer delayMs: get, set
+    private bool shouldFail: get, set
+
+    method execute(string jobId): object {
+        var i = 0
+        while (i < steps) {
+            checkCancelled(jobId)
+            thread.sleep(delayMs)
+            i = i + 1
+            jobProgress(jobId, toFloat(i) / toFloat(steps), "Step ${i} / ${steps}")
+        }
+        if (shouldFail) {
+            fail(500, "internal", "test job failed on purpose")
+        }
+        return {"steps": steps}
+    }
+}
+
+method toFloat(integer value): float {
+    float f = value
+    return f
+}
+
+method testRoute(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "jobs" && verb == "POST") {
+        var options = {}
+        if (isMap(body)) {
+            options = body
+        }
+        var steps = getOr(options, "steps", 5)
+        var delay = getOr(options, "delayMs", 50)
+        var failing = getOr(options, "fail", false)
+        if (isWholeNumber(steps) == false || toInteger(steps) < 1 || toInteger(steps) > 10000) {
+            badRequest("'steps' must be an integer between 1 and 10000")
+        }
+        if (isWholeNumber(delay) == false || toInteger(delay) < 0 || toInteger(delay) > 60000) {
+            badRequest("'delayMs' must be an integer between 0 and 60000")
+        }
+        if (isBool(failing) == false) {
+            badRequest("'fail' must be true or false")
+        }
+        var counting = CountingJob{steps = toInteger(steps), delayMs = toInteger(delay), shouldFail = failing}
+        return respond(202, startJob("test", "Test job", counting))
+    }
+    notFound("no such endpoint")
+    return {}
+}

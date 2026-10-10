@@ -1,0 +1,181 @@
+package autoprofiles
+
+import launch
+import path
+import thread
+import time
+import core
+
+// The checker. The timer (one step per second) starts a check job 30 seconds after the
+// server starts and 30 seconds after the feature is switched on, then every 60 minutes
+// while it is on. A check reads the Mojang manifest and handles every version not yet seen:
+//   - the first check (autoRecordOnlyDue) only records the versions present;
+//   - later checks create "<version> Performance" for each new version of the selected
+//     kind (release; with snapshots also snapshot), and record the others as seen.
+// A failed manifest sets lastError and the next check tries again. A version whose profile
+// could not be made now (failed, not skipped) stays unseen and is tried again.
+
+define class AutoManifestTask {
+    method run(): object {
+        return autoManifest()
+    }
+}
+
+// The version manifest: Mojang's (launch.LAUNCH_MANIFEST_URL), or the fixture's manifest.json
+// in tests. Raises 502 when it cannot be loaded.
+method autoManifest(): map<string, object> {
+    var dir = autoFixtureDir()
+    var manifest = core.none()
+    if (dir != "") {
+        manifest = core.readJsonFile(path.join(dir, "manifest.json"), core.none())
+    } else {
+        manifest = launch.launchFetchJson(launch.LAUNCH_MANIFEST_URL)
+    }
+    if (core.isMap(manifest) == false || core.isArray(core.getOr(manifest, "versions", 0)) == false) {
+        core.upstream("the Minecraft version manifest cannot be loaded")
+    }
+    return manifest
+}
+
+// {id, type} of every version in the manifest, in the manifest's order.
+method autoVersionEntries(map<string, object> manifest): array {
+    var out = []
+    for (entry in manifest["versions"]) {
+        if (core.isMap(entry) == false) {
+            continue
+        }
+        var id = "" + core.getOr(entry, "id", "")
+        if (id != "") {
+            out.append({"id": id, "type": "" + core.getOr(entry, "type", "")})
+        }
+    }
+    return out
+}
+
+// One check (the job body): the manifest, then every version not yet seen.
+method autoRunCheck(string jobId): map<string, object> {
+    core.jobProgress(jobId, 0.02, "Lade die Versionsliste")
+    var attempt = core.runTrapped(AutoManifestTask{})
+    var at = core.nowIso()
+    if (attempt.failed()) {
+        var problem = "" + core.decodeFailure(attempt.error())["message"]
+        autoNoteCheck(at, problem)
+        core.upstream(problem)
+    }
+    var entries = autoVersionEntries(attempt.result())
+    if (autoRecordOnlyDue()) {
+        autoRecordBaseline(entries, at)
+        core.logInfo("autoprofiles: recorded " + entries.length() + " versions, no profiles created")
+        return {"versions": entries.length(), "created": 0, "skipped": 0, "failed": 0}
+    }
+    var known = autoSeenCopy()
+    var total = entries.length()
+    var created = 0
+    var skipped = 0
+    var failed = 0
+    var index = 0
+    for (entry in entries) {
+        index = index + 1
+        var id = "" + entry["id"]
+        if (known.contains(id)) {
+            continue
+        }
+        core.checkCancelled(jobId)
+        if (autoVersionWanted("" + entry["type"]) == false) {
+            autoMarkSeen(id)
+            continue
+        }
+        core.jobProgress(jobId, 0.05 + 0.9 * index / total, "Prüfe " + id)
+        var result = autoCreateForVersion(jobId, id)
+        autoRecordResult(id, result)
+        var status = "" + result["status"]
+        if (status == "created") {
+            created = created + 1
+        } else if (status == "skipped") {
+            skipped = skipped + 1
+        } else {
+            failed = failed + 1
+        }
+        if (status != "failed") {
+            autoMarkSeen(id)
+            autoSaveNow()
+        }
+    }
+    autoSaveNow()
+    autoNoteCheck(at, "")
+    core.logInfo("autoprofiles: check done, " + created + " created, " + skipped + " skipped, " + failed + " failed")
+    return {"versions": total, "created": created, "skipped": skipped, "failed": failed}
+}
+
+define class AutoCheckTask {
+    private string jobId: get, set
+
+    method run(): object {
+        return autoRunCheck(jobId)
+    }
+}
+
+// The check as a job (kind "autoprofile"). The claim taken by the starter is released whatever happens.
+define class AutoProfileCheckJob based JobBody {
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(AutoCheckTask{jobId = jobId})
+        autoReleaseCheck()
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+define class AutoTickTask {
+    method run(): object {
+        autoTick()
+        return true
+    }
+}
+
+// One timer step: notices when the feature is switched on, and starts a check when one is due.
+method autoTick() {
+    var enabled = autoEnabled()
+    var now = time.now()
+    var start = false
+    sync (autoLock) {
+        if (enabled && autoWasEnabled == false) {
+            autoRecordOnlyNext = true
+            autoNextCheck = now + AUTO_FIRST_CHECK_DELAY_SECONDS
+        }
+        autoWasEnabled = enabled
+        if (enabled && autoCheckRunning == false && now >= autoNextCheck) {
+            autoCheckRunning = true
+            autoNextCheck = now + AUTO_CHECK_INTERVAL_SECONDS
+            start = true
+        }
+    }
+    if (start) {
+        core.startJob("autoprofile", "Automatische Profile prüfen", AutoProfileCheckJob{})
+    }
+}
+
+// The timer thread: a failed step is logged and the loop goes on.
+method autoProfilesLoop() {
+    while (true) {
+        var outcome = core.runTrapped(AutoTickTask{})
+        if (outcome.failed()) {
+            core.logWarn("autoprofiles: " + core.decodeFailure(outcome.error())["message"])
+        }
+        thread.sleep(1000)
+    }
+}
+
+// Loads the state and starts the timer thread (called once from main, before the server listens).
+method startBackground() {
+    autoLoadState()
+    var enabled = autoEnabled()
+    var now = time.now()
+    sync (autoLock) {
+        autoWasEnabled = enabled
+        autoRecordOnlyNext = autoBaselined == false
+        autoNextCheck = now + AUTO_FIRST_CHECK_DELAY_SECONDS
+    }
+    thread autoProfilesLoop()
+}

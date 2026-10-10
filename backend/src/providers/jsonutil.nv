@@ -1,0 +1,241 @@
+package providers
+
+import core
+import json
+import time
+
+// Reading provider JSON. Every accessor treats a missing key, JSON null and
+// a value of the wrong type alike: as absent.
+
+// The text of `key`, or "" (numbers are turned into text).
+method jstr(object m, string key): string {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return ""
+    }
+    var value = m[key]
+    if (core.isString(value)) {
+        return value
+    }
+    var kind = typeOf(value)
+    if (kind == "integer") {
+        return "" + value
+    }
+    if (kind == "float" && core.isWholeNumber(value)) {
+        return "" + core.toInteger(value)
+    }
+    return ""
+}
+
+// The number of `key` as an integer, or `fallback`.
+method jint(object m, string key, integer fallback): integer {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return fallback
+    }
+    var value = m[key]
+    var kind = typeOf(value)
+    if (kind == "integer") {
+        return value
+    }
+    if (kind == "float") {
+        integer truncated = value
+        return truncated
+    }
+    if (core.isString(value) && isDigits(value)) {
+        return parseInt(value)
+    }
+    return fallback
+}
+
+method jbool(object m, string key): bool {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return false
+    }
+    var value = m[key]
+    return core.isBool(value) && value
+}
+
+// The array of `key`, or [].
+method jarr(object m, string key): array {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return []
+    }
+    var value = m[key]
+    if (core.isArray(value)) {
+        return value
+    }
+    return []
+}
+
+// The object of `key`, or {}.
+method jobj(object m, string key): map<string, object> {
+    if (core.isMap(m) == false || m.has(key) == false) {
+        return {}
+    }
+    var value = m[key]
+    if (core.isMap(value)) {
+        return value
+    }
+    return {}
+}
+
+// The non-blank strings of an array.
+method stringList(array values): array {
+    var out = []
+    for (value in values) {
+        if (core.isString(value) && value.trim() != "") {
+            out.append(value)
+        }
+    }
+    return out
+}
+
+// A query parameter, trimmed, or "".
+method queryText(map<string, string> query, string key): string {
+    if (query.has(key)) {
+        return ("" + query[key]).trim()
+    }
+    return ""
+}
+
+// A whole-number query parameter within [low, high], fallback when absent.
+method queryInt(map<string, string> query, string key, integer fallback, integer low, integer high): integer {
+    var text = queryText(query, key)
+    if (text == "") {
+        return fallback
+    }
+    if (isDigits(text) == false || text.length() > 9) {
+        core.badRequest("'" + key + "' must be a whole number between " + low + " and " + high)
+    }
+    var value = parseInt(text)
+    if (value < low || value > high) {
+        core.badRequest("'" + key + "' must be a whole number between " + low + " and " + high)
+    }
+    return value
+}
+
+// A string field of a request body, or "".
+method bodyText(object body, string key): string {
+    if (core.isMap(body) == false || body.has(key) == false) {
+        return ""
+    }
+    var value = body[key]
+    if (core.isString(value)) {
+        return value.trim()
+    }
+    if (typeOf(value) == "integer") {
+        return "" + value
+    }
+    if (typeOf(value) == "float" && core.isWholeNumber(value)) {
+        return "" + core.toInteger(value)
+    }
+    return ""
+}
+
+// Epoch seconds as ISO-8601 UTC, "" for 0 or less.
+method isoFromEpoch(integer seconds): string {
+    if (seconds <= 0) {
+        return ""
+    }
+    return time.iso(seconds)
+}
+
+// --- sorting -----------------------------------------------------------------------
+
+// A stable merge sort of maps by a numeric field, largest first.
+method sortByNumberDesc(array items, string key): array {
+    if (items.length() <= 1) {
+        return items
+    }
+    var middle = items.length() / 2
+    var left = []
+    var right = []
+    var i = 0
+    while (i < items.length()) {
+        if (i < middle) {
+            left.append(items[i])
+        } else {
+            right.append(items[i])
+        }
+        i = i + 1
+    }
+    left = sortByNumberDesc(left, key)
+    right = sortByNumberDesc(right, key)
+    var out = []
+    var a = 0
+    var b = 0
+    while (a < left.length() && b < right.length()) {
+        if (jint(right[b], key, 0) > jint(left[a], key, 0)) {
+            out.append(right[b])
+            b = b + 1
+        } else {
+            out.append(left[a])
+            a = a + 1
+        }
+    }
+    while (a < left.length()) {
+        out.append(left[a])
+        a = a + 1
+    }
+    while (b < right.length()) {
+        out.append(right[b])
+        b = b + 1
+    }
+    return out
+}
+
+// The same by a text field (ISO dates sort as text), largest first.
+method sortByTextDesc(array items, string key): array {
+    if (items.length() <= 1) {
+        return items
+    }
+    var middle = items.length() / 2
+    var left = []
+    var right = []
+    var i = 0
+    while (i < items.length()) {
+        if (i < middle) {
+            left.append(items[i])
+        } else {
+            right.append(items[i])
+        }
+        i = i + 1
+    }
+    left = sortByTextDesc(left, key)
+    right = sortByTextDesc(right, key)
+    var out = []
+    var a = 0
+    var b = 0
+    while (a < left.length() && b < right.length()) {
+        if (jstr(right[b], key) > jstr(left[a], key)) {
+            out.append(right[b])
+            b = b + 1
+        } else {
+            out.append(left[a])
+            a = a + 1
+        }
+    }
+    while (a < left.length()) {
+        out.append(left[a])
+        a = a + 1
+    }
+    while (b < right.length()) {
+        out.append(right[b])
+        b = b + 1
+    }
+    return out
+}
+
+// items[from, to) of an array.
+method pageOf(array items, integer from, integer count): array {
+    var out = []
+    var i = from
+    while (i < items.length() && i < from + count) {
+        out.append(items[i])
+        i = i + 1
+    }
+    return out
+}
+
+method copyOf(object value): object {
+    return json.parse(json.stringify(value))
+}

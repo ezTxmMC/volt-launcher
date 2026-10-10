@@ -1,0 +1,211 @@
+package providers
+
+import core
+import bytes
+import hash
+import os
+import zlib
+
+// Reading zip archives (pack archives, Solder mod zips, the jars inside
+// them): the central directory, stored and deflated entries, Zip64 sizes,
+// and a CRC-32 check of every entry that is read.
+//
+// zlib.decompress() wants a zlib stream; a zip entry is raw deflate data, so
+// a two byte zlib header is put in front (the decompressor skips it and does
+// not need the Adler-32 trailer).
+
+private final PV_ZIP_EOCD = 0x06054b50
+private final PV_ZIP_CENTRAL = 0x02014b50
+private final PV_ZIP_LOCAL = 0x04034b50
+private final PV_ZIP64_LOCATOR = 0x07064b50
+private final PV_ZIP64_EOCD = 0x06064b50
+private final PV_U32_MAX = 4294967295
+
+define class PvZipEntry {
+    private string name: get, set
+    private integer compression: get, set
+    private integer crc: get, set
+    private integer compressedSize: get, set
+    private integer size: get, set
+    private integer localOffset: get, set
+    private bool directory: get, set
+}
+
+define class PvZip {
+    private string label: get, set
+    private string data: get, set
+    private array entries: get, set
+}
+
+method le16(string data, integer at): integer {
+    return bytes.u8(data, at) + bytes.u8(data, at + 1) * 256
+}
+
+method le32(string data, integer at): integer {
+    return le16(data, at) + le16(data, at + 2) * 65536
+}
+
+method le64(string data, integer at): integer {
+    return le32(data, at) + le32(data, at + 4) * 4294967296
+}
+
+method zipBroken(string label, string why): object {
+    return core.upstream(label + " is not a valid zip archive (" + why + ")")
+}
+
+// Opens the zip archive in `file`.
+method zipOpenFile(string file, string label): PvZip {
+    if (os.isFile(file) == false) {
+        core.internal("archive '" + file + "' is missing")
+    }
+    return zipOpenData(os.readFile(file), label)
+}
+
+// Opens a zip archive held in memory (a nested jar).
+method zipOpenData(string data, string label): PvZip {
+    var n = bytes.size(data)
+    if (n < 22) {
+        zipBroken(label, "too short")
+    }
+    // The end of central directory record: the last one within the comment range.
+    var eocd = -1
+    var at = n - 22
+    var lowest = n - 22 - 65535
+    if (lowest < 0) {
+        lowest = 0
+    }
+    while (at >= lowest) {
+        if (bytes.u8(data, at) == 0x50 && bytes.u8(data, at + 1) == 0x4b && le32(data, at) == PV_ZIP_EOCD) {
+            eocd = at
+            break
+        }
+        at = at - 1
+    }
+    if (eocd < 0) {
+        zipBroken(label, "no end of central directory")
+    }
+    var count = le16(data, eocd + 10)
+    var cdOffset = le32(data, eocd + 16)
+    if ((count == 65535 || cdOffset == PV_U32_MAX) && eocd >= 20 && le32(data, eocd - 20) == PV_ZIP64_LOCATOR) {
+        var z64 = le64(data, eocd - 12)
+        if (z64 < 0 || z64 + 56 > n || le32(data, z64) != PV_ZIP64_EOCD) {
+            zipBroken(label, "bad Zip64 record")
+        }
+        count = le64(data, z64 + 32)
+        cdOffset = le64(data, z64 + 48)
+    }
+    if (cdOffset < 0 || cdOffset > n) {
+        zipBroken(label, "central directory out of range")
+    }
+    var entries = []
+    var p = cdOffset
+    var i = 0
+    while (i < count) {
+        if (p + 46 > n || le32(data, p) != PV_ZIP_CENTRAL) {
+            zipBroken(label, "bad central directory entry " + i)
+        }
+        var compression = le16(data, p + 10)
+        var crc = le32(data, p + 16)
+        var csize = le32(data, p + 20)
+        var usize = le32(data, p + 24)
+        var nameLen = le16(data, p + 28)
+        var extraLen = le16(data, p + 30)
+        var commentLen = le16(data, p + 32)
+        var local = le32(data, p + 42)
+        if (p + 46 + nameLen + extraLen + commentLen > n) {
+            zipBroken(label, "central directory entry " + i + " out of range")
+        }
+        var name = bytes.slice(data, p + 46, p + 46 + nameLen).replace("\\", "/")
+        if (usize == PV_U32_MAX || csize == PV_U32_MAX || local == PV_U32_MAX) {
+            // Zip64 extended information: the fields that overflowed, in order.
+            var e = p + 46 + nameLen
+            var end = e + extraLen
+            while (e + 4 <= end) {
+                var id = le16(data, e)
+                var len = le16(data, e + 2)
+                if (id == 1) {
+                    var f = e + 4
+                    if (usize == PV_U32_MAX && f + 8 <= e + 4 + len) {
+                        usize = le64(data, f)
+                        f = f + 8
+                    }
+                    if (csize == PV_U32_MAX && f + 8 <= e + 4 + len) {
+                        csize = le64(data, f)
+                        f = f + 8
+                    }
+                    if (local == PV_U32_MAX && f + 8 <= e + 4 + len) {
+                        local = le64(data, f)
+                    }
+                }
+                e = e + 4 + len
+            }
+        }
+        entries.append(PvZipEntry{
+            name = name,
+            compression = compression,
+            crc = crc,
+            compressedSize = csize,
+            size = usize,
+            localOffset = local,
+            directory = name.endsWith("/")
+        })
+        p = p + 46 + nameLen + extraLen + commentLen
+        i = i + 1
+    }
+    return PvZip{label = label, data = data, entries = entries}
+}
+
+// The bytes of an entry, checked against its CRC-32.
+method zipRead(PvZip zip, PvZipEntry entry): string {
+    var data = zip.data()
+    var n = bytes.size(data)
+    var at = entry.localOffset()
+    if (at < 0 || at + 30 > n || le32(data, at) != PV_ZIP_LOCAL) {
+        zipBroken(zip.label(), "bad local header for '" + entry.name() + "'")
+    }
+    var start = at + 30 + le16(data, at + 26) + le16(data, at + 28)
+    var end = start + entry.compressedSize()
+    if (end > n || entry.compressedSize() < 0) {
+        zipBroken(zip.label(), "'" + entry.name() + "' is cut short")
+    }
+    var raw = data.substring(start, end)
+    var content = ""
+    if (entry.compression() == 0) {
+        content = raw
+    } else if (entry.compression() == 8) {
+        if (entry.size() > 0) {
+            content = zlib.decompress(bytes.putU8(0x78) + bytes.putU8(0x9c) + raw, entry.size())
+            if (zlib.failed()) {
+                zipBroken(zip.label(), "'" + entry.name() + "' does not inflate")
+            }
+        }
+    } else {
+        zipBroken(zip.label(), "'" + entry.name() + "' uses unsupported compression method " + entry.compression())
+    }
+    if (bytes.size(content) != entry.size()) {
+        zipBroken(zip.label(), "'" + entry.name() + "' has the wrong size")
+    }
+    if (hash.crc32(content) != entry.crc()) {
+        zipBroken(zip.label(), "CRC mismatch in '" + entry.name() + "'")
+    }
+    return content
+}
+
+// The entry named exactly `name`, or null.
+method zipFind(PvZip zip, string name): object {
+    for (entry in zip.entries()) {
+        if (entry.name() == name) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// The content of the entry `name`, or "" when there is none (or it is a directory).
+method zipReadNamed(PvZip zip, string name): string {
+    var entry = zipFind(zip, name)
+    if (core.isNull(entry) || entry.directory()) {
+        return ""
+    }
+    return zipRead(zip, entry)
+}

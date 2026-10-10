@@ -1,0 +1,551 @@
+package system
+
+import core
+import json
+import os
+import path
+import thread
+import time
+
+// Discord rich presence over Discord's local IPC socket (DiscordIpcClient.java).
+//
+// Frames are [opcode int32 LE][length int32 LE][utf-8 JSON]. The socket is a Unix
+// domain socket (Linux, macOS: $XDG_RUNTIME_DIR, $TMPDIR, /tmp, Flatpak and Snap
+// sub-folders, discord-ipc-0..9) or a named pipe (Windows: \\.\pipe\discord-ipc-0..9).
+// Binary framing needs C, so the socket calls below are a small C block.
+//
+// One loop thread (systemStartBackground) owns the connection:
+//   - nothing configured or switched off: no connection attempt
+//   - Discord not running: "waiting_for_discord", retried every 15 s; nothing fails
+//   - connected: the wanted activity is pushed when it changed, and again every 15 s
+//   - Discord closes or breaks the pipe: back to waiting
+//
+// States: disabled | not_configured | waiting_for_discord | rejected | connected.
+// "rejected" means Discord answered the handshake with an error (wrong application id).
+//
+//   GET /api/integrations/discord    {state, message, transport, configured, enabled}
+//
+// Other modules set what is shown with systemDiscordSetActivity(details, state, startedAtMs).
+
+c {
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
+
+#define VOLT_IPC_MAX_FRAME 65536
+
+    /* 1 = a frame was read, 0 = nothing within the timeout, -1 = closed or broken. */
+    static int volt_ipc_status = 0;
+    static int volt_ipc_opcode = 0;
+
+#ifdef _WIN32
+    static int volt_ipc_open(const char *path) {
+        return _open(path, _O_RDWR | _O_BINARY);
+    }
+    static void volt_ipc_close_fd(int fd) {
+        _close(fd);
+    }
+    static int volt_ipc_write_all(int fd, const unsigned char *buf, size_t n) {
+        size_t sent = 0;
+        while (sent < n) {
+            int w = _write(fd, buf + sent, (unsigned int)(n - sent));
+            if (w <= 0) return 0;
+            sent += (size_t)w;
+        }
+        return 1;
+    }
+    /* A named pipe has no poll(): look at the bytes available, sleep in 10 ms steps. */
+    static int volt_ipc_ready(int fd, int timeoutMs) {
+        HANDLE h = (HANDLE)_get_osfhandle(fd);
+        DWORD avail = 0;
+        int waited = 0;
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        for (;;) {
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1;
+            if (avail > 0) return 1;
+            if (waited >= timeoutMs) return 0;
+            Sleep(10);
+            waited += 10;
+        }
+    }
+    static int volt_ipc_read_some(int fd, unsigned char *buf, size_t n) {
+        return _read(fd, buf, (unsigned int)n);
+    }
+#else
+    static int volt_ipc_open(const char *path) {
+        struct sockaddr_un addr;
+        int fd;
+        if (strlen(path) >= sizeof(addr.sun_path)) return -1;
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strcpy(addr.sun_path, path);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            return -1;
+        }
+#ifdef SO_NOSIGPIPE
+        {
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        }
+#endif
+        return fd;
+    }
+    static void volt_ipc_close_fd(int fd) {
+        close(fd);
+    }
+    static int volt_ipc_write_all(int fd, const unsigned char *buf, size_t n) {
+        size_t sent = 0;
+        while (sent < n) {
+            ssize_t w;
+#ifdef MSG_NOSIGNAL
+            w = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
+#else
+            w = write(fd, buf + sent, n - sent);
+#endif
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return 0;
+            }
+            sent += (size_t)w;
+        }
+        return 1;
+    }
+    static int volt_ipc_ready(int fd, int timeoutMs) {
+        struct pollfd p;
+        int r;
+        p.fd = fd;
+        p.events = POLLIN;
+        p.revents = 0;
+        do {
+            r = poll(&p, 1, timeoutMs);
+        } while (r < 0 && errno == EINTR);
+        if (r < 0) return -1;
+        if (r == 0) return 0;
+        return 1;
+    }
+    static int volt_ipc_read_some(int fd, unsigned char *buf, size_t n) {
+        ssize_t r;
+        do {
+            r = read(fd, buf, n);
+        } while (r < 0 && errno == EINTR);
+        return (int)r;
+    }
+#endif
+
+    /* Reads exactly n bytes. 1 = done; 0 = nothing arrived before the first byte; -1 = broken. */
+    static int volt_ipc_read_exact(int fd, unsigned char *buf, size_t n, int timeoutMs) {
+        size_t got = 0;
+        while (got < n) {
+            int ready = volt_ipc_ready(fd, timeoutMs);
+            int r;
+            if (ready == 0) return got == 0 ? 0 : -1;
+            if (ready < 0) return -1;
+            r = volt_ipc_read_some(fd, buf + got, n - got);
+            if (r <= 0) return -1;
+            got += (size_t)r;
+        }
+        return 1;
+    }
+
+    static int volt_ipc_send_frame(int fd, int opcode, const char *text) {
+        size_t len = strlen(text);
+        unsigned char *frame;
+        int ok;
+        if (len > VOLT_IPC_MAX_FRAME) return 0;
+        frame = (unsigned char *)malloc(8 + len);
+        if (!frame) return 0;
+        frame[0] = (unsigned char)(opcode & 0xff);
+        frame[1] = (unsigned char)((opcode >> 8) & 0xff);
+        frame[2] = (unsigned char)((opcode >> 16) & 0xff);
+        frame[3] = (unsigned char)((opcode >> 24) & 0xff);
+        frame[4] = (unsigned char)(len & 0xff);
+        frame[5] = (unsigned char)((len >> 8) & 0xff);
+        frame[6] = (unsigned char)((len >> 16) & 0xff);
+        frame[7] = (unsigned char)((len >> 24) & 0xff);
+        memcpy(frame + 8, text, len);
+        ok = volt_ipc_write_all(fd, frame, 8 + len);
+        free(frame);
+        return ok;
+    }
+
+    /* The JSON of the next frame (malloc'd, the caller frees it), or NULL. Sets volt_ipc_status. */
+    static char *volt_ipc_recv_text(int fd, int timeoutMs) {
+        unsigned char head[8];
+        unsigned int opcode, length;
+        unsigned char *body;
+        int r;
+        volt_ipc_status = -1;
+        r = volt_ipc_read_exact(fd, head, 8, timeoutMs);
+        if (r == 0) {
+            volt_ipc_status = 0;
+            return NULL;
+        }
+        if (r < 0) return NULL;
+        opcode = (unsigned int)head[0] | ((unsigned int)head[1] << 8) | ((unsigned int)head[2] << 16) | ((unsigned int)head[3] << 24);
+        length = (unsigned int)head[4] | ((unsigned int)head[5] << 8) | ((unsigned int)head[6] << 16) | ((unsigned int)head[7] << 24);
+        if (length > VOLT_IPC_MAX_FRAME) return NULL;
+        body = (unsigned char *)malloc(length + 1);
+        if (!body) return NULL;
+        if (length > 0 && volt_ipc_read_exact(fd, body, length, timeoutMs) != 1) {
+            free(body);
+            return NULL;
+        }
+        body[length] = 0;
+        volt_ipc_opcode = (int)opcode;
+        /* CLOSE (opcode 2) carries the reason, e.g. {"code":4000,"message":"Invalid Client ID"}. */
+        volt_ipc_status = (opcode == 2) ? 2 : 1;
+        return (char *)body;
+    }
+}
+
+// -1 when the socket cannot be opened (Discord not running).
+method systemIpcConnect(string socket): integer {
+    c { return nv_int(volt_ipc_open(nv_cstr($socket))); }
+}
+
+method systemIpcClose(integer fd): bool {
+    c {
+        volt_ipc_close_fd((int)nv_ival($fd));
+        return nv_bool(1);
+    }
+}
+
+// Sends one frame; false when the write failed.
+method systemIpcSend(integer fd, integer opcode, string text): bool {
+    c { return nv_bool(volt_ipc_send_frame((int)nv_ival($fd), (int)nv_ival($opcode), nv_cstr($text))); }
+}
+
+// The JSON of the next frame, or "" (see systemIpcStatus for what that means).
+method systemIpcRecv(integer fd, integer timeoutMs): string {
+    c {
+        char *text = volt_ipc_recv_text((int)nv_ival($fd), (int)nv_ival($timeoutMs));
+        nv value;
+        if (text == NULL) {
+            return nv_str("");
+        }
+        value = nv_str(text);
+        free(text);
+        return value;
+    }
+}
+
+// What the last systemIpcRecv did: 1 frame, 2 Discord closed the connection (the text is the reason),
+// 0 nothing in time, -1 broken.
+method systemIpcStatus(): integer {
+    c { return nv_int(volt_ipc_status); }
+}
+
+method systemIpcOpcode(): integer {
+    c { return nv_int(volt_ipc_opcode); }
+}
+
+// --- shared state ----------------------------------------------------------------
+
+final SYSTEM_DISCORD_RETRY_SECONDS = 15
+final SYSTEM_DISCORD_HEARTBEAT_SECONDS = 15
+
+var systemDiscordLock = thread.mutex()
+var systemDiscordState = "disabled"
+var systemDiscordDirty = true
+var systemDiscordActivity = {
+    "details": "In the launcher",
+    "state": "Browsing profiles",
+    "startedAt": 0,
+    "largeImageKey": "volt_logo",
+    "largeImageText": "VoltLauncher"
+}
+
+// Only the loop thread touches these.
+var systemDiscordFd = -1
+var systemDiscordAppId = ""
+var systemDiscordLastAttempt = 0
+var systemDiscordLastPush = 0
+
+// Shows `details` / `state` in Discord. startedAtMs > 0 adds an elapsed-time counter.
+method systemDiscordSetActivity(string details, string state, integer startedAtMs) {
+    sync (systemDiscordLock) {
+        systemDiscordActivity = {
+            "details": details,
+            "state": state,
+            "startedAt": startedAtMs,
+            "largeImageKey": "volt_logo",
+            "largeImageText": "VoltLauncher"
+        }
+        systemDiscordDirty = true
+    }
+}
+
+method systemDiscordSetState(string state) {
+    sync (systemDiscordLock) {
+        systemDiscordState = state
+    }
+}
+
+method systemDiscordTrim(string value, integer max): string {
+    var text = value.trim()
+    if (text.length() <= max) {
+        return text
+    }
+    return text.substring(0, max - 1) + "..."
+}
+
+// The Discord activity object for the wanted presence (Discord limits strings to 128 characters).
+method systemDiscordActivityJson(): map<string, object> {
+    var text = ""
+    sync (systemDiscordLock) {
+        text = json.stringify(systemDiscordActivity)
+    }
+    var wanted = json.parse(text)
+    var out = {
+        "details": systemDiscordTrim(systemText(wanted, "details"), 128),
+        "state": systemDiscordTrim(systemText(wanted, "state"), 128)
+    }
+    var startedAt = core.getOr(wanted, "startedAt", 0)
+    if (core.isWholeNumber(startedAt) && core.toInteger(startedAt) > 0) {
+        out["timestamps"] = {"start": core.toInteger(startedAt)}
+    }
+    var image = systemText(wanted, "largeImageKey")
+    var imageText = systemText(wanted, "largeImageText")
+    if (image != "" || imageText != "") {
+        var assets = {}
+        if (image != "") {
+            assets["large_image"] = image
+        }
+        if (imageText != "") {
+            assets["large_text"] = systemDiscordTrim(imageText, 128)
+        }
+        out["assets"] = assets
+    }
+    return out
+}
+
+// Sends SET_ACTIVITY and drains its reply. false when the connection is gone.
+method systemDiscordPush(): bool {
+    var payload = {
+        "cmd": "SET_ACTIVITY",
+        "args": {"pid": os.pid(), "activity": systemDiscordActivityJson()},
+        "nonce": core.newId()
+    }
+    if (systemIpcSend(systemDiscordFd, 1, json.stringify(payload)) == false) {
+        return false
+    }
+    systemIpcRecv(systemDiscordFd, 1500)
+    var status = systemIpcStatus()
+    return status == 0 || status == 1
+}
+
+// Candidate sockets in the order Discord's own clients use them.
+method systemDiscordSockets(): array {
+    var sockets = []
+    if (os.platform() == "windows") {
+        var n = 0
+        while (n < 10) {
+            sockets.append("\\\\.\\pipe\\discord-ipc-" + n)
+            n = n + 1
+        }
+        return sockets
+    }
+    var roots = []
+    for (name in ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"]) {
+        var value = os.env("" + name)
+        if (value != "") {
+            roots.append(value)
+        }
+    }
+    roots.append("/tmp")
+    var dirs = []
+    for (root in roots) {
+        dirs.append("" + root)
+        dirs.append(path.join("" + root, "app/com.discordapp.Discord"))
+        dirs.append(path.join("" + root, "app/com.discordapp.DiscordCanary"))
+        dirs.append(path.join("" + root, "snap.discord"))
+        dirs.append(path.join("" + root, "snap.discord-canary"))
+    }
+    for (dir in dirs) {
+        var index = 0
+        while (index < 10) {
+            sockets.append(path.join("" + dir, "discord-ipc-" + index))
+            index = index + 1
+        }
+    }
+    return sockets
+}
+
+// Opens and shakes hands with the first Discord client that answers. Sets the state.
+method systemDiscordConnect(string appId) {
+    systemDiscordSetState("waiting_for_discord")
+    var sockets = systemDiscordSockets()
+    var rejected = false
+    var fd = -1
+    var i = 0
+    while (i < sockets.length() && fd < 0) {
+        var candidate = systemIpcConnect("" + sockets[i])
+        i = i + 1
+        if (candidate >= 0) {
+            systemIpcSend(candidate, 0, json.stringify({"v": 1, "client_id": appId}))
+            var reply = systemIpcRecv(candidate, 2000)
+            var status = systemIpcStatus()
+            var evt = ""
+            var code = 0
+            if (reply != "") {
+                var parsed = json.tryParse(reply)
+                if (core.isMap(parsed)) {
+                    evt = systemText(parsed, "evt")
+                    if (core.isWholeNumber(core.getOr(parsed, "code", 0))) {
+                        code = core.toInteger(core.getOr(parsed, "code", 0))
+                    }
+                }
+            }
+            // Discord answers an unknown application id with a CLOSE frame (code 4000) or an ERROR event.
+            if ((status == 1 && evt == "ERROR") || (status == 2 && code == 4000)) {
+                rejected = true
+                systemIpcClose(candidate)
+            } else if (status == 1) {
+                fd = candidate
+            } else {
+                systemIpcClose(candidate)
+            }
+        }
+    }
+    if (fd >= 0) {
+        systemDiscordFd = fd
+        systemDiscordAppId = appId
+        systemDiscordLastPush = 0
+        systemDiscordSetState("connected")
+        return
+    }
+    if (rejected) {
+        systemDiscordSetState("rejected")
+    }
+}
+
+// Closes the connection (if any) and records the state.
+method systemDiscordDrop(string state) {
+    var fd = systemDiscordFd
+    systemDiscordFd = -1
+    systemDiscordAppId = ""
+    if (fd >= 0) {
+        systemIpcClose(fd)
+    }
+    systemDiscordSetState(state)
+}
+
+// One pass of the loop: follow the settings, connect, push what changed.
+method systemDiscordTick() {
+    if (core.setting("discordPresence") != true) {
+        systemDiscordDrop("disabled")
+        return
+    }
+    var appId = "" + core.setting("discordApplicationId")
+    if (appId == "") {
+        systemDiscordDrop("not_configured")
+        return
+    }
+    if (systemDiscordFd >= 0 && systemDiscordAppId != appId) {
+        systemDiscordDrop("waiting_for_discord")
+    }
+    var now = time.now()
+    if (systemDiscordFd < 0) {
+        if (systemDiscordLastAttempt > 0 && now - systemDiscordLastAttempt < SYSTEM_DISCORD_RETRY_SECONDS) {
+            return
+        }
+        systemDiscordLastAttempt = now
+        systemDiscordConnect(appId)
+        return
+    }
+    var due = now - systemDiscordLastPush >= SYSTEM_DISCORD_HEARTBEAT_SECONDS
+    sync (systemDiscordLock) {
+        if (systemDiscordDirty) {
+            due = true
+            systemDiscordDirty = false
+        }
+    }
+    if (due) {
+        if (systemDiscordPush()) {
+            systemDiscordLastPush = now
+        } else {
+            systemDiscordDrop("waiting_for_discord")
+        }
+    }
+}
+
+define class SystemDiscordTick {
+    method run(): object {
+        systemDiscordTick()
+        return true
+    }
+}
+
+// The loop thread: a failed tick is logged and the loop goes on.
+method systemDiscordLoop() {
+    while (true) {
+        var outcome = core.runTrapped(SystemDiscordTick{})
+        if (outcome.failed()) {
+            core.logWarn("discord presence: " + core.decodeFailure(outcome.error())["message"])
+        }
+        thread.sleep(1000)
+    }
+}
+
+// Starts the presence loop (called once at startup).
+method systemStartBackground() {
+    thread systemDiscordLoop()
+}
+
+// --- status -----------------------------------------------------------------------
+
+method systemDiscordMessage(string state): string {
+    if (state == "not_configured") {
+        return "No Discord application id configured."
+    }
+    if (state == "waiting_for_discord") {
+        return "Waiting for the Discord desktop client."
+    }
+    if (state == "rejected") {
+        return "Discord rejected the application id."
+    }
+    if (state == "connected") {
+        return "Connected to Discord."
+    }
+    return "Rich presence is switched off."
+}
+
+method systemDiscordTransport(): string {
+    if (os.platform() == "windows") {
+        return "named pipe"
+    }
+    return "unix socket"
+}
+
+method systemDiscordStatus(): map<string, object> {
+    var state = ""
+    sync (systemDiscordLock) {
+        state = systemDiscordState
+    }
+    var enabled = core.setting("discordPresence") == true
+    var configured = ("" + core.setting("discordApplicationId")) != ""
+    if (enabled == false) {
+        state = "disabled"
+    }
+    return {
+        "state": state,
+        "message": systemDiscordMessage(state),
+        "transport": systemDiscordTransport(),
+        "configured": configured,
+        "enabled": enabled
+    }
+}

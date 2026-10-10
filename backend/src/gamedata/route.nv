@@ -1,0 +1,294 @@
+package gamedata
+
+import core
+import path
+import strings
+
+// The gamedata module: worlds, servers, screenshots, logs and backups of a
+// profile (see docs/ARCHITECTURE.md, "Spieldaten"). Each section has its own
+// header comment with the endpoints: worlds.nv, servers.nv, media.nv, logs.nv,
+// backups.nv. Shared machinery: nbt.nv (NBT, gzip), files.nv (trees, names),
+// zipio.nv (ZIP writer, extraction), jobs.nv (profile claims, jobs).
+//
+// segments are the path segments after /api, e.g. ["profiles", "<id>", "worlds", ...].
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    var id = segments[1]
+    if (core.isId(id) == false) {
+        core.notFound("profile '" + id + "' not found")
+    }
+    core.requireProfile(id)
+    var section = segments[2]
+    if (section == "worlds") {
+        return worldsRoute(verb, id, segments, body)
+    }
+    if (section == "servers") {
+        return serversRoute(verb, id, segments, body)
+    }
+    if (section == "screenshots") {
+        return screenshotsRoute(verb, id, segments)
+    }
+    if (section == "logs") {
+        return logsRoute(verb, id, segments, query)
+    }
+    if (section == "backups") {
+        return backupsRoute(verb, id, segments, body)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}
+
+// The request body as a map; an empty map when there is none.
+method bodyMap(object body): map<string, object> {
+    if (core.isMap(body)) {
+        return body
+    }
+    return {}
+}
+
+// A trimmed string field, or "" when it is absent or not a string.
+method optionalText(map<string, object> fields, string key): string {
+    if (fields.has(key) == false || core.isString(fields[key]) == false) {
+        return ""
+    }
+    string value = fields[key]
+    return value.trim()
+}
+
+// An integer query parameter (a leading "-" is allowed), or the fallback when absent.
+method queryInt(map<string, string> query, string key, integer fallback): integer {
+    if (query.has(key) == false) {
+        return fallback
+    }
+    var text = query[key].trim()
+    var negative = false
+    if (text.startsWith("-")) {
+        negative = true
+        text = text.substring(1, text.length())
+    }
+    if (strings.isNumeric(text) == false) {
+        core.badRequest("'" + key + "' must be an integer")
+    }
+    integer value = parseInt(text)
+    if (negative) {
+        return 0 - value
+    }
+    return value
+}
+
+// A server index from the path.
+method pathIndex(string text): integer {
+    if (strings.isNumeric(text) == false) {
+        core.badRequest("Server index must be a number")
+    }
+    return parseInt(text)
+}
+
+method profileName(string profileId): string {
+    var profile = core.requireProfile(profileId)
+    string name = core.getOr(profile, "name", profileId)
+    return name
+}
+
+// --- worlds ---------------------------------------------------------------------
+
+method worldsRoute(string verb, string id, array<string> segments, object body): map<string, object> {
+    var count = segments.length()
+    if (count == 3) {
+        if (verb == "GET") {
+            return core.ok({"worlds": listWorlds(id)})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    var folder = segments[3]
+    if (count == 4) {
+        if (verb == "PATCH") {
+            var renamed = bodyMap(body)
+            var title = core.requireText(renamed, "name")
+            worldDir(id, folder)
+            var world = runExclusive(id, RenameWorldWork{profileId = id, folder = folder, title = title})
+            return core.ok({"world": world})
+        }
+        if (verb == "DELETE") {
+            return core.ok(runExclusive(id, DeleteWorldWork{profileId = id, folder = folder}))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 5) {
+        var action = segments[4]
+        if (action == "icon" && verb == "GET") {
+            return core.ok({"dataUrl": worldIconDataUrl(id, folder)})
+        }
+        if (action == "duplicate" && verb == "POST") {
+            var source = worldDir(id, folder)
+            var copyName = optionalText(bodyMap(body), "name")
+            var label = path.basename(source)
+            return startGameDataJob([id], "world-duplicate", "Dupliziere Welt " + label,
+                DuplicateWorldWork{profileId = id, folder = folder, title = copyName})
+        }
+        if (action == "copy" && verb == "POST") {
+            var fields = bodyMap(body)
+            var target = core.requireText(fields, "targetProfileId")
+            if (core.isId(target) == false) {
+                core.notFound("profile '" + target + "' not found")
+            }
+            if (target == id) {
+                core.badRequest("Pick a different profile to copy the world into")
+            }
+            worldDir(id, folder)
+            core.requireProfile(target)
+            return startGameDataJob([id, target], "world-copy", "Kopiere Welt in " + profileName(target),
+                CopyWorldWork{profileId = id, folder = folder, targetId = target})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}
+
+// --- servers --------------------------------------------------------------------
+
+method serversRoute(string verb, string id, array<string> segments, object body): map<string, object> {
+    var count = segments.length()
+    if (count == 3) {
+        if (verb == "GET") {
+            return core.ok({"servers": listServers(id)})
+        }
+        if (verb == "POST") {
+            var fields = bodyMap(body)
+            var address = core.getOr(fields, "address", core.none())
+            var name = core.getOr(fields, "name", core.none())
+            var server = runExclusive(id, AddServerWork{profileId = id, name = name, address = address})
+            return core.respond(201, {"server": server})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4) {
+        var index = pathIndex(segments[3])
+        if (verb == "PATCH") {
+            var fields = bodyMap(body)
+            var hasName = fields.has("name")
+            var hasAddress = fields.has("address")
+            if (hasName == false && hasAddress == false) {
+                core.badRequest("nothing to change: send 'name' and/or 'address'")
+            }
+            var server = runExclusive(id, EditServerWork{profileId = id, index = index,
+                hasName = hasName, name = core.getOr(fields, "name", core.none()),
+                hasAddress = hasAddress, address = core.getOr(fields, "address", core.none())})
+            return core.ok({"server": server})
+        }
+        if (verb == "DELETE") {
+            return core.ok(runExclusive(id, RemoveServerWork{profileId = id, index = index}))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}
+
+// --- screenshots ----------------------------------------------------------------
+
+method screenshotsRoute(string verb, string id, array<string> segments): map<string, object> {
+    var count = segments.length()
+    if (count == 3) {
+        if (verb == "GET") {
+            return core.ok({"screenshots": listScreenshots(id)})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4 && segments[3] == "open-folder") {
+        if (verb == "POST") {
+            return core.ok(openScreenshotFolder(id))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4) {
+        if (verb == "DELETE") {
+            return core.ok({"deleted": deleteScreenshot(id, segments[3])})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 5 && segments[4] == "image") {
+        if (verb == "GET") {
+            return core.ok(screenshotImage(id, segments[3]))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}
+
+// --- logs -----------------------------------------------------------------------
+
+method logsRoute(string verb, string id, array<string> segments, map<string, string> query): map<string, object> {
+    var count = segments.length()
+    if (count == 3) {
+        if (verb == "GET") {
+            return core.ok({"logs": listLogs(id)})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4 && segments[3] == "latest-crash") {
+        if (verb == "GET") {
+            return core.ok({"log": latestCrashReport(id)})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4) {
+        if (verb == "GET") {
+            var offset = queryInt(query, "offset", -1)
+            var maxBytes = queryInt(query, "maxBytes", 0)
+            return core.ok(readLog(id, segments[3], offset, maxBytes))
+        }
+        if (verb == "DELETE") {
+            return core.ok(clearLog(id, segments[3]))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 5 && segments[4] == "open-folder") {
+        if (verb == "POST") {
+            return core.ok(openLogFolder(id, segments[3]))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}
+
+// --- backups --------------------------------------------------------------------
+
+method backupsRoute(string verb, string id, array<string> segments, object body): map<string, object> {
+    var count = segments.length()
+    if (count == 3) {
+        if (verb == "GET") {
+            return core.ok({"backups": listBackups(id)})
+        }
+        if (verb == "POST") {
+            var label = optionalText(bodyMap(body), "label")
+            return startGameDataJob([id], "backup-create", "Sichere " + profileName(id),
+                CreateBackupWork{profileId = id, label = label})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4 && segments[3] == "open-folder") {
+        if (verb == "POST") {
+            return core.ok(openBackupsFolder(id))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 4) {
+        if (verb == "DELETE") {
+            return core.ok(deleteBackup(id, segments[3]))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (count == 5 && segments[4] == "restore") {
+        if (verb == "POST") {
+            var archive = backupArchive(id, segments[3])
+            return startGameDataJob([id], "backup-restore", "Stelle Backup wieder her: " + profileName(id),
+                RestoreBackupWork{profileId = id, backupId = path.basename(archive)})
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}

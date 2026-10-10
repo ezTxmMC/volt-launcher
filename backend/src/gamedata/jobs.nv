@@ -1,0 +1,96 @@
+package gamedata
+
+import core
+import launch
+
+// Running game data work with the profile held exclusively.
+//
+// A profile is claimed through the launch module's busy flags (the same ones an
+// install or launch uses), so a world copy, a backup or a restore can never run
+// while the game of that profile starts, and a launch cannot start during them.
+// Claims are taken before the work starts and released when it ends, however it
+// ends (the work runs trapped, see core/errors.nv).
+//
+//   runExclusive(profile, work)           inline (renames, server list edits, ...)
+//   startGameDataJob(profiles, kind, title, work)  background job, 202 + Job
+//
+// Work classes extend GameDataWork and return plain JSON data.
+
+define abstract GameDataWork {
+    abstract method work(string jobId): object
+}
+
+define class GameDataTask {
+    private string jobId: get, set
+    private GameDataWork work: get, set
+
+    method run(): object {
+        return work.work(jobId)
+    }
+}
+
+// The job body: runs the work, then releases the profiles it claimed.
+define class GameDataJob based JobBody {
+    private array<string> profileIds: get, set
+    private GameDataWork work: get, set
+
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(GameDataTask{jobId = jobId, work = work})
+        for (id in profileIds) {
+            launch.launchReleaseProfile(id)
+        }
+        if (outcome.failed()) {
+            // The same text again: the status and code encoding survives for the job runner.
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+// Claims every profile for `marker`. Returns "" on success, otherwise why not
+// (nothing stays claimed in that case).
+method acquireProfiles(array<string> profileIds, string marker): string {
+    var claimed = []
+    for (id in profileIds) {
+        if (launch.launchIsRunning(id)) {
+            releaseAll(claimed)
+            return "stop the game of this profile first"
+        }
+        if (launch.launchClaimProfile(id, marker) == false) {
+            releaseAll(claimed)
+            return "another operation on this profile is running"
+        }
+        claimed.append(id)
+    }
+    return ""
+}
+
+method releaseAll(array<string> profileIds) {
+    for (id in profileIds) {
+        launch.launchReleaseProfile(id)
+    }
+}
+
+// Runs `work` now, with the profile held. 409 while the game runs or another
+// operation holds the profile.
+method runExclusive(string profileId, GameDataWork work): object {
+    var problem = acquireProfiles([profileId], "gamedata")
+    if (problem != "") {
+        core.conflict(problem)
+    }
+    var outcome = core.runTrapped(GameDataTask{jobId = "", work = work})
+    launch.launchReleaseProfile(profileId)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    return outcome.result()
+}
+
+// Starts `work` as a job that holds the profiles until it ends: 202 with the Job.
+method startGameDataJob(array<string> profileIds, string kind, string title, GameDataWork work): map<string, object> {
+    var problem = acquireProfiles(profileIds, kind)
+    if (problem != "") {
+        core.conflict(problem)
+    }
+    return core.respond(202, core.startJob(kind, title, GameDataJob{profileIds = profileIds, work = work}))
+}

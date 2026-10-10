@@ -1,0 +1,188 @@
+package launch
+
+import core
+import os
+import path
+
+// The launch module (see docs/ARCHITECTURE.md, "Launch"):
+//
+//   POST /api/profiles/:id/install-game   Job -> result {versionId, javaPath}
+//   POST /api/profiles/:id/launch         Job -> result {pid, versionId, javaPath, logFile}
+//                                         body (optional): {"quickPlay": {"mode": "multiplayer",
+//                                         "server": "host" | "host:port"}} or {"quickPlay": {"mode":
+//                                         "singleplayer", "world": "<folder>"}}; 400, 404 and 422
+//                                         are answered before the job starts
+//   GET  /api/profiles/:id/game           {running, pid, startedAt, stopping, lastExit}
+//   POST /api/profiles/:id/game/stop      SIGTERM, SIGKILL after 5 s; answers the status
+//   GET  /api/java                        [{path, version, majorVersion}]
+//
+// segments are the path segments after /api.
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments[0] == "java") {
+        if (segments.length() != 1) {
+            core.notFound("no such endpoint")
+        }
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(launchDetectJava())
+    }
+    if (segments[0] != "profiles" || segments.length() < 3) {
+        core.notFound("no such endpoint")
+    }
+    var id = segments[1]
+    if (core.isId(id) == false) {
+        core.notFound("profile '" + id + "' not found")
+    }
+    var section = segments[2]
+    if (section == "install-game" || section == "launch") {
+        if (segments.length() != 3) {
+            core.notFound("no such endpoint")
+        }
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var profile = core.requireProfile(id)
+        var start = section == "launch"
+        var quick = {}
+        if (start) {
+            quick = launchQuickPlayRequest(body)
+            launchQuickCheckRequest(id, profile, quick)
+        }
+        if (launchIsRunning(id)) {
+            core.conflict("the game of this profile is running")
+        }
+        if (launchClaimProfile(id, section) == false) {
+            core.conflict("an install or launch of this profile is already running")
+        }
+        var name = core.getOr(profile, "name", id)
+        var job = core.none()
+        if (start) {
+            job = core.startJob("launch", "Starte " + name, LaunchJob{profileId = id, start = true, quickPlay = quick})
+        } else {
+            job = core.startJob("install-game", "Installiere " + name, LaunchJob{profileId = id, start = false, quickPlay = quick})
+        }
+        return core.respond(202, job)
+    }
+    if (section == "game") {
+        core.requireProfile(id)
+        if (segments.length() == 3) {
+            if (verb != "GET") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(launchGameStatus(id))
+        }
+        if (segments.length() == 4 && segments[3] == "stop") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(launchStopGame(id))
+        }
+    }
+    core.notFound("no such endpoint")
+    return {}
+}
+
+// The quick play request of a launch body, checked (400 bad_request). {} when the body is not
+// a JSON object, has no quickPlay, or quickPlay is null; otherwise {"mode", "server"} or
+// {"mode", "world"} with the values as they will be used.
+method launchQuickPlayRequest(object body): map<string, object> {
+    if (core.isMap(body) == false) {
+        return {}
+    }
+    var request = core.getOr(body, "quickPlay", core.none())
+    if (core.isNull(request)) {
+        return {}
+    }
+    if (core.isMap(request) == false) {
+        core.badRequest("quickPlay must be an object")
+    }
+    var mode = core.getOr(request, "mode", core.none())
+    if (mode == "multiplayer") {
+        var server = core.getOr(request, "server", core.none())
+        if (core.isString(server) == false) {
+            core.badRequest("quickPlay.server is required for multiplayer")
+        }
+        string text = server
+        var parsed = launchParseServer(text)
+        if (parsed.has("host") == false) {
+            core.badRequest("quickPlay.server must be host or host:port (1 to 255 characters, no spaces or '/', port 1 to 65535)")
+        }
+        return {"mode": "multiplayer", "server": text}
+    }
+    if (mode == "singleplayer") {
+        var world = core.getOr(request, "world", core.none())
+        if (core.isString(world) == false) {
+            core.badRequest("quickPlay.world is required for singleplayer")
+        }
+        string folder = world
+        launchCheckWorldFolder(folder)
+        return {"mode": "singleplayer", "world": folder}
+    }
+    core.badRequest("quickPlay.mode must be multiplayer or singleplayer")
+    return {}
+}
+
+// A world folder name: not empty, and no "/", "\", "..", "." or NUL, so it names a folder
+// directly inside the profile's saves.
+method launchCheckWorldFolder(string folder) {
+    if (folder.trim() == "" || folder == "." || folder.contains("/") || folder.contains("\\") || folder.contains("..") || folder.contains(chr(0))) {
+        core.badRequest("quickPlay.world must be the folder name of a world")
+    }
+}
+
+// Whether a Minecraft version name supports quick play by its name: "yes" (1.20 and newer,
+// snapshots from 23w14a on), "no" (older), or "" when the name does not tell. The job decides
+// by the metadata in the "" case.
+method launchQuickByVersion(object value): string {
+    if (core.isString(value) == false) {
+        return ""
+    }
+    string text = value
+    text = text.trim()
+    if (text.startsWith("1.")) {
+        var minor = launchLeadingDigits(text.substring(2, text.length()))
+        if (minor == "") {
+            return ""
+        }
+        if (parseInt(minor) >= 20) {
+            return "yes"
+        }
+        return "no"
+    }
+    var year = launchLeadingDigits(text)
+    if (year.length() == 2 && text.length() > 2 && text.substring(2, 3) == "w") {
+        var week = launchLeadingDigits(text.substring(3, text.length()))
+        if (week == "") {
+            return ""
+        }
+        var yearNumber = parseInt(year)
+        if (yearNumber > 23) {
+            return "yes"
+        }
+        if (yearNumber < 23) {
+            return "no"
+        }
+        if (parseInt(week) >= 14) {
+            return "yes"
+        }
+        return "no"
+    }
+    return ""
+}
+
+// The checks of a launch's quick play that answer before the job starts: 422 when the profile's
+// version name is known not to support singleplayer, 404 when the world folder is not in the
+// profile's saves. Nothing happens without a quick play request.
+method launchQuickCheckRequest(string profileId, map<string, object> profile, map<string, object> quick) {
+    if (launchQuickMode(quick) != "singleplayer") {
+        return
+    }
+    if (launchQuickByVersion(core.getOr(profile, "minecraftVersion", core.none())) == "no") {
+        launchQuickRefused()
+    }
+    var folder = launchQuickWorld(quick)
+    if (os.isDir(path.join(core.profileDir(profileId), "saves", folder)) == false) {
+        core.notFound("world '" + folder + "' not found")
+    }
+}

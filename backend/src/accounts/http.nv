@@ -1,0 +1,215 @@
+package accounts
+
+import bytes
+import core
+import json
+import os
+import path
+
+// HTTPS for the sign-in chain and the skin API, driven by curl (the same approach as
+// providers/net.nv: std/http has no timeouts, and its temporary file names are not
+// thread safe).
+//
+// Tokens never appear on the command line: request headers (Authorization) are
+// written to a file in <dataDir>/accounts/tmp, which holds only owner-readable files,
+// and curl reads them with -H @file. Bodies go the same way with --data-binary @file.
+// Only https is allowed, redirects are not followed, and every request has timeouts.
+
+final AC_CONNECT_SECONDS = 20
+final AC_MAX_SECONDS = 60
+
+method acUserAgent(): string {
+    return "VoltLauncher-next/" + core.version() + " (https://github.com/ezTxmMC/VoltLauncher)"
+}
+
+// <dataDir>/accounts/tmp, owner-only.
+method acTempDir(): string {
+    acEnsureDir()
+    var dir = path.join(acDir(), "tmp")
+    if (os.isDir(dir) == false) {
+        os.mkdir(dir)
+    }
+    acChmod(dir, "700")
+    return dir
+}
+
+// A new temporary file name in the private directory.
+method acTempFile(string suffix): string {
+    return path.join(acTempDir(), "req-" + core.newId() + core.newId() + suffix)
+}
+
+// Writes a secret-carrying file and makes it owner-only.
+method acWriteSecret(string file, string content) {
+    os.writeFile(file, content)
+    acChmod(file, "600")
+}
+
+// Percent-encodes everything but the unreserved characters (RFC 3986).
+method acUrlEncode(string text): string {
+    var out = ""
+    var i = 0
+    var n = bytes.size(text)
+    while (i < n) {
+        var b = bytes.u8(text, i)
+        var plain = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 126
+        if (plain) {
+            out = out + bytes.slice(text, i, i + 1)
+        } else {
+            out = out + "%" + bytes.hex(bytes.putU8(b)).toUpper()
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// application/x-www-form-urlencoded from a map (key order does not matter to the server).
+method acForm(map<string, string> fields): string {
+    var parts = []
+    for (key in fields) {
+        parts.append(acUrlEncode(key) + "=" + acUrlEncode(fields[key]))
+    }
+    return parts.join("&")
+}
+
+// One request. headers are sent from a file, body (if any) with contentType.
+// `extra` is a string of already quoted curl arguments put before the URL (multipart).
+// Answers {status (0: no HTTP answer), text, error}; never raises.
+method acSend(string verb, string url, map<string, string> headers, string body, string contentType, string extra): map<string, object> {
+    if (url.startsWith("https://") == false) {
+        return {"status": 0, "text": "", "error": "only https URLs are allowed"}
+    }
+    var out = acTempFile(".out")
+    var temporary = [out]
+    var cmd = "curl -sS -g --proto =https --proto-redir =https --max-redirs 0"
+    cmd = cmd + " --connect-timeout " + AC_CONNECT_SECONDS + " --max-time " + AC_MAX_SECONDS + " --retry 1 --retry-delay 1"
+    cmd = cmd + " -A " + os.shellQuote(acUserAgent())
+    if (headers.length() > 0) {
+        var lines = ""
+        for (key in headers) {
+            lines = lines + key + ": " + headers[key] + "\n"
+        }
+        var headerFile = acTempFile(".headers")
+        acWriteSecret(headerFile, lines)
+        temporary.append(headerFile)
+        cmd = cmd + " -H " + os.shellQuote("@" + headerFile)
+    }
+    if (body != "") {
+        var bodyFile = acTempFile(".body")
+        acWriteSecret(bodyFile, body)
+        temporary.append(bodyFile)
+        cmd = cmd + " -H " + os.shellQuote("Content-Type: " + contentType)
+        cmd = cmd + " --data-binary " + os.shellQuote("@" + bodyFile)
+    }
+    if (extra != "") {
+        cmd = cmd + " " + extra
+    }
+    if (verb != "GET") {
+        cmd = cmd + " -X " + os.shellQuote(verb)
+    }
+    cmd = cmd + " -o " + os.shellQuote(out) + " -w " + os.shellQuote("\\n%{http_code}")
+    cmd = cmd + " " + os.shellQuote(url) + " 2>&1"
+    var result = os.run(cmd)
+    var text = ""
+    if (os.isFile(out)) {
+        text = os.readFile(out)
+    }
+    for (file in temporary) {
+        if (os.isFile(file)) {
+            os.remove(file)
+        }
+    }
+    var output = ("" + result["output"]).trim()
+    var lines = output.split("\n")
+    var statusText = lines[lines.length() - 1].trim()
+    var status = 0
+    if (statusText.length() == 3 && acIsDigits(statusText)) {
+        status = parseInt(statusText)
+    }
+    var error = ""
+    if (lines.length() > 1) {
+        var errorLines = []
+        var i = 0
+        while (i < lines.length() - 1) {
+            if (lines[i].trim() != "") {
+                errorLines.append(lines[i].trim())
+            }
+            i = i + 1
+        }
+        error = errorLines.join("; ")
+    }
+    if (status == 0 && error == "") {
+        if (result["code"] != 0) {
+            error = "curl failed with exit code " + result["code"] + " (is curl installed?)"
+        } else {
+            error = "no HTTP answer"
+        }
+    }
+    return {"status": status, "text": text, "error": error}
+}
+
+method acIsDigits(string text): bool {
+    if (text == "") {
+        return false
+    }
+    for (ch in text) {
+        if ("0123456789".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+method acOk(map<string, object> res): bool {
+    var status = res["status"]
+    return status >= 200 && status < 300
+}
+
+// The JSON answer, or none.
+method acJson(map<string, object> res): object {
+    return json.tryParse(res["text"])
+}
+
+// The most useful one line description of a failed answer: Microsoft's
+// error_description, Xbox's Message, Mojang's errorMessage, or the start of the body.
+method acErrorText(map<string, object> res): string {
+    var parsed = acJson(res)
+    if (core.isMap(parsed)) {
+        // OAuth answers carry a code ("invalid_grant") and a description; keep both.
+        var code = core.getOr(parsed, "error", "")
+        var description = core.getOr(parsed, "error_description", "")
+        if (core.isString(code) && code != "" && core.isString(description) && description != "") {
+            return code + ": " + description
+        }
+        for (key in ["error_description", "Message", "errorMessage", "error"]) {
+            var value = core.getOr(parsed, key, "")
+            if (core.isString(value) && value != "") {
+                return value
+            }
+        }
+        // A JSON answer without a message (e.g. {"path": ...}) is not shown: the status says enough.
+        return ""
+    }
+    var flat = ("" + res["text"]).replace("\r", " ").replace("\n", " ").trim()
+    if (flat.length() > 200) {
+        flat = flat.substring(0, 200) + "..."
+    }
+    if (flat == "" && res["error"] != "") {
+        return res["error"]
+    }
+    return flat
+}
+
+// Raises a 502 when the request got no answer (network) or a non-2xx answer.
+// The network case starts with "Network unreachable" so callers can tell it apart.
+method acRequireOk(map<string, object> res, string what) {
+    if (res["status"] == 0) {
+        core.upstream("Network unreachable while " + what + ": " + res["error"])
+    }
+    if (acOk(res) == false) {
+        var detail = acErrorText(res)
+        if (detail != "") {
+            detail = ": " + detail
+        }
+        core.upstream(what + " failed (HTTP " + res["status"] + ")" + detail)
+    }
+}

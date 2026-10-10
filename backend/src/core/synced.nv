@@ -1,0 +1,812 @@
+package core
+
+import os
+import path
+import thread
+
+// Synced entries: a folder or a file that several profiles share. The shared copy lives once in
+// <dataDir>/synced/ under the game's name: <dataDir>/synced/saves/ (a folder), <dataDir>/synced/options.txt
+// (a file). A profile that chose the key gets <gameDir>/<entry> as a link to it:
+//   folders (shaderpacks, resourcepacks, saves, screenshots, config): `ln -s` on Linux and macOS,
+//     a directory junction (`mklink /J`, no admin rights) on Windows;
+//   files (options -> options.txt, servers -> servers.dat): `ln -s` on Linux and macOS, a hard link
+//     (`mklink /H`, same volume, no admin rights) on Windows.
+// Only links are ever removed here; the shared content is never deleted.
+//
+// Chosen at creation (POST /api/profiles, "synced": [...]) and changed later with PATCH
+// (see "changing the shared folders" below).
+
+final SYNCED_KEYS_TEXT = "shaderpacks, resourcepacks, saves, screenshots, config, options, servers"
+final SYNC_CONFLICTS_DIR = ".volt-sync-conflicts"
+
+// The entry (inside the game directory) of an allowed key, "" for any other text.
+method syncedEntry(string key): string {
+    if (key == "shaderpacks") {
+        return "shaderpacks"
+    }
+    if (key == "resourcepacks") {
+        return "resourcepacks"
+    }
+    if (key == "saves") {
+        return "saves"
+    }
+    if (key == "screenshots") {
+        return "screenshots"
+    }
+    if (key == "config") {
+        return "config"
+    }
+    if (key == "options") {
+        return "options.txt"
+    }
+    if (key == "servers") {
+        return "servers.dat"
+    }
+    return ""
+}
+
+// True for a key whose entry is a file (options, servers); folders otherwise.
+method syncedIsFile(string key): bool {
+    return key == "options" || key == "servers"
+}
+
+// The word the messages use for the entry of a key: "file" or "folder".
+method syncedKind(string key): string {
+    if (syncedIsFile(key)) {
+        return "file"
+    }
+    return "folder"
+}
+
+// The body field "synced": absent or null is no folder; otherwise an array of distinct
+// allowed keys. Anything else is a 400.
+method checkSynced(object value): array<string> {
+    var keys = []
+    if (isNull(value)) {
+        return keys
+    }
+    if (isArray(value) == false) {
+        badRequest("'synced' must be an array of folder keys (" + SYNCED_KEYS_TEXT + ")")
+    }
+    for (item in value) {
+        if (isString(item) == false) {
+            badRequest("'synced' must be an array of folder keys (" + SYNCED_KEYS_TEXT + ")")
+        }
+        if (syncedEntry(item) == "") {
+            badRequest("'synced' has an unknown folder '${item}' (allowed: " + SYNCED_KEYS_TEXT + ")")
+        }
+        if (keys.contains(item)) {
+            badRequest("'synced' lists '${item}' more than once")
+        }
+        keys.append(item)
+    }
+    return keys
+}
+
+// The keys stored in a profile record. Lenient: a record without the field (older
+// profiles) or with junk reads as the keys it can use.
+method storedSynced(object value): array<string> {
+    var keys = []
+    if (isArray(value)) {
+        for (item in value) {
+            if (isString(item)) {
+                if (syncedEntry(item) != "" && keys.contains(item) == false) {
+                    keys.append(item)
+                }
+            }
+        }
+    }
+    return keys
+}
+
+// <dataDir>/synced/<entry>: the one copy of the folder or file.
+method syncedSharedPath(string key): string {
+    return path.join(dataDir(), "synced", syncedEntry(key))
+}
+
+// <gameDir>/<entry>: where the link of a key goes.
+method syncedLinkPath(string gameDir, string key): string {
+    return path.join(gameDir, syncedEntry(key))
+}
+
+// cmd.exe and mklink want backslashes.
+method nativePath(string text): string {
+    if (os.platform() == "windows") {
+        return text.replace("/", "\\")
+    }
+    return text
+}
+
+// The shell command that makes `link` a link to `target`. A folder is a junction on Windows, a
+// file a hard link there. Never raises.
+method syncedLinkCommand(string target, string link, bool asFile): string {
+    if (os.platform() == "windows") {
+        var flag = "/J"
+        if (asFile) {
+            flag = "/H"
+        }
+        return "cmd /c mklink " + flag + " " + os.shellQuote(nativePath(link)) + " " + os.shellQuote(nativePath(target)) + " 2>&1"
+    }
+    return "ln -s " + os.shellQuote(target) + " " + os.shellQuote(link) + " 2>&1"
+}
+
+// The Windows file ID of `p` (fsutil). Two names of one file, a hard link and its target, share it.
+// "" when it cannot be read. The output is read from the "0x" on, so any display language works.
+method windowsFileId(string p): string {
+    var result = os.run("fsutil file queryFileID " + os.shellQuote(nativePath(p)) + " 2>&1")
+    if (result["code"] != 0) {
+        return ""
+    }
+    var text = "" + result["output"]
+    var at = text.indexOf("0x")
+    if (at < 0) {
+        return ""
+    }
+    return text.substring(at, text.length()).trim()
+}
+
+// True when the files `a` and `b` are the same file on Windows (a hard link to it).
+method sameWindowsFile(string a, string b): bool {
+    if (os.isFile(a) == false || os.isFile(b) == false) {
+        return false
+    }
+    var id = windowsFileId(a)
+    return id != "" && id == windowsFileId(b)
+}
+
+// The entry at `link` is a link made for `shared`: a symlink (any platform except a file on
+// Windows) or, for a file on Windows, a hard link to it. A link to somewhere else counts too.
+method linkEntry(string link, string shared, bool asFile): bool {
+    if (asFile && os.platform() == "windows") {
+        return sameWindowsFile(link, shared)
+    }
+    return os.isSymlink(link)
+}
+
+// The entry at `link` is a link to `shared` (see linkEntry).
+method linkedTo(string link, string shared, bool asFile): bool {
+    if (asFile && os.platform() == "windows") {
+        return sameWindowsFile(link, shared)
+    }
+    return linkPointsTo(link, shared)
+}
+
+// The creation check, before anything is made: an entry that already exists in the
+// game directory (a folder, a file or a link) is never replaced.
+method checkSyncedTargets(string gameDir, array<string> keys) {
+    for (key in keys) {
+        var link = syncedLinkPath(gameDir, key)
+        if (os.exists(link) || os.isSymlink(link)) {
+            conflict("the " + syncedKind(key) + " " + syncedEntry(key) + " already exists in the new profile")
+        }
+    }
+}
+
+// Makes the link `link` to `target`. "" on success, else the text to report.
+method makeLink(string target, string link, bool asFile): string {
+    var result = os.run(syncedLinkCommand(target, link, asFile))
+    if (result["code"] != 0 || linkEntry(link, target, asFile) == false) {
+        var text = result["output"].trim()
+        if (text == "") {
+            return "the link command failed"
+        }
+        return text
+    }
+    return ""
+}
+
+// Creates the shared file `file` as an empty file when it does not exist yet (the parent exists).
+// Raises 500 when it cannot. Journaled when it is made here.
+method ensureSharedFile(string file, array journal) {
+    if (os.isFile(file)) {
+        return
+    }
+    var error = writeFileAtomic(file, "")
+    if (error != "") {
+        internal("cannot create '" + file + "': " + error)
+    }
+    journal.append({"op": "created", "file": file})
+}
+
+// Creates the shared folders and the links in gameDir (raises 500 when a link fails).
+// Call only after checkSyncedTargets(), and never inside a sync block.
+method linkSynced(string gameDir, array<string> keys) {
+    ensureDir(path.join(dataDir(), "synced"))
+    for (key in keys) {
+        var shared = syncedSharedPath(key)
+        var link = syncedLinkPath(gameDir, key)
+        var asFile = syncedIsFile(key)
+        if (asFile) {
+            if (os.isFile(shared) == false) {
+                var created = writeFileAtomic(shared, "")
+                if (created != "") {
+                    internal("cannot create the shared file '" + key + "': " + created)
+                }
+            }
+        } else {
+            ensureDir(shared)
+        }
+        var error = makeLink(shared, link, asFile)
+        if (error != "") {
+            internal("cannot link the shared " + syncedKind(key) + " '" + key + "' into the new profile: " + error)
+        }
+    }
+}
+
+define class SyncedLinksTask {
+    private string gameDir: get, set
+    private object keys: get, set
+
+    method run(): object {
+        linkSynced(gameDir, keys)
+        return true
+    }
+}
+
+// Removes the link at `link` and nothing else. Linux and macOS: removeAll removes a
+// link itself and never follows it. Windows: `rmdir` removes a junction without
+// touching its target (removeAll would walk into it); `del` removes one name of a
+// hard link and leaves the file it names.
+method unlinkSynced(string link, bool asFile) {
+    if (os.platform() == "windows") {
+        if (asFile) {
+            os.run("cmd /c del /f /q " + os.shellQuote(nativePath(link)) + " 2>&1")
+            return
+        }
+        os.run("cmd /c rmdir " + os.shellQuote(nativePath(link)) + " 2>&1")
+        return
+    }
+    os.removeAll(link)
+}
+
+// Removes the links of `keys` in gameDir. Only entries that are links are touched.
+// True when none is left.
+method removeSyncedLinks(string gameDir, array<string> keys): bool {
+    var gone = true
+    for (key in keys) {
+        var link = syncedLinkPath(gameDir, key)
+        var shared = syncedSharedPath(key)
+        var asFile = syncedIsFile(key)
+        if (linkEntry(link, shared, asFile)) {
+            unlinkSynced(link, asFile)
+            if (linkEntry(link, shared, asFile)) {
+                gone = false
+            }
+        }
+    }
+    return gone
+}
+
+// Removes the links of a profile record, in its managed directory and in its game
+// directory (a gameDirectory set later by PATCH). True when all of them are gone.
+method removeProfileLinks(string id, map<string, object> profile): bool {
+    var keys = storedSynced(getOr(profile, "synced", []))
+    var managed = managedProfileDir(id)
+    var gone = removeSyncedLinks(managed, keys)
+    var gameDir = effectiveGameDir(profile)
+    if (gameDir != managed) {
+        if (removeSyncedLinks(gameDir, keys) == false) {
+            gone = false
+        }
+    }
+    return gone
+}
+
+// --- changing the shared entries of a profile (PATCH "synced") ---------------------------------
+//
+// PATCH {"synced": [keys]} sets the full set of keys. A new key (enable): the shared entry is made
+// if missing; the entry <gameDir>/<name> is merged into it (a folder: a name the shared folder lacks
+// is moved there, a name it already has is moved to <gameDir>/.volt-sync-conflicts/<key>/; a file:
+// moved into the shared file when that is missing, else moved to <gameDir>/.volt-sync-conflicts/<name>),
+// the empty real folder is removed and the link made. A file with no game file gets an empty shared
+// file when none exists yet (createdEmpty). A link already to the shared entry changes nothing. A
+// removed key (disable): the link is removed (never followed), and the shared content is COPIED back
+// into the game (a folder: an empty folder that gets the copies; a file: the copy of the file).
+// If a copy fails, the shared entry is untouched, the entry is reported as failed and the key stays
+// enabled.
+//
+// Every step is journaled; a failure undoes the journal newest first, so the profile is left as it
+// was. An undo that fails is named in the 500 message. Nothing here raises inside a lock: the
+// steps run in runTrapped() and the errors are raised after the lock is released.
+
+// One PATCH that changes shared entries at a time.
+var syncedLock = thread.mutex()
+
+// profile id -> true while its game runs (see markGameRunning).
+var gamesLock = thread.mutex()
+var runningGames = {}
+
+// Records that the game of a profile started (running true) or stopped (running false). A PATCH
+// that changes the shared entries of that profile answers 409 while it is recorded as running.
+method markGameRunning(string id, bool running) {
+    sync (gamesLock) {
+        if (running) {
+            runningGames[id] = true
+        }
+        if (running == false && runningGames.has(id)) {
+            runningGames.remove(id)
+        }
+    }
+}
+
+method isGameRunning(string id): bool {
+    var running = false
+    sync (gamesLock) {
+        running = runningGames.has(id)
+    }
+    return running
+}
+
+// The PATCH field "synced": an array of allowed keys (null is not a set of keys).
+method checkSyncedPatch(object value): array<string> {
+    if (isArray(value) == false) {
+        badRequest("'synced' must be an array of folder keys (" + SYNCED_KEYS_TEXT + ")")
+    }
+    return checkSynced(value)
+}
+
+// The entry at `p` exists: a folder, a file or a link (a dangling link counts).
+method entryExists(string p): bool {
+    return os.exists(p) || os.isSymlink(p)
+}
+
+// A real folder: a directory that is not a link.
+method isRealDir(string p): bool {
+    return os.isDir(p) && os.isSymlink(p) == false
+}
+
+// True when `link` is a link (a junction on Windows) whose target is the folder `shared`.
+method linkPointsTo(string link, string shared): bool {
+    if (os.isSymlink(link) == false) {
+        return false
+    }
+    var target = os.realpath(link)
+    return target != "" && target == os.realpath(shared)
+}
+
+// Copies the entry `from` to the absent name `to`, folders recursively. A link is neither
+// followed nor copied. "" on success, else the reason. `from` is only read.
+method copyEntry(string from, string to): string {
+    if (os.isSymlink(from)) {
+        return "a link is not copied"
+    }
+    if (os.isDir(from)) {
+        if (os.mkdir(to) == false) {
+            return "cannot create the folder"
+        }
+        for (name in os.listDir(from)) {
+            var error = copyEntry(path.join(from, name), path.join(to, name))
+            if (error != "") {
+                return error
+            }
+        }
+        return ""
+    }
+    // os.copy reports no short writes; the size check catches them.
+    if (os.copy(from, to) == false || os.fileSize(to) != os.fileSize(from)) {
+        return "cannot copy the file"
+    }
+    return ""
+}
+
+// Moves `from` to the absent name `to`: a rename, or, when the rename fails (another device),
+// a copy that removes `from` only after it succeeded. "" on success, else the reason.
+method moveEntry(string from, string to): string {
+    if (os.rename(from, to)) {
+        return ""
+    }
+    if (os.isSymlink(from)) {
+        return "a link cannot be moved to another device"
+    }
+    var error = copyEntry(from, to)
+    if (error != "") {
+        os.removeAll(to)
+        return error
+    }
+    if (os.removeAll(from) == false) {
+        return "copied, but the original could not be removed"
+    }
+    return ""
+}
+
+// `dir`/`name` when that is free, else `dir`/"name (2)", "name (3)" ...; "" when none is free.
+method freeName(string dir, string name): string {
+    var candidate = path.join(dir, name)
+    var n = 2
+    while (entryExists(candidate)) {
+        if (n > 999) {
+            return ""
+        }
+        candidate = path.join(dir, name + " (" + n + ")")
+        n = n + 1
+    }
+    return candidate
+}
+
+// Creates `dir` (with its parents) when missing and journals it: an undo removes it again
+// when it is still empty.
+method madeDir(string dir, array journal) {
+    if (os.isDir(dir) == false) {
+        ensureDir(dir)
+        journal.append({"op": "made", "dir": dir})
+    }
+}
+
+// The free name for `name` in the conflicts folder (the folders are made when missing).
+method conflictTarget(string root, string dir, string name, array journal): string {
+    madeDir(root, journal)
+    madeDir(dir, journal)
+    var target = freeName(dir, name)
+    if (target == "") {
+        internal("no free name for '" + name + "' in " + dir)
+    }
+    return target
+}
+
+// Moves `from` to `to` and journals the move. A failure is a 500.
+method moveJournaled(string from, string to, array journal) {
+    var error = moveEntry(from, to)
+    if (error != "") {
+        internal("cannot move '" + from + "': " + error)
+    }
+    journal.append({"op": "move", "from": from, "to": to})
+}
+
+// Undoes one journal entry. Raises when it cannot (undoRange reports that).
+method undoEntry(object entry) {
+    var op = entry["op"]
+    if (op == "move") {
+        ensureDir(path.dirname(entry["from"]))
+        var error = moveEntry(entry["to"], entry["from"])
+        if (error != "") {
+            internal(error)
+        }
+    } else if (op == "link") {
+        if (linkEntry(entry["link"], entry["target"], entry["file"])) {
+            unlinkSynced(entry["link"], entry["file"])
+        }
+    } else if (op == "unlinked") {
+        if (linkEntry(entry["link"], entry["target"], entry["file"]) == false) {
+            var linkError = makeLink(entry["target"], entry["link"], entry["file"])
+            if (linkError != "") {
+                internal(linkError)
+            }
+        }
+    } else if (op == "localdir") {
+        if (isRealDir(entry["dir"])) {
+            os.removeAll(entry["dir"])
+            if (entryExists(entry["dir"])) {
+                internal("cannot remove the copy '" + entry["dir"] + "'")
+            }
+        }
+    } else if (op == "localfile") {
+        if (os.isSymlink(entry["path"]) == false && os.isFile(entry["path"])) {
+            os.remove(entry["path"])
+            if (entryExists(entry["path"])) {
+                internal("cannot remove the copy '" + entry["path"] + "'")
+            }
+        }
+    } else if (op == "created") {
+        if (os.isSymlink(entry["file"]) == false && os.isFile(entry["file"])) {
+            os.remove(entry["file"])
+        }
+    } else if (op == "removed") {
+        if (os.isDir(entry["dir"]) == false) {
+            ensureDir(entry["dir"])
+        }
+    } else if (op == "made") {
+        if (isRealDir(entry["dir"])) {
+            os.rmdir(entry["dir"])
+        }
+    }
+}
+
+define class UndoEntryTask {
+    private object entry: get, set
+
+    method run(): object {
+        undoEntry(entry)
+        return true
+    }
+}
+
+// Undoes the journal from index `mark` on, newest first; those entries leave the journal.
+// Returns the messages of the undos that failed (empty when all were undone).
+method undoRange(array journal, integer mark): array {
+    var stuck = []
+    while (journal.length() > mark) {
+        var entry = journal.pop()
+        var undone = runTrapped(UndoEntryTask{entry = entry})
+        if (undone.failed()) {
+            stuck.append(decodeFailure(undone.error())["message"])
+        }
+    }
+    return stuck
+}
+
+// Enable one key: the shared entry is made, the entry at `link` is merged into it, and the link
+// is made. Returns the report item.
+method enableKey(string gameDir, string key, string shared, string link, array journal): map<string, object> {
+    if (syncedIsFile(key)) {
+        return enableFile(gameDir, key, shared, link, journal)
+    }
+    var folder = syncedEntry(key)
+    madeDir(shared, journal)
+    var moved = 0
+    var conflicts = 0
+    if (linkPointsTo(link, shared) == false) {
+        var conflictsRoot = path.join(gameDir, SYNC_CONFLICTS_DIR)
+        var conflictsDir = path.join(conflictsRoot, key)
+        if (os.isDir(link)) {
+            for (name in os.listDir(link)) {
+                var source = path.join(link, name)
+                var target = path.join(shared, name)
+                if (entryExists(target)) {
+                    target = conflictTarget(conflictsRoot, conflictsDir, name, journal)
+                    conflicts = conflicts + 1
+                } else {
+                    moved = moved + 1
+                }
+                moveJournaled(source, target, journal)
+            }
+            journal.append({"op": "removed", "dir": link})
+            if (os.rmdir(link) == false) {
+                internal("cannot remove the folder '" + folder + "' after the merge")
+            }
+        } else if (os.exists(link)) {
+            // A plain file has no entries to merge; it is kept in the conflicts folder.
+            var fileTarget = conflictTarget(conflictsRoot, conflictsDir, folder, journal)
+            moveJournaled(link, fileTarget, journal)
+            conflicts = conflicts + 1
+        }
+        var error = makeLink(shared, link, false)
+        journal.append({"op": "link", "link": link, "target": shared, "file": false})
+        if (error != "") {
+            internal("cannot link the shared folder '" + key + "' into the game folder: " + error)
+        }
+    }
+    return {"key": key, "action": "enable", "status": "ok", "moved": moved, "conflicts": conflicts}
+}
+
+// Enable a file key (options.txt, servers.dat). The shared file is made when missing and takes the
+// game's file (moved). When the shared file exists already, the game's file is kept in the conflicts
+// folder instead (its own name, or "name (2)" when that is taken). With no game file, an empty shared
+// file is made when none exists (createdEmpty). The link is made last. Returns the report item.
+method enableFile(string gameDir, string key, string shared, string link, array journal): map<string, object> {
+    var moved = 0
+    var conflicts = 0
+    var createdEmpty = false
+    if (linkedTo(link, shared, true) == false) {
+        madeDir(path.dirname(shared), journal)
+        var hasFile = os.exists(link)
+        if (os.isFile(shared) == false) {
+            if (hasFile) {
+                moveJournaled(link, shared, journal)
+                moved = 1
+            } else {
+                ensureSharedFile(shared, journal)
+                createdEmpty = true
+            }
+        } else if (hasFile) {
+            var conflictsDir = path.join(gameDir, SYNC_CONFLICTS_DIR)
+            var fileTarget = conflictTarget(conflictsDir, conflictsDir, syncedEntry(key), journal)
+            moveJournaled(link, fileTarget, journal)
+            conflicts = 1
+        }
+        var error = makeLink(shared, link, true)
+        journal.append({"op": "link", "link": link, "target": shared, "file": true})
+        if (error != "") {
+            internal("cannot link the shared file '" + key + "' into the game folder: " + error)
+        }
+    }
+    return {"key": key, "action": "enable", "status": "ok", "moved": moved, "conflicts": conflicts, "createdEmpty": createdEmpty}
+}
+
+// Disable one key: the link is removed, an empty real folder is made and the shared content is
+// copied into it. A failed copy restores the link and reports the failed entries (status failed).
+method disableKey(string key, string shared, string link, array journal): map<string, object> {
+    if (syncedIsFile(key)) {
+        return disableFile(key, shared, link, journal)
+    }
+    var mark = journal.length()
+    madeDir(shared, journal)
+    if (os.isSymlink(link)) {
+        journal.append({"op": "unlinked", "link": link, "target": shared, "file": false})
+        unlinkSynced(link, false)
+        if (os.isSymlink(link)) {
+            internal("cannot remove the link '" + link + "'")
+        }
+    }
+    journal.append({"op": "localdir", "dir": link})
+    if (os.mkdir(link) == false) {
+        internal("cannot create the folder '" + link + "'")
+    }
+    var copied = 0
+    var failed = []
+    for (name in os.listDir(shared)) {
+        var error = copyEntry(path.join(shared, name), path.join(link, name))
+        if (error == "") {
+            copied = copied + 1
+        } else {
+            failed.append({"name": name, "reason": error})
+        }
+    }
+    if (failed.length() > 0) {
+        var stuck = undoRange(journal, mark)
+        if (stuck.length() > 0) {
+            internal("cannot restore the link of '" + key + "': " + stuck.join("; "))
+        }
+        return {"key": key, "action": "disable", "status": "failed", "copied": 0, "failed": failed}
+    }
+    return {"key": key, "action": "disable", "status": "ok", "copied": copied}
+}
+
+// Disable a file key: the link is removed (one name only, never the shared file), then the shared
+// file is copied to the game's place. A failed copy restores the link and reports the entry. With no
+// shared file the profile simply has no file afterwards (copied 0).
+method disableFile(string key, string shared, string link, array journal): map<string, object> {
+    var mark = journal.length()
+    if (linkEntry(link, shared, true)) {
+        journal.append({"op": "unlinked", "link": link, "target": shared, "file": true})
+        unlinkSynced(link, true)
+        if (linkEntry(link, shared, true)) {
+            internal("cannot remove the link '" + link + "'")
+        }
+    }
+    if (os.isFile(shared) == false) {
+        return {"key": key, "action": "disable", "status": "ok", "copied": 0}
+    }
+    if (entryExists(link)) {
+        internal("the file '" + link + "' is in the way")
+    }
+    journal.append({"op": "localfile", "path": link})
+    var error = copyEntry(shared, link)
+    if (error != "") {
+        var stuck = undoRange(journal, mark)
+        if (stuck.length() > 0) {
+            internal("cannot restore the link of '" + key + "': " + stuck.join("; "))
+        }
+        var failed = []
+        failed.append({"name": syncedEntry(key), "reason": error})
+        return {"key": key, "action": "disable", "status": "failed", "copied": 0, "failed": failed}
+    }
+    return {"key": key, "action": "disable", "status": "ok", "copied": 1}
+}
+
+// Runs the changes: removed keys first, then new keys. A key whose disable failed goes to `kept`.
+method applyChanges(string gameDir, array enable, array disable, array journal, array report, array kept) {
+    if (enable.length() > 0 && os.isDir(gameDir) == false) {
+        madeDir(gameDir, journal)
+    }
+    for (key in disable) {
+        var result = disableKey(key, syncedSharedPath(key), syncedLinkPath(gameDir, key), journal)
+        report.append(result)
+        if (result["status"] == "failed") {
+            kept.append(key)
+        }
+    }
+    for (key in enable) {
+        report.append(enableKey(gameDir, key, syncedSharedPath(key), syncedLinkPath(gameDir, key), journal))
+    }
+}
+
+define class SyncedApplyTask {
+    private string gameDir: get, set
+    private object enable: get, set
+    private object disable: get, set
+    private object journal: get, set
+    private object report: get, set
+    private object kept: get, set
+
+    method run(): object {
+        applyChanges(gameDir, enable, disable, journal, report, kept)
+        return true
+    }
+}
+
+// The 409 text when a change cannot be made, "" when it can. Every key is checked before anything
+// changes: an entry that is not ours (a link elsewhere, a folder where a file is expected, or for a
+// disable an entry that is neither a link to the shared one nor absent) refuses.
+method syncedRefusal(string gameDir, array enable, array disable): string {
+    for (key in enable) {
+        var link = syncedLinkPath(gameDir, key)
+        var shared = syncedSharedPath(key)
+        var asFile = syncedIsFile(key)
+        if (linkEntry(link, shared, asFile) && linkedTo(link, shared, asFile) == false) {
+            return "the " + syncedKind(key) + " " + syncedEntry(key) + " is a link to another place"
+        }
+        if (asFile && os.isDir(link)) {
+            return "the file " + syncedEntry(key) + " is a folder"
+        }
+    }
+    for (key in disable) {
+        var link = syncedLinkPath(gameDir, key)
+        var shared = syncedSharedPath(key)
+        var asFile = syncedIsFile(key)
+        if (linkedTo(link, shared, asFile) == false && entryExists(link)) {
+            return "the " + syncedKind(key) + " " + syncedEntry(key) + " is not a link to the shared " + syncedKind(key)
+        }
+    }
+    return ""
+}
+
+// PATCH with "synced": changes the links and shared entries, then stores the profile. `fields`
+// holds the other validated fields. Returns the profile with "syncReport".
+method patchSynced(string id, array<string> wanted, map<string, object> fields): map<string, object> {
+    requireProfile(id)
+    if (fields.has("gameDirectory")) {
+        badRequest("change 'gameDirectory' and 'synced' in separate requests")
+    }
+    if (isGameRunning(id)) {
+        conflict("stop the game before changing shared folders")
+    }
+    var refusal = ""
+    var failure = ""
+    var stuck = []
+    var journal = []
+    var report = []
+    var kept = []
+    sync (syncedLock) {
+        var current = findProfile(id)
+        if (isNull(current)) {
+            refusal = "the profile was deleted"
+        } else {
+            var gameDir = effectiveGameDir(current)
+            var currentKeys = storedSynced(getOr(current, "synced", []))
+            var enable = []
+            var disable = []
+            for (key in wanted) {
+                if (currentKeys.contains(key) == false) {
+                    enable.append(key)
+                }
+            }
+            for (key in currentKeys) {
+                if (wanted.contains(key) == false) {
+                    disable.append(key)
+                }
+            }
+            refusal = syncedRefusal(gameDir, enable, disable)
+            if (refusal == "") {
+                var trapped = runTrapped(SyncedApplyTask{gameDir = gameDir, enable = enable, disable = disable, journal = journal, report = report, kept = kept})
+                if (trapped.failed()) {
+                    failure = "" + decodeFailure(trapped.error())["message"]
+                }
+            }
+            if (refusal == "" && failure == "") {
+                var keysNow = []
+                for (key in wanted) {
+                    keysNow.append(key)
+                }
+                for (key in kept) {
+                    if (wanted.contains(key) == false) {
+                        keysNow.append(key)
+                    }
+                }
+                fields["synced"] = keysNow
+                var saveError = storeProfileFields(id, fields)
+                if (saveError != "") {
+                    failure = "cannot save profiles: " + saveError
+                }
+            }
+            if (failure != "") {
+                stuck = undoRange(journal, 0)
+            }
+        }
+    }
+    if (refusal != "") {
+        conflict(refusal)
+    }
+    if (failure != "") {
+        var message = failure
+        if (stuck.length() > 0) {
+            message = message + "; could not undo: " + stuck.join("; ")
+        }
+        internal(message)
+    }
+    var saved = findProfile(id)
+    if (isNull(saved)) {
+        notFound("profile '${id}' not found")
+    }
+    saved["syncReport"] = report
+    return saved
+}

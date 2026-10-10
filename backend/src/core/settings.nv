@@ -1,0 +1,341 @@
+package core
+
+import json
+import path
+import thread
+
+// Settings: <dataDir>/settings.json, merged over the contract's defaults.
+//
+//   GET   /api/settings   -> Settings
+//   PATCH /api/settings   -> partial update, answers the complete Settings
+//
+// Feature modules read values with core.setting("downloadThreads") or a copy
+// of everything with core.settings().
+
+var settingsLock = thread.mutex()
+var currentSettings = {}
+
+// The defaults of the contract. To add a setting, add its default here and
+// its rule to settingRule(). A setting whose rule is "fixed" has a default
+// that the launcher owns: PATCH refuses it and a stored value is ignored.
+// autoProfileMods is the Fabric preset of the automatic profiles (autoprofiles/);
+// the other loaders have no preset yet, so the untouched default gives them no mods.
+method defaultSettings(): map<string, object> {
+    return {
+        "language": "de",
+        "theme": "system",
+        "memoryMb": 4096,
+        "bridgeUrl": "https://bridge.volt-launcher.app",
+        "javaPath": none(),
+        "closeOnLaunch": false,
+        "downloadThreads": 6,
+        "accentColor": "#00b2ff",
+        "uiScale": "default",
+        "animationsEnabled": true,
+        "minMemoryMb": 1024,
+        "defaultJvmArgs": "-XX:+UseG1GC -XX:+ParallelRefProcEnabled",
+        "javaRuntimes": [],
+        "openLogsOnLaunch": false,
+        "backupsToKeep": 5,
+        "backupBeforePackUpdate": true,
+        "profileSort": "lastPlayed",
+        "quickJoinLabel": "name",
+        "favouritesFirst": true,
+        "showFps": false,
+        "discordPresence": true,
+        "discordApplicationId": "1490544471962685530",
+        "autoUpdate": true,
+        "betaUpdates": false,
+        "autoProfilesEnabled": false,
+        "autoProfileLoader": "fabric",
+        "autoProfileVersions": "release",
+        "autoProfileMods": [
+            {"provider": "modrinth", "projectId": "AANobbMI", "name": "Sodium"},
+            {"provider": "modrinth", "projectId": "gvQqBUqZ", "name": "Lithium"},
+            {"provider": "modrinth", "projectId": "uXXizFIs", "name": "FerriteCore"},
+            {"provider": "modrinth", "projectId": "5ZwdcRci", "name": "ImmediatelyFast"},
+            {"provider": "modrinth", "projectId": "NNAgCjsB", "name": "Entity Culling"},
+            {"provider": "modrinth", "projectId": "nmDcB62a", "name": "ModernFix"},
+            {"provider": "modrinth", "projectId": "fQEb0iXm", "name": "Krypton"}
+        ]
+    }
+}
+
+// How a value of `key` is validated: string | optionalString | bool |
+// integer:<min>:<max> | hexColor | choice:<a>|<b>|... . "" for an unknown key.
+method settingRule(string key): string {
+    var rules = {
+        "language": "string",
+        "theme": "string",
+        "memoryMb": "integer:256:1048576",
+        "bridgeUrl": "fixed",
+        "javaPath": "optionalString",
+        "closeOnLaunch": "bool",
+        "downloadThreads": "integer:1:64",
+        "accentColor": "hexColor",
+        "uiScale": "choice:compact|default|comfortable",
+        "animationsEnabled": "bool",
+        "minMemoryMb": "integer:256:1048576",
+        "defaultJvmArgs": "string",
+        "javaRuntimes": "runtimes",
+        "openLogsOnLaunch": "bool",
+        "backupsToKeep": "integer:0:50",
+        "backupBeforePackUpdate": "bool",
+        "profileSort": "choice:lastPlayed|name|createdAt",
+        "quickJoinLabel": "choice:name|address",
+        "favouritesFirst": "bool",
+        "showFps": "bool",
+        "discordPresence": "bool",
+        "discordApplicationId": "fixed",
+        "autoUpdate": "bool",
+        "betaUpdates": "bool",
+        "autoProfilesEnabled": "bool",
+        "autoProfileLoader": "choice:fabric|quilt|forge|neoforge",
+        "autoProfileVersions": "choice:release|snapshots",
+        "autoProfileMods": "presetMods"
+    }
+    if (rules.has(key)) {
+        return rules[key]
+    }
+    return ""
+}
+
+method settingsFile(): string {
+    return path.join(dataDir(), "settings.json")
+}
+
+// Reads settings.json (missing keys get their default, unknown or invalid
+// values are dropped with a warning).
+method loadSettings() {
+    var merged = defaultSettings()
+    var stored = readJsonFile(settingsFile(), {})
+    if (isMap(stored)) {
+        for (key in stored) {
+            if (validSetting(key, stored[key]) == "") {
+                merged[key] = stored[key]
+            } else {
+                logWarn("settings.json: ignoring '${key}'")
+            }
+        }
+    }
+    sync (settingsLock) {
+        currentSettings = merged
+    }
+}
+
+// A copy of the current settings.
+method settings(): map<string, object> {
+    var text = ""
+    sync (settingsLock) {
+        text = json.stringify(currentSettings)
+    }
+    return json.parse(text)
+}
+
+// One setting (null for an unknown key).
+method setting(string key): object {
+    return getOr(settings(), key, none())
+}
+
+// "#rrggbb" in any letter case.
+method isHexColor(object value): bool {
+    var text = "" + value
+    if (text.length() != 7 || text.startsWith("#") == false) {
+        return false
+    }
+    for (ch in text.substring(1, 7).toLower()) {
+        if ("0123456789abcdef".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// A Modrinth project id or slug: letters, digits, "-", "_" and "." (at most 64 characters).
+method isProjectIdText(object value): bool {
+    var text = "" + value
+    if (text.length() == 0 || text.length() > 64) {
+        return false
+    }
+    for (ch in text) {
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// "" when `value` is a list of preset mods for the auto profiles, otherwise why not:
+// [{"provider": "modrinth", "projectId": "AANobbMI", "name": "Sodium"}, ...] (at most 32 entries).
+method presetModsProblem(string key, object value): string {
+    var shape = "'" + key + "' entries need provider \"modrinth\", a projectId and a name"
+    if (isArray(value) == false) {
+        return "'" + key + "' must be a list"
+    }
+    if (value.length() > 32) {
+        return "'" + key + "' has more than 32 entries"
+    }
+    for (entry in value) {
+        if (isMap(entry) == false) {
+            return shape
+        }
+        if (getOr(entry, "provider", "") != "modrinth") {
+            return shape
+        }
+        var projectId = getOr(entry, "projectId", 0)
+        if (isString(projectId) == false) {
+            return shape
+        }
+        if (isProjectIdText(projectId) == false) {
+            return "'" + key + "' has a projectId that is not a Modrinth id or slug"
+        }
+        if (isString(getOr(entry, "name", 0)) == false) {
+            return shape
+        }
+    }
+    return ""
+}
+
+// "" when `value` is acceptable for `key`, otherwise why not.
+method validSetting(string key, object value): string {
+    var rule = settingRule(key)
+    if (rule == "") {
+        return "unknown setting '${key}'"
+    }
+    if (rule == "fixed") {
+        return "'" + key + "' is fixed by the launcher"
+    }
+    if (rule == "string") {
+        if (isString(value) == false) {
+            return "'${key}' must be a string"
+        }
+        return ""
+    }
+    if (rule == "optionalString") {
+        if (isNull(value) == false && isString(value) == false) {
+            return "'${key}' must be a string or null"
+        }
+        return ""
+    }
+    if (rule == "bool") {
+        if (isBool(value) == false) {
+            return "'${key}' must be true or false"
+        }
+        return ""
+    }
+    if (rule == "hexColor") {
+        if (isString(value) == false || isHexColor(value) == false) {
+            return "'" + key + "' must be a colour like #00b2ff"
+        }
+        return ""
+    }
+    if (rule.startsWith("choice:")) {
+        var choices = rule.split(":")[1].split("|")
+        if (isString(value) == false || choices.contains(value) == false) {
+            return "'" + key + "' must be one of " + choices.join(", ")
+        }
+        return ""
+    }
+    if (rule == "runtimes") {
+        // [{"majorVersion": 21, "path": "/opt/java/bin/java"}, ...]
+        if (isArray(value) == false) {
+            return "'" + key + "' must be a list"
+        }
+        for (entry in value) {
+            if (isMap(entry) == false || isWholeNumber(getOr(entry, "majorVersion", "")) == false || isString(getOr(entry, "path", 0)) == false) {
+                return "'" + key + "' entries need a majorVersion and a path"
+            }
+        }
+        return ""
+    }
+    if (rule == "presetMods") {
+        return presetModsProblem(key, value)
+    }
+    // integer:<min>:<max>
+    var parts = rule.split(":")
+    var low = parseInt(parts[1])
+    var high = parseInt(parts[2])
+    if (isWholeNumber(value) == false) {
+        return "'${key}' must be an integer"
+    }
+    var number = toInteger(value)
+    if (number < low || number > high) {
+        return "'${key}' must be between ${low} and ${high}"
+    }
+    return ""
+}
+
+// Validates the whole patch first, then applies and persists it.
+method patchSettings(object patch): map<string, object> {
+    if (isMap(patch) == false) {
+        badRequest("expected a JSON object with the settings to change")
+    }
+    var changes = {}
+    for (key in patch) {
+        var problem = validSetting(key, patch[key])
+        if (problem != "") {
+            badRequest(problem)
+        }
+        var value = patch[key]
+        if (isWholeNumber(value) && settingRule(key).startsWith("integer")) {
+            value = toInteger(value)
+        }
+        changes[key] = value
+    }
+    var writeError = ""
+    var text = ""
+    sync (settingsLock) {
+        for (key in changes) {
+            currentSettings[key] = changes[key]
+        }
+        text = json.pretty(currentSettings)
+        writeError = writeFileAtomic(settingsFile(), text + "\n")
+    }
+    if (writeError != "") {
+        internal("cannot save settings: " + writeError)
+    }
+    return json.parse(text)
+}
+
+// --- routes -------------------------------------------------------------------------
+
+// Replaces every setting with its default and saves that (POST /api/settings/reset).
+method settingsReset(): map<string, object> {
+    var writeError = ""
+    var text = ""
+    sync (settingsLock) {
+        currentSettings = defaultSettings()
+        text = json.pretty(currentSettings)
+        writeError = writeFileAtomic(settingsFile(), text + "\n")
+    }
+    if (writeError != "") {
+        internal("cannot save settings: " + writeError)
+    }
+    return json.parse(text)
+}
+
+method settingsRoute(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "reset") {
+        if (verb != "POST") {
+            return methodNotAllowed(verb, segments)
+        }
+        return ok(settingsReset())
+    }
+    if (segments.length() != 1) {
+        notFound("no such endpoint")
+    }
+    if (verb == "GET") {
+        return ok(settings())
+    }
+    if (verb == "PATCH") {
+        return ok(patchSettings(body))
+    }
+    return methodNotAllowed(verb, segments)
+}
+
+// 405 with the contract's error shape (the code list has no own entry).
+method methodNotAllowed(string verb, array<string> segments): map<string, object> {
+    // A string literal inside ${...} does not parse (see README), hence the concatenation.
+    fail(405, "bad_request", verb + " is not supported on /api/" + segments.join("/"))
+    return {}
+}

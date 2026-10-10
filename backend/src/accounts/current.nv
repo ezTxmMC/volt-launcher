@@ -1,0 +1,286 @@
+package accounts
+
+import base64
+import bytes
+import core
+import os
+import thread
+
+// The current skin of the selected Microsoft account for the home page: GET /api/accounts/skin.
+//
+// The Mojang profile (GET api.minecraftservices.com/minecraft/profile, with the Minecraft token
+// from acSessionOf, so the sign-in chain and its refresh are the launch ones) lists the skins and
+// capes of the account; the entry with state ACTIVE is the one in use. Its PNG is downloaded from
+// textures.minecraft.net and answered as a data URL, so the renderer never needs network access to
+// the texture host. The active cape is optional: when it cannot be downloaded the answer has no
+// cape instead of failing.
+//
+// Answer: {name, uuid (dashed), model: "classic" | "slim", skinUrl, dataUrl, capeDataUrl}. Without
+// an active skin, skinUrl, dataUrl and capeDataUrl are null and the model is the one of the first
+// listed skin (classic when the profile lists none).
+//
+// Answers are cached per account for AC_SKIN_CACHE_SECONDS in memory. Only successful answers are
+// cached. The network runs outside the cache lock, so a raise never happens while the lock is held.
+
+final AC_SKIN_CACHE_SECONDS = 300
+final AC_TEXTURE_PREFIX = "https://textures.minecraft.net/"
+final AC_TEXTURE_PREFIX_PLAIN = "http://textures.minecraft.net/"
+
+var acCurrentLock = thread.mutex()
+// account id -> {at, view}
+var acCurrentCache = {}
+
+// The skin of the selected Microsoft account; 403 sign_in_required without one.
+method acCurrentSkin(): map<string, object> {
+    var entry = acSelectedMicrosoft()
+    if (core.isNull(entry)) {
+        core.fail(403, "sign_in_required", "Sign in with a Microsoft account to show your skin.")
+    }
+    var id = entry["id"]
+    var cached = acCacheGet(id, os.time())
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var view = acCurrentFetch(entry)
+    acCachePut(id, view, os.time())
+    return view
+}
+
+// GET /api/accounts: the account view plus skinDataUrl and skinError on every entry. A
+// Microsoft account gets its current skin (the PNG data URL, null without an active skin)
+// or skinError (a short message) when the skin cannot be fetched; offline accounts get null
+// for both. The network runs here, outside the store lock, one account after another; the
+// skin cache makes repeated lists free. A failure only affects its own account.
+method acListWithSkins(): map<string, object> {
+    var view = acChange("list", {})
+    var microsoft = acChange("microsoft-entries", {})
+    var skins = {}
+    for (entry in microsoft) {
+        var id = entry["id"]
+        skins[id] = acListSkin(entry)
+    }
+    var accounts = []
+    for (account in view["accounts"]) {
+        var item = {}
+        for (key in account) {
+            item[key] = account[key]
+        }
+        item["skinDataUrl"] = core.none()
+        item["skinError"] = core.none()
+        var accountId = account["id"]
+        if (skins.has(accountId)) {
+            item["skinDataUrl"] = skins[accountId]["skinDataUrl"]
+            item["skinError"] = skins[accountId]["skinError"]
+        }
+        accounts.append(item)
+    }
+    view["accounts"] = accounts
+    return view
+}
+
+// The skin fields of one Microsoft account for the list: the cached answer while it is fresh,
+// otherwise a fetch (only successes are cached). A failed fetch is an answer, not an error.
+method acListSkin(map<string, object> entry): map<string, object> {
+    var id = entry["id"]
+    var cached = acCacheGet(id, os.time())
+    if (core.isNull(cached) == false) {
+        return {"skinDataUrl": cached["dataUrl"], "skinError": core.none()}
+    }
+    var outcome = core.runTrapped(AcSkinTask{entry = entry})
+    if (outcome.failed()) {
+        var message = core.decodeFailure(outcome.error())["message"]
+        return {"skinDataUrl": core.none(), "skinError": acShortError("" + message)}
+    }
+    var view = outcome.result()
+    acCachePut(id, view, os.time())
+    return {"skinDataUrl": view["dataUrl"], "skinError": core.none()}
+}
+
+// The current skin of a Microsoft account entry as a trapped task (the list keeps going on failure).
+define class AcSkinTask {
+    private map<string, object> entry: get, set
+
+    method run(): object {
+        return acCurrentFetch(entry)
+    }
+}
+
+// A short text for the skinError field: the first 160 characters of the failure.
+method acShortError(string message): string {
+    var text = "Skin unavailable: " + message
+    if (text.length() > 160) {
+        return text.substring(0, 157) + "..."
+    }
+    return text
+}
+
+// Drops every cached answer (after a skin was applied, so the next request shows the new one).
+method acCurrentForget() {
+    sync (acCurrentLock) {
+        var keys = []
+        for (key in acCurrentCache) {
+            keys.append(key)
+        }
+        for (key in keys) {
+            acCurrentCache.remove(key)
+        }
+    }
+}
+
+// The cached answer of an account while it is fresh; none otherwise.
+method acCacheGet(string id, integer now): object {
+    var hit = core.none()
+    sync (acCurrentLock) {
+        if (acCurrentCache.has(id)) {
+            var entry = acCurrentCache[id]
+            if (now - entry["at"] < AC_SKIN_CACHE_SECONDS) {
+                hit = entry["view"]
+            }
+        }
+    }
+    return hit
+}
+
+// Stores an answer and drops the expired ones.
+method acCachePut(string id, map<string, object> view, integer now) {
+    sync (acCurrentLock) {
+        acCurrentCache[id] = {"at": now, "view": view}
+        var stale = []
+        for (key in acCurrentCache) {
+            if (now - acCurrentCache[key]["at"] >= AC_SKIN_CACHE_SECONDS) {
+                stale.append(key)
+            }
+        }
+        for (key in stale) {
+            acCurrentCache.remove(key)
+        }
+    }
+}
+
+// The network part: profile, then the active skin and cape images.
+method acCurrentFetch(map<string, object> entry): map<string, object> {
+    var session = acSessionOf(entry)
+    var profile = acProfileDocument(session["accessToken"])
+    var skinUrl = acTextureUrl(acActiveEntry(profile, "skins"))
+    var skinPng = ""
+    if (skinUrl != "") {
+        skinPng = acTextureDownload(skinUrl)
+    }
+    var capeUrl = acTextureUrl(acActiveEntry(profile, "capes"))
+    var capePng = ""
+    if (capeUrl != "") {
+        var outcome = core.runTrapped(AcTextureTask{url = capeUrl})
+        if (outcome.failed()) {
+            core.logWarn("accounts: the active cape could not be loaded, the skin is shown without it")
+        } else {
+            capePng = outcome.result()
+        }
+    }
+    return acSkinAnswer(session["name"], entry["id"], profile, skinUrl, skinPng, capePng)
+}
+
+// The Minecraft profile document. It is never logged: it holds account details.
+method acProfileDocument(string minecraftToken): map<string, object> {
+    var res = acSend("GET", AC_MC_PROFILE_URL, {"Authorization": "Bearer " + minecraftToken, "Accept": "application/json"}, "", "", "")
+    acRequireOk(res, "loading the Minecraft profile")
+    var parsed = acJson(res)
+    if (core.isMap(parsed) == false) {
+        core.upstream("the Minecraft profile answer is not JSON")
+    }
+    return parsed
+}
+
+// The first entry of the profile list (skins or capes) with state ACTIVE; none when there is none.
+method acActiveEntry(map<string, object> profile, string field): object {
+    for (item in core.getOr(profile, field, [])) {
+        if (core.isMap(item) && core.getOr(item, "state", "") == "ACTIVE") {
+            return item
+        }
+    }
+    return core.none()
+}
+
+// The texture URL of a profile entry, or "" when there is none.
+method acTextureUrl(object item): string {
+    if (core.isNull(item)) {
+        return ""
+    }
+    var url = core.getOr(item, "url", "")
+    if (core.isString(url) == false) {
+        return ""
+    }
+    return url
+}
+
+// "classic" or "slim" from the variant of the active skin, else of the first listed skin.
+method acModelOf(map<string, object> profile): string {
+    var skin = acActiveEntry(profile, "skins")
+    if (core.isNull(skin)) {
+        var listed = core.getOr(profile, "skins", [])
+        if (listed.length() == 0) {
+            return "classic"
+        }
+        skin = listed[0]
+    }
+    if (core.isMap(skin) == false) {
+        return "classic"
+    }
+    var variant = core.getOr(skin, "variant", "")
+    if (core.isString(variant) && variant.toUpper() == "SLIM") {
+        return "slim"
+    }
+    return "classic"
+}
+
+// The answer of GET /api/accounts/skin. skinPng and capePng are "" when there is no image.
+method acSkinAnswer(string name, string uuid, map<string, object> profile, string skinUrl, string skinPng, string capePng): map<string, object> {
+    var view = {
+        "name": name,
+        "uuid": uuid,
+        "model": acModelOf(profile),
+        "skinUrl": core.none(),
+        "dataUrl": core.none(),
+        "capeDataUrl": core.none()
+    }
+    if (skinUrl != "") {
+        view["skinUrl"] = skinUrl
+        view["dataUrl"] = "data:image/png;base64," + base64.encode(skinPng)
+    }
+    if (capePng != "") {
+        view["capeDataUrl"] = "data:image/png;base64," + base64.encode(capePng)
+    }
+    return view
+}
+
+// A texture as PNG bytes. Only textures.minecraft.net is fetched (the URL comes from Mojang's answer).
+method acTextureDownload(string url): string {
+    // Mojang answers with http:// or https:// on the same host; the download always uses https.
+    var secure = ""
+    if (url.startsWith(AC_TEXTURE_PREFIX)) {
+        secure = url
+    } else if (url.startsWith(AC_TEXTURE_PREFIX_PLAIN)) {
+        secure = AC_TEXTURE_PREFIX + url.substring(AC_TEXTURE_PREFIX_PLAIN.length())
+    } else {
+        core.upstream("Mojang answered an unexpected skin address")
+    }
+    var res = acSend("GET", secure, {"Accept": "image/png"}, "", "", "")
+    acRequireOk(res, "downloading the skin texture")
+    var png = res["text"]
+    if (bytes.size(png) > AC_MAX_PNG_BYTES) {
+        core.upstream("the skin texture is larger than 2 MB")
+    }
+    var signature = bytes.putU8(137) + "PNG" + bytes.putU8(13) + bytes.putU8(10) + bytes.putU8(26) + bytes.putU8(10)
+    if (bytes.size(png) < 24 || bytes.slice(png, 0, 8) != signature) {
+        core.upstream("the skin texture is not a PNG file")
+    }
+    return png
+}
+
+// The cape download as a trapped task (a failed cape does not fail the answer).
+define class AcTextureTask {
+    private string url: get, set
+
+    method run(): object {
+        return acTextureDownload(url)
+    }
+}

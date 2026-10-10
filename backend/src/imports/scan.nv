@@ -1,0 +1,165 @@
+package imports
+
+import core
+import os
+
+// GET /api/imports/scan: every launcher of launcherTable() with the profiles found in its
+// default folders. Read-only: nothing in a launcher's folder is written, and a link is
+// listed but never followed. A launcher whose reader fails is "unavailable" with the
+// reason, and the other launchers are still listed.
+//
+//   {"launchers": [{"id", "name", "status": found|none|unavailable, "reason",
+//                   "confidence": verified|documented|community,
+//                   "profiles": [{"key", "name", "minecraftVersion", "loader",
+//                                 "loaderVersion", "sizeBytes", "sizeComplete", "path",
+//                                 "importable", "reason", "notes"}]}]}
+//
+// sizeBytes is the game folder's size, counted up to SCAN_ENTRY_CAP entries; when the
+// count stops early sizeComplete is false.
+
+define class DetectTask {
+    private string launcher: get, set
+
+    method run(): object {
+        return detectLauncher(launcher)
+    }
+}
+
+define class MeasureTask {
+    private string folder: get, set
+
+    method run(): object {
+        return measureTree(folder, SCAN_ENTRY_CAP, 0)
+    }
+}
+
+// The reader of one launcher: {"records", "checked"} and "unavailable" when it cannot read.
+// Raises for an unknown launcher id.
+method detectLauncher(string id): map<string, object> {
+    if (id == "prism") {
+        return detectPrism("prism", launcherRoots("prism"), LOADER_IDS)
+    }
+    if (id == "multimc") {
+        return detectPrism("multimc", launcherRoots("multimc"), MULTIMC_LOADER_IDS)
+    }
+    if (id == "atlauncher") {
+        return detectAtLauncher(launcherRoots("atlauncher"))
+    }
+    if (id == "gdlauncher") {
+        return detectGdLauncher(launcherRoots("gdlauncher"))
+    }
+    if (id == "ftb") {
+        return detectFtb(launcherRoots("ftb"))
+    }
+    if (id == "hmcl") {
+        return detectHmcl(launcherRoots("hmcl"))
+    }
+    if (id == "vanilla") {
+        return detectVanilla(launcherRoots("vanilla"))
+    }
+    if (id == "curseforge") {
+        return detectCurseForge()
+    }
+    if (id == "modrinth") {
+        return detectModrinth()
+    }
+    if (id == "norisk") {
+        return detectNoRisk()
+    }
+    return core.notFound("no such launcher: " + id)
+}
+
+// The records of one launcher for the import (none when it cannot be read).
+method launcherRecords(string id): array {
+    var outcome = core.runTrapped(DetectTask{launcher = id})
+    if (outcome.failed()) {
+        return []
+    }
+    return outcome.result()["records"]
+}
+
+// The size of a game folder, measured without following links; a failure counts as unknown.
+method scanSize(string folder): map<string, object> {
+    if (folder == "" || os.isSymlink(folder)) {
+        return {"bytes": 0, "complete": folder == ""}
+    }
+    var outcome = core.runTrapped(MeasureTask{folder = folder})
+    if (outcome.failed()) {
+        return {"bytes": 0, "complete": false}
+    }
+    return outcome.result()
+}
+
+// The public form of a record (the copy-only fields are left out).
+method publicProfile(map<string, object> rec, bool withSizes): map<string, object> {
+    var size = {"bytes": 0, "complete": true}
+    if (withSizes) {
+        size = scanSize(rec["gameDir"])
+    }
+    return {
+        "key": rec["key"],
+        "name": rec["name"],
+        "minecraftVersion": rec["minecraftVersion"],
+        "loader": rec["loader"],
+        "loaderVersion": rec["loaderVersion"],
+        "sizeBytes": size["bytes"],
+        "sizeComplete": size["complete"],
+        "path": rec["path"],
+        "importable": rec["importable"],
+        "reason": rec["reason"],
+        "notes": rec["notes"]
+    }
+}
+
+// One launcher of the scan.
+method scanLauncher(object info, bool withSizes): map<string, object> {
+    var id = info["id"]
+    var status = "none"
+    var reason = ""
+    var records = []
+    var outcome = core.runTrapped(DetectTask{launcher = id})
+    if (outcome.failed()) {
+        status = "unavailable"
+        reason = core.decodeFailure(outcome.error())["message"]
+    } else {
+        var found = outcome.result()
+        var unavailable = textValue(core.getOr(found, "unavailable", ""))
+        records = found["records"]
+        array checked = found["checked"]
+        if (unavailable != "") {
+            status = "unavailable"
+            reason = unavailable
+        } else if (records.length() > 0) {
+            status = "found"
+        } else if (checked.length() == 0) {
+            reason = "no default folder of this launcher on this system"
+        } else {
+            reason = "no instance found in: " + checked.join(", ")
+        }
+    }
+    var profiles = []
+    var seen = {}
+    for (rec in records) {
+        if (seen.has(rec["key"]) == false) {
+            seen[rec["key"]] = true
+            profiles.append(publicProfile(rec, withSizes))
+        }
+    }
+    return {
+        "id": id,
+        "name": info["name"],
+        "status": status,
+        "reason": reason,
+        "confidence": info["confidence"],
+        "profiles": profiles
+    }
+}
+
+// GET /api/imports/scan.
+method scanAll(): map<string, object> {
+    var launchers = []
+    for (info in launcherTable()) {
+        launchers.append(scanLauncher(info, true))
+    }
+    return {"launchers": launchers}
+}

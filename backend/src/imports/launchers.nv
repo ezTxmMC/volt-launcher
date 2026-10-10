@@ -1,0 +1,189 @@
+package imports
+
+import core
+import os
+import path
+
+// The launchers whose profiles can be imported (docs/IMPORT-FORMATS.md) and the
+// default folders they keep their data in on this system.
+//
+// Only the locations the document lists are searched. Where the document marks a
+// location as inferred or only found in third-party code, the launcher's confidence
+// is "community" and the notes of its profiles say so.
+//
+// Test option (documented in docs/ARCHITECTURE.md): when the server runs with
+// --enable-test-routes, VOLT_IMPORT_HOME replaces the home directory and every
+// other environment lookup is switched off, so tests see only their fixtures.
+
+final LOADER_IDS = ["vanilla", "fabric", "quilt", "forge", "neoforge"]
+final MULTIMC_LOADER_IDS = ["vanilla", "forge"]
+final IMPORT_LIMIT_BYTES = 42949672960
+final SCAN_ENTRY_CAP = 50000
+final MAX_IMPORT_ITEMS = 200
+final PROFILE_NAME_LIMIT = 100
+
+// id, display name and confidence of each launcher, in the order the scan lists them.
+method launcherTable(): array {
+    return [
+        {"id": "prism", "name": "Prism Launcher", "confidence": "verified"},
+        {"id": "multimc", "name": "MultiMC", "confidence": "verified"},
+        {"id": "atlauncher", "name": "ATLauncher", "confidence": "community"},
+        {"id": "gdlauncher", "name": "GDLauncher", "confidence": "community"},
+        {"id": "ftb", "name": "FTB App", "confidence": "verified"},
+        {"id": "hmcl", "name": "HMCL", "confidence": "community"},
+        {"id": "vanilla", "name": "Minecraft Launcher (Mojang)", "confidence": "documented"},
+        {"id": "curseforge", "name": "CurseForge app", "confidence": "community"},
+        {"id": "modrinth", "name": "Modrinth App", "confidence": "documented"},
+        {"id": "norisk", "name": "NoRisk Client", "confidence": "community"}
+    ]
+}
+
+method knownLauncher(string id): bool {
+    for (info in launcherTable()) {
+        if (info["id"] == id) {
+            return true
+        }
+    }
+    return false
+}
+
+// The test home (VOLT_IMPORT_HOME) when the server runs with --enable-test-routes, else "".
+method testHome(): string {
+    if (core.testRoutes() == false) {
+        return ""
+    }
+    return os.env("VOLT_IMPORT_HOME")
+}
+
+// The home directory the default paths hang off (the test home in test mode).
+method homeDir(): string {
+    var test = testHome()
+    if (test != "") {
+        return path.absolute(test)
+    }
+    return os.home()
+}
+
+// An environment variable's value, or "" (always "" in test mode).
+method envValue(string name): string {
+    if (testHome() != "") {
+        return ""
+    }
+    return os.env(name)
+}
+
+// "windows", "macos" or "linux" (every other unix counts as linux).
+method currentPlatform(): string {
+    var name = os.platform()
+    if (name == "windows" || name == "macos") {
+        return name
+    }
+    return "linux"
+}
+
+// %APPDATA% on Windows, else <home>/AppData/Roaming (the Windows default in tests).
+method appDataDir(): string {
+    var value = envValue("APPDATA")
+    if (value != "") {
+        return value
+    }
+    return path.join(homeDir(), "AppData", "Roaming")
+}
+
+// $XDG_DATA_HOME or <home>/.local/share (the data directory on Linux).
+method dataHome(): string {
+    var value = envValue("XDG_DATA_HOME")
+    if (value != "" && path.isAbsolute(value)) {
+        return value
+    }
+    return path.join(homeDir(), ".local", "share")
+}
+
+// The data folders of a launcher on this system, the most likely one first. Each is
+// the folder that holds the launcher's instances (the reader adds the subfolder).
+// Platform-specific entries are only added on their platform.
+method launcherRoots(string id): array {
+    var platform = currentPlatform()
+    var home = homeDir()
+    var roots = []
+    if (id == "prism") {
+        var custom = envValue("PRISMLAUNCHER_DATA_DIR")
+        if (custom != "") {
+            roots.append(custom)
+        }
+        if (platform == "windows") {
+            roots.append(path.join(appDataDir(), "PrismLauncher"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", "PrismLauncher"))
+        } else {
+            roots.append(path.join(dataHome(), "PrismLauncher"))
+            roots.append(path.join(home, ".var", "app", "org.prismlauncher.PrismLauncher", "data", "PrismLauncher"))
+        }
+    } else if (id == "multimc") {
+        if (platform == "windows") {
+            roots.append(path.join(appDataDir(), "multimc"))
+            roots.append(path.join(appDataDir(), "MultiMC"))
+        }
+        roots.append(path.join(home, "MultiMC"))
+        roots.append(path.join(home, "Desktop", "MultiMC"))
+        roots.append(path.join(home, "Downloads", "MultiMC"))
+        roots.append(path.join(home, "Applications", "MultiMC.app", "Data"))
+        if (platform == "macos") {
+            roots.append("/Applications/MultiMC.app/Data")
+        }
+    } else if (id == "atlauncher") {
+        if (platform == "windows") {
+            roots.append(path.join(appDataDir(), "ATLauncher"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", "ATLauncher"))
+        } else {
+            roots.append(path.join(dataHome(), "ATLauncher"))
+            roots.append(path.join(home, "ATLauncher"))
+        }
+    } else if (id == "gdlauncher") {
+        if (platform == "windows") {
+            roots.append(path.join(appDataDir(), "gdlauncher_next"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", "gdlauncher_next"))
+        } else {
+            roots.append(path.join(home, ".config", "gdlauncher_next"))
+        }
+    } else if (id == "ftb") {
+        if (platform == "windows") {
+            roots.append(path.join(home, "AppData", "Local", ".ftba"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", ".ftba"))
+        } else {
+            roots.append(path.join(home, ".ftba"))
+        }
+    } else if (id == "hmcl" || id == "vanilla") {
+        // The default .minecraft folder (documented for the vanilla launcher; HMCL's base
+        // folder is inferred to be the same, see IMPORT-FORMATS.md section 9).
+        if (platform == "windows") {
+            roots.append(path.join(appDataDir(), ".minecraft"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", "minecraft"))
+        } else {
+            roots.append(path.join(home, ".minecraft"))
+        }
+    } else if (id == "modrinth") {
+        // The settings folder that holds app.db and profiles/ (dirs::data_dir() + ModrinthApp).
+        var custom = envValue("THESEUS_CONFIG_DIR")
+        if (custom != "") {
+            roots.append(custom)
+        } else if (platform == "windows") {
+            roots.append(path.join(appDataDir(), "ModrinthApp"))
+        } else if (platform == "macos") {
+            roots.append(path.join(home, "Library", "Application Support", "ModrinthApp"))
+        } else {
+            roots.append(path.join(dataHome(), "ModrinthApp"))
+        }
+    } else if (id == "curseforge") {
+        // The CurseForge app keeps its Minecraft folder here (no macOS location is documented).
+        if (platform != "macos") {
+            roots.append(path.join(home, "curseforge", "minecraft"))
+            roots.append(path.join(home, "Documents", "curseforge", "minecraft"))
+        }
+    }
+    return roots
+}

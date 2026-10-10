@@ -1,0 +1,321 @@
+package launch
+
+import os
+import path
+import strings
+import thread
+import core
+
+// Java runtimes: detection, version probing and the Temurin download.
+//
+// Detection order: JAVA_HOME, PATH (which -a java / where java), the usual
+// install folders (/usr/lib/jvm, /usr/java, /opt/java, /opt/jdks, macOS
+// /Library/Java/JavaVirtualMachines/*/Contents/Home, Windows Program Files
+// vendors) and <dataDir>/shared/runtimes. Duplicates (same real path) are
+// dropped. The version comes from the JDK's `release` file when it has one
+// (no process needed - GET /api/java runs on the request thread), else from
+// `java -version`.
+
+final LAUNCH_ADOPTIUM = "https://api.adoptium.net/v3/assets/latest/"
+
+var launchJavaLock = thread.mutex()
+var launchJavaVersions = {}   // real path + mtime -> version text
+
+// The major version of a version text: "1.8.0_402" -> 8, "21.0.5" -> 21; 0 if unknown.
+method launchJavaMajor(string version): integer {
+    var v = version.trim()
+    if (v.startsWith("1.")) {
+        v = v.substring(2, v.length())
+    }
+    var digits = ""
+    for (ch in v) {
+        if (strings.isDigit(ch) == false) {
+            break
+        }
+        digits = digits + ch
+    }
+    if (digits == "") {
+        return 0
+    }
+    return parseInt(digits)
+}
+
+// The text between the first pair of quotes after `marker`.
+method launchQuotedAfter(string text, string marker): string {
+    var at = text.indexOf(marker)
+    if (at < 0) {
+        return ""
+    }
+    var rest = text.substring(at + marker.length(), text.length())
+    var open = rest.indexOf("\"")
+    if (open < 0) {
+        return ""
+    }
+    rest = rest.substring(open + 1, rest.length())
+    var close = rest.indexOf("\"")
+    if (close < 0) {
+        return ""
+    }
+    return rest.substring(0, close)
+}
+
+// The version text of a java executable ("" when it cannot be determined).
+method launchJavaVersion(string executable): string {
+    var real = os.realpath(executable)
+    if (real == "") {
+        return ""
+    }
+    var key = real + "|" + os.modified(real)
+    var cached = ""
+    sync (launchJavaLock) {
+        if (launchJavaVersions.has(key)) {
+            cached = launchJavaVersions[key]
+        }
+    }
+    if (cached != "") {
+        return cached
+    }
+    var version = ""
+    // <home>/bin/java -> <home>/release: JAVA_VERSION="21.0.5"
+    var release = path.join(path.dirname(path.dirname(real)), "release")
+    if (os.isFile(release)) {
+        version = launchQuotedAfter(os.readFile(release), "JAVA_VERSION=")
+    }
+    if (version == "") {
+        var out = os.run(launchQ(real) + " -version 2>&1")["output"]
+        version = launchQuotedAfter(out, "version ")
+    }
+    if (version != "") {
+        sync (launchJavaLock) {
+            launchJavaVersions[key] = version
+        }
+    }
+    return version
+}
+
+method launchAddCandidate(array found, map<string, object> seen, string executable) {
+    if (executable == "" || os.isFile(executable) == false) {
+        return
+    }
+    var real = os.realpath(executable)
+    if (real == "" || seen.has(real)) {
+        return
+    }
+    seen[real] = true
+    var version = launchJavaVersion(executable)
+    if (version == "") {
+        return
+    }
+    found.append({"path": path.normalize(executable), "version": version, "majorVersion": launchJavaMajor(version)})
+}
+
+// <home>/bin/java of every directory below `base` (macOS bundles: Contents/Home).
+method launchAddHomesIn(array found, map<string, object> seen, string base, bool macBundle) {
+    if (os.isDir(base) == false) {
+        return
+    }
+    for (name in os.listDir(base)) {
+        if (name.endsWith(".tmp") || name == "downloads") {
+            continue
+        }
+        var home = path.join(base, name)
+        if (macBundle) {
+            home = path.join(home, "Contents", "Home")
+        }
+        launchAddCandidate(found, seen, path.join(home, "bin", launchJavaExeName()))
+    }
+}
+
+// Every Java installation found: [{path, version, majorVersion}].
+method launchDetectJava(): array {
+    var found = []
+    var seen = {}
+    var home = os.env("JAVA_HOME")
+    if (home != "") {
+        launchAddCandidate(found, seen, path.join(home, "bin", launchJavaExeName()))
+    }
+    var listing = ""
+    if (launchIsWindows()) {
+        listing = os.run("where java 2>NUL")["output"]
+    } else {
+        listing = os.run("which -a java 2>/dev/null")["output"]
+    }
+    for (line in listing.split("\n")) {
+        launchAddCandidate(found, seen, line.trim())
+    }
+    var system = launchOsName()
+    if (system == "windows") {
+        for (base in ["C:/Program Files/Java", "C:/Program Files/Eclipse Adoptium", "C:/Program Files/Microsoft", "C:/Program Files/Zulu", "C:/Program Files/Amazon Corretto"]) {
+            launchAddHomesIn(found, seen, base, false)
+        }
+    } else if (system == "osx") {
+        launchAddHomesIn(found, seen, "/Library/Java/JavaVirtualMachines", true)
+        launchAddHomesIn(found, seen, path.join(os.home(), "Library/Java/JavaVirtualMachines"), true)
+    } else {
+        for (base in ["/usr/lib/jvm", "/usr/java", "/opt/java", "/opt/jdks"]) {
+            launchAddHomesIn(found, seen, base, false)
+        }
+    }
+    launchAddHomesIn(found, seen, launchRuntimesDir(), false)
+    return found
+}
+
+// The Java major a version needs: javaVersion.majorVersion, else a guess
+// from the Minecraft version (1.21/1.22 -> 21, 1.18-1.20 -> 17, 1.17 -> 16, else 8).
+method launchRequiredJava(map<string, object> meta, string mc): integer {
+    var jv = core.getOr(meta, "javaVersion", core.none())
+    if (core.isMap(jv) && core.isWholeNumber(core.getOr(jv, "majorVersion", "")) && core.toInteger(jv["majorVersion"]) > 0) {
+        return core.toInteger(jv["majorVersion"])
+    }
+    if (mc.startsWith("1.21") || mc.startsWith("1.22") || mc.startsWith("25w") || mc.startsWith("26w")) {
+        return 21
+    }
+    if (mc.startsWith("1.18") || mc.startsWith("1.19") || mc.startsWith("1.20") || mc.startsWith("22w") || mc.startsWith("23w") || mc.startsWith("24w")) {
+        return 17
+    }
+    if (mc.startsWith("1.17") || mc.startsWith("21w")) {
+        return 16
+    }
+    return 8
+}
+
+// A configured path (an executable or a Java home) as an executable, or "".
+method launchConfiguredJava(object configured): string {
+    if (core.isString(configured) == false || configured.trim() == "") {
+        return ""
+    }
+    var candidate = configured.trim()
+    if (os.isDir(candidate)) {
+        candidate = path.join(candidate, "bin", launchJavaExeName())
+    }
+    if (os.isFile(candidate) == false) {
+        launchUnprocessable("the configured Java path does not exist: " + configured)
+    }
+    return candidate
+}
+
+// The java executable for a profile: its javaPath, the global javaPath
+// setting, a detected installation of exactly `major`, else a Temurin JDK
+// downloaded into shared/runtimes.
+method launchSelectJava(map<string, object> profile, integer major, string jobId): string {
+    var chosen = launchConfiguredJava(core.getOr(profile, "javaPath", core.none()))
+    if (chosen != "") {
+        return chosen
+    }
+    chosen = launchConfiguredJava(core.setting("javaPath"))
+    if (chosen != "") {
+        return chosen
+    }
+    core.jobMessage(jobId, "Suche Java " + major)
+    for (runtime in launchDetectJava()) {
+        if (runtime["majorVersion"] == major) {
+            return runtime["path"]
+        }
+    }
+    return launchDownloadTemurin(major, jobId)
+}
+
+// --- Temurin ------------------------------------------------------------------
+
+method launchAdoptiumOs(): string {
+    var system = launchOsName()
+    if (system == "osx") {
+        return "mac"
+    }
+    return system
+}
+
+method launchAdoptiumArch(): string {
+    if (launchArch() == "aarch64") {
+        return "aarch64"
+    }
+    return "x64"
+}
+
+// Finds <dir>/**/bin/java (at most three levels down; mac: Contents/Home/bin/java).
+method launchFindJavaHome(string dir, integer depth): string {
+    if (os.isFile(path.join(dir, "bin", launchJavaExeName()))) {
+        return dir
+    }
+    if (depth <= 0 || os.isDir(dir) == false) {
+        return ""
+    }
+    for (name in os.listDir(dir)) {
+        var child = path.join(dir, name)
+        if (os.isDir(child)) {
+            var found = launchFindJavaHome(child, depth - 1)
+            if (found != "") {
+                return found
+            }
+        }
+    }
+    return ""
+}
+
+// Downloads and unpacks Temurin JDK `major` (once) and returns its java.
+method launchDownloadTemurin(integer major, string jobId): string {
+    var system = launchAdoptiumOs()
+    var arch = launchAdoptiumArch()
+    var runtimeDir = path.join(launchRuntimesDir(), "jdk-" + major + "-" + system + "-" + arch)
+    var java = path.join(runtimeDir, "bin", launchJavaExeName())
+    if (os.isFile(java)) {
+        return java
+    }
+    core.jobMessage(jobId, "Lade Java " + major + " (Temurin)")
+    var url = LAUNCH_ADOPTIUM + major + "/hotspot?architecture=" + arch + "&heap_size=normal&image_type=jdk&jvm_impl=hotspot&os=" + system + "&vendor=eclipse"
+    var releases = launchFetchJson(url)
+    if (core.isArray(releases) == false || releases.length() == 0) {
+        launchUnprocessable("no Temurin JDK " + major + " exists for " + system + "/" + arch)
+    }
+    var release = releases[0]
+    var pkg = core.none()
+    if (core.isMap(release) && core.isMap(core.getOr(release, "binary", 0))) {
+        pkg = core.getOr(release["binary"], "package", core.none())
+    }
+    if (core.isMap(pkg) == false || core.isString(core.getOr(pkg, "link", 0)) == false || core.isString(core.getOr(pkg, "name", 0)) == false) {
+        core.upstream("unexpected answer from the Adoptium API")
+    }
+    var downloads = launchEnsureDir(path.join(launchRuntimesDir(), "downloads"))
+    var archive = launchInside(downloads, pkg["name"])
+    if (archive == "") {
+        core.upstream("unexpected file name from the Adoptium API: " + pkg["name"])
+    }
+    launchDownload(pkg["link"], archive, launchText(core.getOr(pkg, "checksum", "")))
+    core.checkCancelled(jobId)
+
+    core.jobMessage(jobId, "Entpacke Java " + major)
+    var temp = runtimeDir + ".tmp"
+    os.removeAll(temp)
+    launchEnsureDir(temp)
+    var cmd = ""
+    if (archive.endsWith(".zip")) {
+        // Windows 10+ ships bsdtar as tar.exe, which reads zip archives
+        cmd = "tar -xf " + launchQ(archive) + " -C " + launchQ(temp)
+    } else {
+        cmd = "tar -xzf " + launchQ(archive) + " -C " + launchQ(temp)
+    }
+    var result = os.run(cmd + " 2>&1")
+    if (result["code"] != 0) {
+        os.removeAll(temp)
+        core.internal("cannot unpack " + archive + ": " + result["output"].trim())
+    }
+    var home = launchFindJavaHome(temp, 4)
+    if (home == "") {
+        os.removeAll(temp)
+        core.internal("the Temurin archive contains no " + launchJavaExeName())
+    }
+    os.removeAll(runtimeDir)
+    if (os.rename(home, runtimeDir) == false) {
+        os.removeAll(temp)
+        core.internal("cannot move the JDK to " + runtimeDir)
+    }
+    os.removeAll(temp)
+    if (launchIsWindows() == false) {
+        os.run("chmod +x " + launchQ(runtimeDir) + "/bin/* 2>/dev/null")
+    }
+    if (os.isFile(java) == false) {
+        core.internal("the JDK has no " + java + " after unpacking")
+    }
+    core.logInfo("launch: installed Temurin " + major + " at " + runtimeDir)
+    return java
+}

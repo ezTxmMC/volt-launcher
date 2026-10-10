@@ -1,0 +1,489 @@
+package providers
+
+import bytes
+import core
+import os
+import path
+
+// The providers module (see docs/ARCHITECTURE.md, "Discover / Provider").
+//
+//   GET  /api/providers                        [{id, name, kinds, sorts, configured, message}]
+//   GET  /api/providers/:provider/search?q=&kind=&gameVersion=&loader=&categories=&offset=&limit=&sort=&environment=&openSource=
+//        -> {total, items, hasMore, supports}; limit 1..50. Every parameter is accepted by every
+//        provider; one it does not honour is ignored and reported false in "supports".
+//        categories: comma separated category ids (Modrinth names, CurseForge numeric ids)
+//        environment: Modrinth only, "client", "server" or "client,server" (supports.environment)
+//        openSource: Modrinth only, "true" keeps open-source projects (supports.openSource)
+//        sort: one of the ids the provider lists in "sorts" (filters.nv); otherwise relevance
+//   GET  /api/providers/:provider/filters?kind=      {kinds, sorts: [{id, label}], categories:
+//        [{id, label}], gameVersions, loaders, supports}; empty lists = the provider cannot list them
+//   GET  /api/providers/:provider/categories?kind=   the category ids of /filters (["optimization", ...])
+//   GET  /api/providers/:provider/projects/:id
+//   GET  /api/providers/:provider/projects/:id/versions?gameVersion=&loader=
+//   POST /api/providers/packs/install          {provider, projectId, versionId, name?}  -> Job
+//        name: the profile's name (1 to 64 characters); absent = the pack's own name.
+//   POST /api/profiles/:id/content/install     {provider, projectId, versionId?, kind,
+//                                               withDependencies?: true, world?}        -> Job
+//        versionId may be omitted: the newest version that fits the profile is taken.
+//        world: the folder of the world that receives a data pack (required for kind datapack).
+//   GET  /api/profiles/:id/modpack            the pack a profile came from, update status   (modpack.nv)
+//   GET  /api/profiles/:id/modpack/versions   every release of that pack                      (modpack.nv)
+//   POST /api/profiles/:id/modpack/update     {versionId?} -> Job                             (modpack.nv)
+//   POST /api/profiles/:id/export             {format: mrpack|curseforge, name?, version?}    (export.nv)
+//   POST /api/modpacks/import                 {path, name?} -> Job                            (modpack.nv)
+//
+// Files: net.nv (curl), hashes.nv, zip.nv, jsonutil.nv, concurrency.nv
+// (cache, worker pool), modrinth.nv, curseforge.nv, technic.nv, ftb.nv,
+// install.nv (pack installs), content.nv (content installs).
+
+private final PV_PROVIDERS = ["modrinth", "curseforge", "technic", "ftb"]
+private final PV_KINDS = ["mod", "modpack", "resourcepack", "shader", "datapack"]
+
+method providerKinds(string provider): array {
+    if (provider == "technic" || provider == "ftb") {
+        return ["modpack"]
+    }
+    return ["mod", "modpack", "resourcepack", "shader", "datapack"]
+}
+
+method providerName(string provider): string {
+    if (provider == "modrinth") {
+        return "Modrinth"
+    }
+    if (provider == "curseforge") {
+        return "CurseForge"
+    }
+    if (provider == "technic") {
+        return "Technic"
+    }
+    return "Feed The Beast"
+}
+
+// The sort ids a provider really honours (filters.nv).
+method providerSorts(string provider): array {
+    return sortIds(provider)
+}
+
+method providerList(): array {
+    var out = []
+    for (p in PV_PROVIDERS) {
+        var configured = true
+        var message = ""
+        if (p == "curseforge") {
+            var status = cfStatus()
+            configured = status["ok"]
+            message = status["message"]
+        }
+        out.append({"id": p, "name": providerName(p), "kinds": providerKinds(p), "sorts": providerSorts(p), "configured": configured, "message": message})
+    }
+    return out
+}
+
+// The default kind of a request without "kind".
+method defaultKindOf(string provider): string {
+    if (provider == "technic" || provider == "ftb") {
+        return "modpack"
+    }
+    return "mod"
+}
+
+// The Discover filters of a provider and kind:
+//   {kinds, sorts: [{id, label}], categories: [{id, label}], gameVersions, loaders, supports}
+// Lists a provider cannot provide are empty. CurseForge needs its bridge: while the
+// bridge is not usable every list is empty and every support false (not cached, so the
+// filters appear as soon as the bridge does).
+// supports (filters.nv) plus the Modrinth-only search filters: environment (client/server) and openSource.
+method searchSupports(string provider): map<string, object> {
+    var out = supportsOf(provider)
+    var modrinth = provider == "modrinth"
+    out["environment"] = modrinth
+    out["openSource"] = modrinth
+    return out
+}
+
+method providerFilters(string provider, string kind): map<string, object> {
+    if (provider == "curseforge") {
+        var status = cfStatus()
+        if (status["ok"] == false) {
+            return {"kinds": providerKinds(provider), "sorts": [], "categories": [], "gameVersions": [], "loaders": [], "supports": noSupport()}
+        }
+    }
+    var key = "filters:" + provider + "|" + kind
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var lists = emptyLists()
+    if (provider == "modrinth") {
+        lists = mrFilterLists(kind)
+    } else if (provider == "curseforge") {
+        lists = cfFilterLists(kind)
+    }
+    var answer = {
+        "kinds": providerKinds(provider),
+        "sorts": sortList(provider),
+        "categories": lists["categories"],
+        "gameVersions": lists["gameVersions"],
+        "loaders": lists["loaders"],
+        "supports": searchSupports(provider)
+    }
+    cachePut(key, answer)
+    return answer
+}
+
+// The category ids of providerFilters(): Modrinth names, CurseForge numeric ids, [] elsewhere.
+method categoryIdsOf(string provider, string kind): array {
+    var out = []
+    var answer = providerFilters(provider, kind)
+    for (c in jarr(answer, "categories")) {
+        out.append(jstr(c, "id"))
+    }
+    return out
+}
+
+method requireProvider(string provider): string {
+    if (PV_PROVIDERS.contains(provider) == false) {
+        core.notFound("unknown provider '" + provider + "'")
+    }
+    return provider
+}
+
+method requireKind(string kind): string {
+    if (PV_KINDS.contains(kind) == false) {
+        core.badRequest("'kind' must be one of " + PV_KINDS.join(", "))
+    }
+    return kind
+}
+
+// One page of search hits: {total, items, hasMore, supports} (see the header).
+method search(string provider, map<string, string> query): map<string, object> {
+    var kind = queryText(query, "kind").toLower()
+    if (kind == "") {
+        kind = defaultKindOf(provider)
+    }
+    requireKind(kind)
+    var q = queryText(query, "q")
+    var gameVersion = queryText(query, "gameVersion")
+    var loader = queryText(query, "loader").toLower()
+    if (loader == "vanilla") {
+        loader = ""
+    }
+    var offset = queryInt(query, "offset", 0, 0, 10000)
+    var limit = pageLimit(query)
+    var sort = normalizeSort(provider, queryText(query, "sort"))
+    var tags = queryText(query, "categories").toLower()
+    // Modrinth only (see supportsOf): "client", "server" or both, and openSource=true.
+    var environment = queryText(query, "environment").toLower()
+    var openSourceText = queryText(query, "openSource").toLower()
+    var key = "search:" + provider + "|" + kind + "|" + q + "|" + gameVersion + "|" + loader + "|" + offset + "|" + limit + "|" + sort + "|" + tags + "|" + environment + "|" + openSourceText
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return searchAnswer(jint(cached, "total", 0), jarr(cached, "items"), offset, searchSupports(provider))
+    }
+    // A kind the provider does not offer has no hits.
+    var found = emptySearch()
+    if (providerKinds(provider).contains(kind)) {
+        if (provider == "modrinth") {
+            found = mrSearch(q, kind, gameVersion, loader, offset, limit, sort, tags, environment, openSourceText == "true")
+        } else if (provider == "curseforge") {
+            found = cfSearch(q, kind, gameVersion, loader, offset, limit, sort, tags)
+        } else if (provider == "technic") {
+            found = technicSearch(q, kind, gameVersion, loader, offset, limit, sort)
+        } else {
+            found = ftbSearch(q, kind, gameVersion, loader, offset, limit, sort)
+        }
+    }
+    cachePut(key, found)
+    return searchAnswer(jint(found, "total", 0), jarr(found, "items"), offset, searchSupports(provider))
+}
+
+method project(string provider, string id): map<string, object> {
+    var key = "project:" + provider + "|" + id
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var result = {}
+    if (provider == "modrinth") {
+        result = mrProject(id)
+    } else if (provider == "curseforge") {
+        result = cfProject(id)
+    } else if (provider == "technic") {
+        result = technicProject(id)
+    } else {
+        result = ftbProject(id)
+    }
+    cachePut(key, result)
+    return result
+}
+
+method versions(string provider, string id, map<string, string> query): array {
+    var gameVersion = queryText(query, "gameVersion")
+    var loader = queryText(query, "loader").toLower()
+    if (loader == "vanilla") {
+        loader = ""
+    }
+    if (provider == "modrinth") {
+        return mrVersions(id, gameVersion, loader)
+    }
+    if (provider == "curseforge") {
+        return cfVersions(id, gameVersion, loader)
+    }
+    if (provider == "technic") {
+        return technicVersions(id, gameVersion, loader)
+    }
+    return ftbVersions(id, gameVersion, loader)
+}
+
+define class PvTitleTask {
+    private string provider: get, set
+    private string projectId: get, set
+
+    method run(): object {
+        return project(provider, projectId)["name"]
+    }
+}
+
+// The longest profile name a pack install may be given, in characters.
+private final PV_PACK_NAME_MAX = 64
+
+// The optional 'name' of a pack install: "" when it is absent or null (the pack's own
+// name is used). Otherwise trimmed, 1 to 64 characters (UTF-8 characters, not bytes)
+// and checked by core.checkName, the rule profile creation uses.
+method packInstallName(object body): string {
+    if (core.isMap(body) == false || body.has("name") == false || core.isNull(body["name"])) {
+        return ""
+    }
+    if (core.isString(body["name"]) == false) {
+        core.badRequest("'name' must be a string")
+    }
+    var text = ("" + body["name"]).trim()
+    if (text == "") {
+        core.badRequest("'name' must not be empty")
+    }
+    if (packNameLength(text) > PV_PACK_NAME_MAX) {
+        core.badRequest("'name' is longer than " + PV_PACK_NAME_MAX + " characters")
+    }
+    return core.checkName(text)
+}
+
+// The number of UTF-8 characters in text (its bytes that do not continue a character).
+method packNameLength(string text): integer {
+    var count = 0
+    var n = bytes.size(text)
+    var i = 0
+    while (i < n) {
+        if ((bytes.u8(text, i) & 0xC0) != 0x80) {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+method packInstall(object body): map<string, object> {
+    if (core.isMap(body) == false) {
+        core.badRequest("expected a JSON object {provider, projectId, versionId, name?}")
+    }
+    var provider = requireProvider(bodyText(body, "provider").toLower())
+    var projectId = bodyText(body, "projectId")
+    var versionId = bodyText(body, "versionId")
+    if (versionId == "") {
+        core.badRequest("'versionId' is required")
+    }
+    if (projectId == "" && (provider == "technic" || provider == "ftb")) {
+        core.badRequest("'projectId' is required")
+    }
+    var name = packInstallName(body)
+    if (provider == "curseforge") {
+        requireBridge()
+    }
+    var title = "Installiere Modpack"
+    if (projectId != "") {
+        // Usually cached from browsing; a failure only costs the nicer title.
+        var named = core.runTrapped(PvTitleTask{provider = provider, projectId = projectId})
+        if (named.failed() == false && core.isString(named.result()) && named.result() != "") {
+            title = "Installiere " + named.result()
+        }
+    }
+    var job = PvPackInstallJob{provider = provider, projectId = projectId, versionId = versionId, name = name}
+    return core.respond(202, core.startJob("pack-install", title, job))
+}
+
+// A true/false body field; `fallback` when absent.
+method bodyFlag(object body, string key, bool fallback): bool {
+    if (core.isMap(body) == false || body.has(key) == false) {
+        return fallback
+    }
+    var value = body[key]
+    if (core.isBool(value) == false) {
+        core.badRequest("'" + key + "' must be true or false")
+    }
+    return core.isBool(value) && value
+}
+
+method contentInstall(string profileId, object body): map<string, object> {
+    if (core.isId(profileId) == false) {
+        core.notFound("profile '" + profileId + "' not found")
+    }
+    var profile = core.requireProfile(profileId)
+    if (core.isMap(body) == false) {
+        core.badRequest("expected a JSON object {provider, projectId, versionId, kind}")
+    }
+    var provider = requireProvider(bodyText(body, "provider").toLower())
+    var projectId = bodyText(body, "projectId")
+    var versionId = bodyText(body, "versionId")
+    var kind = bodyText(body, "kind").toLower()
+    var withDependencies = bodyFlag(body, "withDependencies", true)
+    var world = bodyText(body, "world")
+    if (kind == "") {
+        kind = "mod"
+    }
+    requireKind(kind)
+    if (kind == "datapack") {
+        if (world == "" || world.contains("/") || world.contains("\\") || world == "." || world == "..") {
+            core.badRequest("data packs live inside a world: pass 'world' (the folder name of the world, see GET /api/profiles/:id/content/datapacks/worlds)")
+        }
+        if (os.isDir(path.join(core.profileDir(profileId), "saves", world)) == false) {
+            core.notFound("world '" + world + "' not found")
+        }
+    }
+    if (kind == "modpack") {
+        core.badRequest("a modpack creates its own profile: use POST /api/providers/packs/install")
+    }
+    if (provider == "technic" || provider == "ftb") {
+        core.badRequest(providerName(provider) + " offers modpacks only")
+    }
+    if (projectId == "" && versionId == "") {
+        core.badRequest("'projectId' or 'versionId' is required")
+    }
+    var busy = busyWith(profileId)
+    if (busy == "pack-install") {
+        core.conflict("profile '" + profileId + "' is still being installed")
+    }
+    if (provider == "curseforge") {
+        requireBridge()
+    }
+    var title = "Installiere Inhalt in " + profile["name"]
+    var job = PvContentInstallJob{profileId = profileId, provider = provider, projectId = projectId, versionId = versionId, kind = kind, withDependencies = withDependencies, world = world}
+    return core.respond(202, core.startJob("content-install", title, job))
+}
+
+// segments are the path segments after /api, e.g. ["providers", "modrinth", "search"].
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    var n = segments.length()
+    if (segments[0] == "modpacks") {
+        // ["modpacks", "import"]
+        if (n == 2 && segments[1] == "import") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return modpackImport(body)
+        }
+        return core.notFound("no such endpoint: /api/" + segments.join("/"))
+    }
+    if (segments[0] == "profiles") {
+        // ["profiles", id, "content", "install"]
+        if (n == 4 && segments[2] == "content" && segments[3] == "install") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return contentInstall(segments[1], body)
+        }
+        // ["profiles", id, "modpack"], ["profiles", id, "modpack", "versions" | "update"], ["profiles", id, "export"]
+        if (n == 3 && segments[2] == "modpack") {
+            if (verb != "GET") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(modpackStatus(segments[1]))
+        }
+        if (n == 4 && segments[2] == "modpack" && segments[3] == "versions") {
+            if (verb != "GET") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(modpackVersions(segments[1]))
+        }
+        if (n == 4 && segments[2] == "modpack" && segments[3] == "update") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return modpackUpdate(segments[1], body)
+        }
+        // ["profiles", id, "modpack", "connect" | "disconnect"]
+        if (n == 4 && segments[2] == "modpack" && segments[3] == "connect") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(modpackConnect(segments[1], body))
+        }
+        if (n == 4 && segments[2] == "modpack" && segments[3] == "disconnect") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(modpackDisconnect(segments[1]))
+        }
+        if (n == 3 && segments[2] == "export") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return exportProfile(segments[1], body)
+        }
+        return core.notFound("no such endpoint: /api/" + segments.join("/"))
+    }
+    if (n == 1) {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(providerList())
+    }
+    if (segments[1] == "packs") {
+        if (n == 3 && segments[2] == "install") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return packInstall(body)
+        }
+        return core.notFound("no such endpoint: /api/" + segments.join("/"))
+    }
+    var provider = requireProvider(segments[1])
+    if (n == 3 && segments[2] == "search") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(search(provider, query))
+    }
+    if (n == 3 && segments[2] == "filters") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var filterKind = queryText(query, "kind").toLower()
+        if (filterKind == "") {
+            filterKind = defaultKindOf(provider)
+        }
+        requireKind(filterKind)
+        return core.ok(providerFilters(provider, filterKind))
+    }
+    if (n == 3 && segments[2] == "categories") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var kind = queryText(query, "kind").toLower()
+        if (kind == "") {
+            kind = defaultKindOf(provider)
+        }
+        requireKind(kind)
+        return core.ok(categoryIdsOf(provider, kind))
+    }
+    if (n >= 4 && segments[2] == "projects" && segments[3].trim() != "") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        if (n == 4) {
+            return core.ok(project(provider, segments[3]))
+        }
+        if (n == 5 && segments[4] == "versions") {
+            return core.ok(versions(provider, segments[3], query))
+        }
+    }
+    return core.notFound("no such endpoint: /api/" + segments.join("/"))
+}

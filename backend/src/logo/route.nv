@@ -1,0 +1,62 @@
+package logo
+
+import core
+import providers
+
+// The profile logo (see docs/ARCHITECTURE.md, "Profil-Logo"):
+//
+//   GET /api/profiles/:id/logo -> {"kind": "custom" | "modpack" | "vanilla" | "loader",
+//                                  "loader": "vanilla" | "fabric" | "quilt" | "forge" | "neoforge",
+//                                  "dataUrl": "data:image/...;base64,..." | null}
+//
+// Priority, first match wins:
+//   1. custom    the profile has its own icon (POST /api/profiles/:id/icon)
+//   2. modpack   the profile is linked to a modpack whose icon can be had (logo cache, then the provider)
+//   3. vanilla   a vanilla profile: the texture of the installed client jar (dataUrl null when there is none)
+//   4. loader    every other profile; dataUrl null, the app draws the loader badge
+// Unknown profile: 404.
+
+// segments are the path segments after /api: ["profiles", id, "logo"].
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() != 3 || segments[2] != "logo") {
+        core.notFound("no such endpoint")
+    }
+    if (verb != "GET") {
+        return core.methodNotAllowed(verb, segments)
+    }
+    return core.ok(logoAnswer(segments[1]))
+}
+
+// A string field of a profile copy, or fallback.
+method logoField(map<string, object> profile, string key, string fallback): string {
+    var value = core.getOr(profile, key, fallback)
+    if (core.isString(value)) {
+        return "" + value
+    }
+    return fallback
+}
+
+// The answer for one profile; raises 404 for an unknown profile.
+method logoAnswer(string profileId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var loader = logoField(profile, "loader", "vanilla")
+    var custom = core.getOr(profile, "iconUrl", core.none())
+    if (core.isString(custom) && custom.startsWith("data:image/")) {
+        return {"kind": "custom", "loader": loader, "dataUrl": custom}
+    }
+    var pack = logoLinkedIcon(profile)
+    if (pack != "") {
+        return {"kind": "modpack", "loader": loader, "dataUrl": pack}
+    }
+    if (loader == "vanilla") {
+        var texture = core.runTrapped(LogoVanillaTask{minecraftVersion = logoField(profile, "minecraftVersion", "")})
+        var dataUrl = core.none()
+        if (texture.failed() == false && core.isString(texture.result()) && texture.result() != "") {
+            dataUrl = texture.result()
+        } else if (texture.failed()) {
+            core.logWarn("logo: no vanilla texture: " + providers.failureMessage(texture.error()))
+        }
+        return {"kind": "vanilla", "loader": loader, "dataUrl": dataUrl}
+    }
+    return {"kind": "loader", "loader": loader, "dataUrl": core.none()}
+}

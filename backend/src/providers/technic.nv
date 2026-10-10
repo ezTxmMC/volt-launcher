@@ -1,0 +1,567 @@
+package providers
+
+import core
+import json
+
+// The Technic Platform. Packs are addressed by slug; a search hit carries
+// only name, slug and icon, so hits are enriched with the pack document
+// (one lookup each, at most 8 at a time, cached). Only /trending and /search
+// answer JSON (/discover is HTML), and neither pages, so the whole hit list
+// is filtered first and paged afterwards.
+//
+// Builds: a pack either lives on a Solder instance (a list of mod zips per
+// build, rooted at the game directory) or publishes one client zip ("url").
+
+private final TECHNIC_API = "https://api.technicpack.net"
+// Technic answers only with a launcher build number; any current one works.
+private final TECHNIC_BUILD = "1177"
+
+method technicHeaders(): map<string, string> {
+    return {"Accept": "application/json"}
+}
+
+// Accepts a bare slug, "slug:build" or a technicpack.net URL.
+method technicSlug(string value): string {
+    var slug = value.trim()
+    var marker = slug.indexOf("/modpack/")
+    if (marker >= 0) {
+        slug = slug.substring(marker + 9, slug.length())
+    }
+    var colon = slug.indexOf(":")
+    if (colon >= 0) {
+        slug = slug.substring(0, colon)
+    }
+    var slash = slug.indexOf("/")
+    if (slash >= 0) {
+        slug = slug.substring(0, slash)
+    }
+    // Platform URLs append the numeric id: attack-of-the-bteam.90000
+    var dot = slug.indexOf(".")
+    if (dot > 0 && isDigits(slug.substring(dot + 1, slug.length()))) {
+        slug = slug.substring(0, dot)
+    }
+    if (slug == "") {
+        core.badRequest("a Technic pack slug is required")
+    }
+    return slug
+}
+
+// The pack document (cached 5 minutes).
+method technicPack(string slugOrUrl): map<string, object> {
+    var slug = technicSlug(slugOrUrl)
+    var key = "technic:pack:" + slug
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var doc = getJson(TECHNIC_API + "/modpack/" + urlEncode(slug) + "?build=" + TECHNIC_BUILD, technicHeaders())
+    if (core.isMap(doc) == false) {
+        core.upstream("Technic returned no document for '" + slug + "'")
+    }
+    var error = jstr(doc, "error")
+    if (error != "") {
+        if (error.toLower().contains("does not exist")) {
+            core.notFound("Technic pack '" + slug + "' does not exist")
+        }
+        core.upstream("Technic pack '" + slug + "' is not available: " + error)
+    }
+    cachePut(key, doc)
+    return doc
+}
+
+method solderBase(string solder): string {
+    var base = solder.trim()
+    if (base.endsWith("/") == false) {
+        base = base + "/"
+    }
+    return base
+}
+
+// The Solder listing of a pack: {builds, recommended, latest} (cached).
+method solderPack(string solder, string slug): map<string, object> {
+    var key = "technic:solder:" + solder + "|" + slug
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var doc = getJson(solderBase(solder) + "modpack/" + urlEncode(slug), technicHeaders())
+    if (core.isMap(doc) == false || jstr(doc, "error") != "") {
+        core.upstream("Solder has no pack '" + slug + "': " + jstr(doc, "error"))
+    }
+    cachePut(key, doc)
+    return doc
+}
+
+// One Solder build: {minecraft, forge, mods: [{name, version, url, md5, filesize}]}.
+method solderBuild(string solder, string slug, string build): map<string, object> {
+    var doc = getJson(solderBase(solder) + "modpack/" + urlEncode(slug) + "/" + urlEncode(build), technicHeaders())
+    if (core.isMap(doc) == false || jstr(doc, "error") != "") {
+        core.upstream("Solder has no build '" + build + "' of '" + slug + "': " + jstr(doc, "error"))
+    }
+    return doc
+}
+
+method technicSolderUrl(object doc): string {
+    var solder = jstr(doc, "solder").trim()
+    if (solder.toLower() == "null") {
+        return ""
+    }
+    return solder
+}
+
+// Tags arrive as "a,b,c" (live API) or as an array.
+method technicTags(object doc): array {
+    var out = []
+    if (core.isMap(doc) && doc.has("tags")) {
+        var raw = doc["tags"]
+        if (core.isString(raw)) {
+            for (t in raw.split(",")) {
+                if (t.trim() != "") {
+                    out.append(t.trim())
+                }
+            }
+        } else if (core.isArray(raw)) {
+            out = stringList(raw)
+        }
+    }
+    return out
+}
+
+method stripTags(string text): string {
+    var out = ""
+    var inTag = false
+    for (ch in text) {
+        if (ch == "<") {
+            inTag = true
+        } else if (ch == ">" && inTag) {
+            inTag = false
+            out = out + " "
+        } else if (inTag == false) {
+            out = out + ch
+        }
+    }
+    return out.trim()
+}
+
+method shortDescription(string description): string {
+    var text = stripTags(description)
+    if (text.length() <= 180) {
+        return text
+    }
+    var cut = text.indexOf(". ")
+    if (cut > 40 && cut < 180) {
+        return text.substring(0, cut + 1)
+    }
+    return text.substring(0, 177) + "..."
+}
+
+method technicSummary(object doc): map<string, object> {
+    var slug = jstr(doc, "name")
+    var icon = jstr(jobj(doc, "icon"), "url")
+    if (icon == "") {
+        icon = jstr(jobj(doc, "logo"), "url")
+    }
+    var minecraft = jstr(doc, "minecraft")
+    var gameVersions = []
+    if (minecraft != "") {
+        gameVersions.append(minecraft)
+    }
+    var name = jstr(doc, "displayName")
+    if (name == "") {
+        name = slug
+    }
+    return {
+        "provider": "technic",
+        "id": slug,
+        "slug": slug,
+        "name": name,
+        "summary": shortDescription(jstr(doc, "description")),
+        "iconUrl": icon,
+        "author": jstr(doc, "user"),
+        "downloads": jint(doc, "installs", 0),
+        "follows": jint(doc, "runs", 0),
+        "kind": "modpack",
+        "categories": technicTags(doc),
+        "loaders": [],
+        "gameVersions": gameVersions,
+        "updated": ""
+    }
+}
+
+method technicHitSummary(object hit): map<string, object> {
+    var slug = jstr(hit, "slug")
+    var name = jstr(hit, "name")
+    if (name == "") {
+        name = slug
+    }
+    return {
+        "provider": "technic", "id": slug, "slug": slug, "name": name, "summary": "",
+        "iconUrl": jstr(hit, "iconUrl"), "author": "", "downloads": 0, "follows": 0,
+        "kind": "modpack", "categories": [], "loaders": [], "gameVersions": [], "updated": ""
+    }
+}
+
+define class TechnicEnrichTask {
+    private object hit: get, set
+
+    method run(): object {
+        return technicSummary(technicPack(jstr(hit, "slug")))
+    }
+}
+
+// The hits of a Technic list (/trending or /search), cached for 5 minutes.
+method technicHitsOf(string url): array {
+    var key = "technic:hits:" + url
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var response = getJson(url, technicHeaders())
+    var hits = []
+    for (hit in jarr(response, "modpacks")) {
+        if (jstr(hit, "slug") != "") {
+            hits.append(hit)
+        }
+    }
+    cachePut(key, hits)
+    return hits
+}
+
+method technicSlugs(array hits): array {
+    var out = []
+    for (hit in hits) {
+        out.append(jstr(hit, "slug"))
+    }
+    return out
+}
+
+// Sorts: relevance = the order of the search (or of /trending without a query);
+// popular = the /trending order (with a query: the hits in that order first);
+// downloads = installs; follows = runs. Technic has no categories and no loader
+// in its pack documents, so only gameVersion (the pack's Minecraft version) filters.
+method technicSearch(string q, string kind, string gameVersion, string loader, integer offset, integer limit, string sort): map<string, object> {
+    if (kind != "modpack") {
+        return emptySearch()
+    }
+    var trendingUrl = TECHNIC_API + "/trending?build=" + TECHNIC_BUILD
+    var hits = technicHitsOf(trendingUrl)
+    if (q != "") {
+        hits = technicHitsOf(TECHNIC_API + "/search?build=" + TECHNIC_BUILD + "&q=" + urlEncode(q))
+    }
+    // Enrich every hit (the lists are short: 15-20), so that the filter
+    // sees all of them before paging.
+    var tasks = []
+    for (hit in hits) {
+        tasks.append(TechnicEnrichTask{hit = hit})
+    }
+    var outcomes = runParallel(tasks, PV_MAX_PARALLEL, "")
+    var summaries = []
+    var i = 0
+    while (i < hits.length()) {
+        if (outcomes[i].failed()) {
+            summaries.append(technicHitSummary(hits[i]))
+        } else {
+            summaries.append(outcomes[i].result())
+        }
+        i = i + 1
+    }
+    // The loader of a Technic pack is not in its document (only in the
+    // build), so a loader filter is not applied here: filtering on a guess
+    // would empty the list for every non-Forge loader.
+    var filtered = []
+    for (s in summaries) {
+        var versions = s["gameVersions"]
+        if (gameVersion == "" || versions.contains(gameVersion)) {
+            filtered.append(s)
+        }
+    }
+    if (sort == "downloads") {
+        filtered = sortByNumberDesc(filtered, "downloads")
+    } else if (sort == "follows") {
+        filtered = sortByNumberDesc(filtered, "follows")
+    } else if (sort == "popular" && q != "") {
+        filtered = rankByIds(filtered, technicSlugs(technicHitsOf(trendingUrl)))
+    }
+    return {"total": filtered.length(), "items": pageOf(filtered, offset, limit)}
+}
+
+method technicProject(string id): map<string, object> {
+    var doc = technicPack(id)
+    var summary = technicSummary(doc)
+    var gallery = []
+    for (key in ["background", "logo"]) {
+        var u = jstr(jobj(doc, key), "url")
+        if (u != "") {
+            gallery.append(u)
+        }
+    }
+    var links = {}
+    if (jstr(doc, "platformUrl") != "") {
+        links["technic"] = jstr(doc, "platformUrl")
+    }
+    var discord = jstr(doc, "discordServerId")
+    if (discord != "" && discord.toLower() != "null") {
+        links["discord"] = "https://discord.gg/" + discord
+    }
+    summary["description"] = jstr(doc, "description")
+    summary["gallery"] = gallery
+    summary["links"] = links
+    summary["solder"] = technicSolderUrl(doc) != ""
+    return summary
+}
+
+method technicVersionEntry(string slug, string build, string title, string minecraft, string releaseType, string downloadUrl): map<string, object> {
+    var gameVersions = []
+    if (minecraft != "") {
+        gameVersions.append(minecraft)
+    }
+    return {
+        "id": build,
+        "projectId": slug,
+        "name": title + " " + build,
+        "versionNumber": build,
+        "gameVersions": gameVersions,
+        "loaders": [],
+        "releaseType": releaseType,
+        "fileName": "",
+        "downloadUrl": downloadUrl,
+        "sha1": "",
+        "datePublished": "",
+        "dependencies": []
+    }
+}
+
+method technicVersions(string id, string gameVersion, string loader): array {
+    var doc = technicPack(id)
+    var slug = jstr(doc, "name")
+    if (slug == "") {
+        slug = technicSlug(id)
+    }
+    var title = jstr(doc, "displayName")
+    if (title == "") {
+        title = slug
+    }
+    var minecraft = jstr(doc, "minecraft")
+    // A pack is pinned to one Minecraft version.
+    if (gameVersion != "" && minecraft != "" && gameVersion != minecraft) {
+        return []
+    }
+    var solder = technicSolderUrl(doc)
+    if (solder == "") {
+        var build = jstr(doc, "version")
+        var url = jstr(doc, "url")
+        if (url == "") {
+            return []
+        }
+        if (build == "") {
+            build = "latest"
+        }
+        return [technicVersionEntry(slug, build, title, minecraft, "release", url)]
+    }
+    var listing = solderPack(solder, slug)
+    var recommended = jstr(listing, "recommended")
+    var out = []
+    var builds = stringList(jarr(listing, "builds"))
+    // Solder lists builds oldest first; newest first here.
+    var i = builds.length() - 1
+    while (i >= 0) {
+        var b = builds[i]
+        var type = "beta"
+        if (b == recommended) {
+            type = "release"
+        }
+        out.append(technicVersionEntry(slug, b, title, minecraft, type, solderBase(solder) + "modpack/" + slug + "/" + b))
+        i = i - 1
+    }
+    return out
+}
+
+// --- loader detection ----------------------------------------------------------------
+
+// The leading "1.7.10" of a merged version id, or "".
+method minecraftFromId(string id): string {
+    var out = ""
+    var dots = 0
+    for (ch in id.trim()) {
+        if (isDigits(ch)) {
+            out = out + ch
+        } else if (ch == "." && out != "" && out.endsWith(".") == false && dots < 2) {
+            out = out + ch
+            dots = dots + 1
+        } else {
+            break
+        }
+    }
+    while (out.endsWith(".")) {
+        out = out.substring(0, out.length() - 1)
+    }
+    if (dots == 0) {
+        return ""
+    }
+    return out
+}
+
+// The leading run of digits and dots of text.
+method leadingVersion(string text): string {
+    var out = ""
+    for (ch in text) {
+        if (isDigits(ch) || ch == ".") {
+            out = out + ch
+        } else {
+            break
+        }
+    }
+    while (out.endsWith(".")) {
+        out = out.substring(0, out.length() - 1)
+    }
+    return out
+}
+
+// Forge's loader version alone: "1.12.2-14.23.5.2860" -> "14.23.5.2860".
+method normalizeForgeVersion(string minecraft, string forge): string {
+    var value = forge.trim()
+    if (value.toLower().startsWith("forge-")) {
+        value = value.substring(6, value.length())
+    }
+    if (minecraft != "" && value.startsWith(minecraft + "-")) {
+        value = value.substring(minecraft.length() + 1, value.length())
+    }
+    // A trailing "-1.7.10" branch suffix is not part of the version.
+    var dash = value.indexOf("-")
+    if (dash > 0) {
+        value = value.substring(0, dash)
+    }
+    return value
+}
+
+// The Forge version in a merged version id, or "".
+//   1.7.10-Forge10.13.4.1558-1.7.10   -> 10.13.4.1558
+//   1.12.2-forge1.12.2-14.23.5.2860   -> 14.23.5.2860
+//   1.12.2-forge-14.23.5.2860         -> 14.23.5.2860
+//   1.6.4-Forge9.11.1.965             -> 9.11.1.965
+method forgeFromVersionId(string id, string minecraft): string {
+    var lower = id.toLower()
+    var at = lower.indexOf("forge")
+    while (at >= 3 && lower.substring(at - 3, at) == "neo") {
+        at = lower.indexOf("forge", at + 5)
+    }
+    if (at < 0) {
+        return ""
+    }
+    var rest = id.substring(at + 5, id.length())
+    while (rest.startsWith("-") || rest.startsWith("_")) {
+        rest = rest.substring(1, rest.length())
+    }
+    if (minecraft != "" && rest.startsWith(minecraft + "-")) {
+        rest = rest.substring(minecraft.length() + 1, rest.length())
+    }
+    var first = leadingVersion(rest)
+    var after = rest.substring(first.length(), rest.length())
+    // "1.12.2-14.23.5.2860" when the Minecraft version was not known: the
+    // first run is a Minecraft version, the Forge version follows.
+    if (first.startsWith("1.") && after.startsWith("-") && after.length() > 1 && isDigits(after.charAt(1))) {
+        var parts = first.split(".")
+        if (parts.length() <= 3) {
+            first = leadingVersion(after.substring(1, after.length()))
+        }
+    }
+    return first
+}
+
+// {minecraft, loader, loaderVersion} read from a version.json document ("" for unknown).
+method loaderFromVersionJson(object doc): map<string, object> {
+    var id = jstr(doc, "id")
+    var minecraft = jstr(doc, "inheritsFrom")
+    if (minecraft == "") {
+        minecraft = minecraftFromId(id)
+    }
+    var lower = id.toLower()
+    var loader = ""
+    var version = ""
+    if (lower.contains("neoforge")) {
+        loader = "neoforge"
+        var at = lower.indexOf("neoforge")
+        var rest = id.substring(at + 8, id.length())
+        while (rest.startsWith("-") || rest.startsWith("_")) {
+            rest = rest.substring(1, rest.length())
+        }
+        version = rest
+        var dashAt = version.indexOf("-")
+        if (dashAt > 0 && version.substring(0, dashAt) == minecraft) {
+            version = version.substring(dashAt + 1, version.length())
+        }
+    } else if (lower.startsWith("fabric-loader-") || lower.startsWith("quilt-loader-")) {
+        // fabric-loader-0.15.11-1.21.1
+        loader = "fabric"
+        if (lower.startsWith("quilt")) {
+            loader = "quilt"
+        }
+        var rest = id.substring(14, id.length())
+        var dash = rest.indexOf("-")
+        version = rest
+        if (dash > 0) {
+            version = rest.substring(0, dash)
+            if (minecraft == "") {
+                minecraft = rest.substring(dash + 1, rest.length())
+            }
+        }
+    } else if (lower.contains("forge")) {
+        loader = "forge"
+        version = forgeFromVersionId(id, minecraft)
+    } else {
+        // Some merged jars name only the libraries.
+        for (lib in jarr(doc, "libraries")) {
+            var name = jstr(lib, "name")
+            if (name.startsWith("net.minecraftforge:forge:") || name.startsWith("net.minecraftforge:minecraftforge:")) {
+                loader = "forge"
+                var coords = name.split(":")
+                version = normalizeForgeVersion(minecraft, coords[2])
+            }
+        }
+    }
+    if (version == "") {
+        loader = ""
+    }
+    return {"minecraft": minecraft, "loader": loader, "loaderVersion": version}
+}
+
+// Reads key=value lines (Java .properties) into a map.
+method readProperties(string text): map<string, object> {
+    var out = {}
+    for (line in text.replace("\r\n", "\n").split("\n")) {
+        var t = line.trim()
+        if (t == "" || t.startsWith("#")) {
+            continue
+        }
+        var eq = t.indexOf("=")
+        if (eq > 0) {
+            out[t.substring(0, eq).trim()] = t.substring(eq + 1, t.length()).trim()
+        }
+    }
+    return out
+}
+
+// The loader of a Technic modpack.jar: its version.json, else the
+// forgeversion.properties that pre-1.6 Forge jars carry.
+method loaderFromModpackJar(string jarData, string label): map<string, object> {
+    var jar = zipOpenData(jarData, label)
+    var versionJson = zipReadNamed(jar, "version.json")
+    if (versionJson != "") {
+        var parsed = json.tryParse(versionJson)
+        if (core.isMap(parsed)) {
+            var found = loaderFromVersionJson(parsed)
+            if (found["loader"] != "" || found["minecraft"] != "") {
+                return found
+            }
+        }
+    }
+    var forgeProps = readProperties(zipReadNamed(jar, "forgeversion.properties"))
+    var fmlProps = readProperties(zipReadNamed(jar, "fmlversion.properties"))
+    var minecraft = jstr(fmlProps, "fmlbuild.mcversion")
+    if (jstr(forgeProps, "forge.major.number") != "") {
+        var v = jstr(forgeProps, "forge.major.number") + "." + jstr(forgeProps, "forge.minor.number") + "."
+            + jstr(forgeProps, "forge.revision.number") + "." + jstr(forgeProps, "forge.build.number")
+        return {"minecraft": minecraft, "loader": "forge", "loaderVersion": v}
+    }
+    return {"minecraft": minecraft, "loader": "", "loaderVersion": ""}
+}

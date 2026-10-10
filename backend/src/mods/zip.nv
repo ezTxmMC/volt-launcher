@@ -1,0 +1,150 @@
+package mods
+
+import bytes
+import zlib
+import core
+
+// A minimal zip reader for jar files: the End-of-Central-Directory record,
+// the central directory and stored / deflated entries. Zip64 archives and
+// encrypted entries are not supported (mod jars are neither).
+//
+// Every function here works on the whole archive held in one string (Novus
+// strings are byte buffers) and raises (core.raise) on anything malformed;
+// callers run it trapped.
+
+private final EOCD_SIGNATURE = 0x06054b50
+private final CENTRAL_SIGNATURE = 0x02014b50
+private final LOCAL_SIGNATURE = 0x04034b50
+private final EOCD_SIZE = 22
+private final MAX_COMMENT = 65535
+
+// Little endian readers (std/bytes reads big endian only). The caller checks
+// the bounds first: bytes.u8 yields 0 past the end instead of failing.
+method le16(string data, integer at): integer {
+    return bytes.u8(data, at) | (bytes.u8(data, at + 1) << 8)
+}
+
+method le32(string data, integer at): integer {
+    return le16(data, at) | (le16(data, at + 2) << 16)
+}
+
+// Offset of the End-of-Central-Directory record, -1 when there is none. It is
+// the last 22 byte record that starts with the signature; a zip comment of up
+// to 65535 bytes may follow it.
+method findEocd(string data): integer {
+    var n = bytes.size(data)
+    if (n < EOCD_SIZE) {
+        return -1
+    }
+    var at = n - EOCD_SIZE
+    var stop = at - MAX_COMMENT
+    if (stop < 0) {
+        stop = 0
+    }
+    while (at >= stop) {
+        // P K 05 06
+        if (bytes.u8(data, at) == 0x50 && bytes.u8(data, at + 1) == 0x4b && bytes.u8(data, at + 2) == 5 && bytes.u8(data, at + 3) == 6) {
+            if (at + EOCD_SIZE + le16(data, at + 20) <= n) {
+                return at
+            }
+        }
+        at = at - 1
+    }
+    return -1
+}
+
+// The entries of the archive: name -> {"method", "compressedSize", "size",
+// "offset", "flags"}. Directories are included (their names end with "/").
+method zipEntries(string data): map<string, object> {
+    var n = bytes.size(data)
+    var eocd = findEocd(data)
+    if (eocd < 0) {
+        core.raise("not a zip archive (no end of central directory record)")
+    }
+    var count = le16(data, eocd + 10)
+    var directorySize = le32(data, eocd + 12)
+    var directoryOffset = le32(data, eocd + 16)
+    if (count == 0xFFFF || directorySize == 0xFFFFFFFF || directoryOffset == 0xFFFFFFFF) {
+        core.raise("zip64 archives are not supported")
+    }
+    if (directoryOffset + directorySize > eocd) {
+        core.raise("central directory lies outside the archive")
+    }
+    var entries = {}
+    var at = directoryOffset
+    var i = 0
+    while (i < count) {
+        if (at + 46 > eocd || le32(data, at) != CENTRAL_SIGNATURE) {
+            core.raise("broken central directory at entry " + i)
+        }
+        var nameLength = le16(data, at + 28)
+        var extraLength = le16(data, at + 30)
+        var commentLength = le16(data, at + 32)
+        if (at + 46 + nameLength > eocd) {
+            core.raise("broken central directory at entry " + i)
+        }
+        var name = bytes.slice(data, at + 46, at + 46 + nameLength)
+        if (name.contains(chr(0)) == false) {
+            entries[name] = {
+                "flags": le16(data, at + 8),
+                "method": le16(data, at + 10),
+                "compressedSize": le32(data, at + 20),
+                "size": le32(data, at + 24),
+                "offset": le32(data, at + 42)
+            }
+        }
+        at = at + 46 + nameLength + extraLength + commentLength
+        i = i + 1
+    }
+    return entries
+}
+
+// The uncompressed content of one entry (from zipEntries). Entries larger
+// than `limit` bytes are refused so that a hostile jar cannot expand without
+// bound.
+method zipRead(string data, map<string, object> entry, integer limit): string {
+    var n = bytes.size(data)
+    var local = entry["offset"]
+    if (entry["size"] > limit) {
+        core.raise("zip entry is larger than " + limit + " bytes")
+    }
+    if ((entry["flags"] & 1) != 0) {
+        core.raise("encrypted zip entries are not supported")
+    }
+    if (local + 30 > n || le32(data, local) != LOCAL_SIGNATURE) {
+        core.raise("broken local file header")
+    }
+    // The sizes of the local header may be 0 (data descriptor, flag bit 3);
+    // the central directory always has them, so only the name and extra
+    // lengths are taken from here.
+    var start = local + 30 + le16(data, local + 26) + le16(data, local + 28)
+    var end = start + entry["compressedSize"]
+    if (end > n) {
+        core.raise("zip entry data lies outside the archive")
+    }
+    var raw = bytes.slice(data, start, end)
+    var compression = entry["method"]
+    if (compression == 0) {
+        return raw
+    }
+    if (compression == 8) {
+        // zlib.decompress expects the zlib container: it skips a two byte
+        // header (checking only FDICT) and does not verify the Adler-32
+        // trailer, so a header in front of the raw deflate data is enough.
+        var inflated = zlib.decompress(bytes.putU8(0x78) + bytes.putU8(0x9c) + raw, limit)
+        if (zlib.failed()) {
+            core.raise("cannot inflate zip entry")
+        }
+        return inflated
+    }
+    core.raise("unsupported zip compression method " + compression)
+    return ""
+}
+
+// The content of the entry `name`, or "" when the archive has no such entry.
+method zipReadNamed(string data, map<string, object> entries, string name, integer limit): string {
+    if (entries.has(name) == false) {
+        return ""
+    }
+    return zipRead(data, entries[name], limit)
+}

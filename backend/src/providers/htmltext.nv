@@ -1,0 +1,884 @@
+package providers
+
+import bytes
+
+// CurseForge descriptions are HTML; the launcher renders descriptions as Markdown.
+// htmlToMarkdown converts the one into the other (docs/ARCHITECTURE.md, "Discover /
+// Provider"). Novus strings are byte strings: every offset below is a byte offset,
+// and multi-byte UTF-8 characters are only ever copied whole, never split.
+//
+// Pipeline: htTokens (HTML -> tokens, entities decoded in text and attributes,
+// comments, declarations, script, style and iframes dropped) -> HtmlWriter (tokens ->
+// Markdown, one token at a time) -> htTidy.
+
+// --- bytes and predicates ----------------------------------------------------------
+
+method htLower(integer b): integer {
+    if (b >= 65 && b <= 90) {
+        return b + 32
+    }
+    return b
+}
+
+method htIsLetter(integer b): bool {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+}
+
+method htIsNameByte(integer b): bool {
+    return htIsLetter(b) || (b >= 48 && b <= 57) || b == 45 || b == 58 || b == 95
+}
+
+method htIsSpace(integer b): bool {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 12
+}
+
+// The value of one hex digit (or of a decimal digit when hex is false), -1 otherwise.
+method htDigit(integer b, bool hex): integer {
+    if (b >= 48 && b <= 57) {
+        return b - 48
+    }
+    if (hex && b >= 97 && b <= 102) {
+        return b - 87
+    }
+    if (hex && b >= 65 && b <= 70) {
+        return b - 55
+    }
+    return -1
+}
+
+// Whether `needle` occurs in `text` at byte offset `at`.
+method htMatchAt(string text, integer at, string needle): bool {
+    var m = bytes.size(needle)
+    if (at < 0 || at + m > bytes.size(text)) {
+        return false
+    }
+    var k = 0
+    while (k < m) {
+        if (bytes.u8(text, at + k) != bytes.u8(needle, k)) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// The byte offset of `needle` in `text` at or after `from`, or -1.
+method htFind(string text, string needle, integer from): integer {
+    var last = bytes.size(text) - bytes.size(needle)
+    var i = from
+    while (i <= last) {
+        if (htMatchAt(text, i, needle)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Whether the lower case `name` is at `at` (any letter case) and not followed by a name byte.
+method htNameAt(string html, integer at, string name): bool {
+    var m = bytes.size(name)
+    if (at < 0 || at + m > bytes.size(html)) {
+        return false
+    }
+    var k = 0
+    while (k < m) {
+        if (htLower(bytes.u8(html, at + k)) != bytes.u8(name, k)) {
+            return false
+        }
+        k = k + 1
+    }
+    return at + m == bytes.size(html) || htIsNameByte(bytes.u8(html, at + m)) == false
+}
+
+// The byte offset of "</name" (any letter case) at or after `from`, or -1.
+method htFindClose(string html, string name, integer from): integer {
+    var last = bytes.size(html) - bytes.size(name) - 2
+    var i = from
+    while (i <= last) {
+        if (bytes.u8(html, i) == 60 && bytes.u8(html, i + 1) == 47 && htNameAt(html, i + 2, name)) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// --- entities ----------------------------------------------------------------------
+
+// The UTF-8 bytes of one code point.
+method htUtf8(integer cp): string {
+    if (cp < 0x80) {
+        return bytes.putU8(cp)
+    }
+    if (cp < 0x800) {
+        return bytes.putU8(0xC0 | (cp >> 6)) + bytes.putU8(0x80 | (cp & 0x3F))
+    }
+    if (cp < 0x10000) {
+        return bytes.putU8(0xE0 | (cp >> 12)) + bytes.putU8(0x80 | ((cp >> 6) & 0x3F)) + bytes.putU8(0x80 | (cp & 0x3F))
+    }
+    return bytes.putU8(0xF0 | (cp >> 18)) + bytes.putU8(0x80 | ((cp >> 12) & 0x3F)) + bytes.putU8(0x80 | ((cp >> 6) & 0x3F)) + bytes.putU8(0x80 | (cp & 0x3F))
+}
+
+// What a named character reference stands for, "" for a name not listed here.
+method htNamedEntity(string name): string {
+    if (name == "amp") {
+        return "&"
+    }
+    if (name == "lt") {
+        return "<"
+    }
+    if (name == "gt") {
+        return ">"
+    }
+    if (name == "quot") {
+        return "\""
+    }
+    if (name == "apos") {
+        return "'"
+    }
+    if (name == "nbsp") {
+        return " "
+    }
+    if (name == "mdash") {
+        return htUtf8(0x2014)
+    }
+    if (name == "ndash") {
+        return htUtf8(0x2013)
+    }
+    if (name == "hellip") {
+        return htUtf8(0x2026)
+    }
+    return ""
+}
+
+// The character reference at `at` (a "&"): {"ok": true, "v": text, "n": offset after
+// the ";"} or {"ok": false}. Numeric references take decimal or hex (&#39; &#x27;).
+method htReference(string text, integer at): map<string, object> {
+    var n = bytes.size(text)
+    var end = at + 1
+    while (end < n && end <= at + 10 && bytes.u8(text, end) != 59) {
+        end = end + 1
+    }
+    if (end >= n || end == at + 1 || bytes.u8(text, end) != 59) {
+        return {"ok": false}
+    }
+    var name = bytes.slice(text, at + 1, end)
+    if (bytes.u8(name, 0) == 35) {
+        var hex = false
+        var first = 1
+        if (bytes.size(name) > 1 && (bytes.u8(name, 1) == 120 || bytes.u8(name, 1) == 88)) {
+            hex = true
+            first = 2
+        }
+        var value = 0
+        var digits = 0
+        var k = first
+        while (k < bytes.size(name) && value <= 0x10FFFF) {
+            var d = htDigit(bytes.u8(name, k), hex)
+            if (d < 0) {
+                break
+            }
+            if (hex) {
+                value = value * 16 + d
+            } else {
+                value = value * 10 + d
+            }
+            digits = digits + 1
+            k = k + 1
+        }
+        if (digits == 0 || k < bytes.size(name) || value == 0 || value > 0x10FFFF) {
+            return {"ok": false}
+        }
+        return {"ok": true, "v": htUtf8(value), "n": end + 1}
+    }
+    var named = htNamedEntity(name)
+    if (named == "") {
+        return {"ok": false}
+    }
+    return {"ok": true, "v": named, "n": end + 1}
+}
+
+// Decodes the character references of a text node or an attribute value.
+method htDecode(string text): string {
+    if (text.contains("&") == false) {
+        return text
+    }
+    var n = bytes.size(text)
+    var result = ""
+    var i = 0
+    while (i < n) {
+        var amp = htFind(text, "&", i)
+        if (amp < 0) {
+            result = result + bytes.slice(text, i, n)
+            break
+        }
+        result = result + bytes.slice(text, i, amp)
+        var ref = htReference(text, amp)
+        if (ref["ok"] == true) {
+            result = result + "" + ref["v"]
+            i = ref["n"]
+        } else {
+            result = result + "&"
+            i = amp + 1
+        }
+    }
+    return result
+}
+
+// --- tokens ------------------------------------------------------------------------
+//
+// {"k": "t", "v": text}                          text, entities decoded
+// {"k": "o", "n": name, "a": attrs, "c": bool}  opening tag (c: self-closing); names lower case
+// {"k": "c", "n": name}                          closing tag
+
+// Appends every element of `extra` to `tokens`.
+method htAppendAll(array tokens, array extra) {
+    for (tok in extra) {
+        tokens.append(tok)
+    }
+}
+
+// A text token for html[from, to), when there is any text.
+method htTextTokens(string html, integer from, integer to): array {
+    if (to <= from) {
+        return []
+    }
+    return [{"k": "t", "v": htDecode(bytes.slice(html, from, to))}]
+}
+
+// The attribute `key` as text, "" when absent.
+method htAttr(object attrs, string key): string {
+    if (attrs.has(key) == false) {
+        return ""
+    }
+    return "" + attrs[key]
+}
+
+// The tag that starts at `at`: {"tok": token, "next": offset after its ">"}.
+method htTag(string html, integer at): map<string, object> {
+    var n = bytes.size(html)
+    var i = at + 1
+    var closing = false
+    if (bytes.u8(html, i) == 47) {
+        closing = true
+        i = i + 1
+    }
+    var start = i
+    while (i < n && htIsNameByte(bytes.u8(html, i))) {
+        i = i + 1
+    }
+    var name = bytes.slice(html, start, i).toLower()
+    var attrs = {}
+    var selfClosing = false
+    var done = false
+    while (i < n && done == false) {
+        var b = bytes.u8(html, i)
+        if (b == 62) {
+            i = i + 1
+            done = true
+        } else if (b == 47) {
+            selfClosing = true
+            i = i + 1
+        } else if (htIsSpace(b)) {
+            i = i + 1
+        } else {
+            var nameStart = i
+            while (i < n && htIsSpace(bytes.u8(html, i)) == false && bytes.u8(html, i) != 61 && bytes.u8(html, i) != 62 && bytes.u8(html, i) != 47) {
+                i = i + 1
+            }
+            if (i == nameStart) {
+                i = i + 1
+            }
+            var attr = bytes.slice(html, nameStart, i).toLower()
+            var value = ""
+            var j = i
+            while (j < n && htIsSpace(bytes.u8(html, j))) {
+                j = j + 1
+            }
+            if (j < n && bytes.u8(html, j) == 61) {
+                j = j + 1
+                while (j < n && htIsSpace(bytes.u8(html, j))) {
+                    j = j + 1
+                }
+                var quote = 0
+                if (j < n) {
+                    quote = bytes.u8(html, j)
+                }
+                var valueStart = j
+                var valueEnd = j
+                if (quote == 34 || quote == 39) {
+                    valueStart = j + 1
+                    valueEnd = valueStart
+                    while (valueEnd < n && bytes.u8(html, valueEnd) != quote) {
+                        valueEnd = valueEnd + 1
+                    }
+                    i = valueEnd + 1
+                } else {
+                    while (valueEnd < n && htIsSpace(bytes.u8(html, valueEnd)) == false && bytes.u8(html, valueEnd) != 62) {
+                        valueEnd = valueEnd + 1
+                    }
+                    i = valueEnd
+                }
+                if (valueStart <= n && valueEnd <= n) {
+                    value = htDecode(bytes.slice(html, valueStart, valueEnd))
+                }
+            }
+            if (attr != "" && attrs.has(attr) == false) {
+                attrs[attr] = value
+            }
+        }
+    }
+    if (i > n) {
+        i = n
+    }
+    if (closing) {
+        return {"tok": {"k": "c", "n": name}, "next": i}
+    }
+    return {"tok": {"k": "o", "n": name, "a": attrs, "c": selfClosing}, "next": i}
+}
+
+// The link a YouTube embed stands for, [Video](https://www.youtube.com/watch?v=ID);
+// no tokens for any other iframe.
+method htVideoTokens(object attrs): array {
+    var src = htAttr(attrs, "src")
+    var at = src.indexOf("/embed/")
+    if (at < 0 || src.contains("youtube") == false) {
+        return []
+    }
+    var id = src.substring(at + 7, bytes.size(src))
+    var end = 0
+    while (end < bytes.size(id) && bytes.u8(id, end) != 63 && bytes.u8(id, end) != 38 && bytes.u8(id, end) != 47 && bytes.u8(id, end) != 35) {
+        end = end + 1
+    }
+    id = bytes.slice(id, 0, end)
+    if (id == "") {
+        return []
+    }
+    var k = 0
+    while (k < bytes.size(id)) {
+        var b = bytes.u8(id, k)
+        if (htIsNameByte(b) == false || b == 58) {
+            return []
+        }
+        k = k + 1
+    }
+    return [{"k": "o", "n": "a", "a": {"href": "https://www.youtube.com/watch?v=" + id}, "c": false}, {"k": "t", "v": "Video"}, {"k": "c", "n": "a"}]
+}
+
+// Splits HTML into tokens. Comments and declarations are dropped; script and style
+// elements, and iframes, are dropped with their content (a YouTube iframe becomes a link).
+method htTokens(string html): array {
+    var tokens = []
+    var n = bytes.size(html)
+    var textStart = 0
+    var i = 0
+    while (i < n) {
+        if (bytes.u8(html, i) != 60) {
+            i = i + 1
+            continue
+        }
+        var c = 0
+        if (i + 1 < n) {
+            c = bytes.u8(html, i + 1)
+        }
+        if (htMatchAt(html, i, "<!--")) {
+            htAppendAll(tokens, htTextTokens(html, textStart, i))
+            var commentEnd = htFind(html, "-->", i + 4)
+            i = n
+            if (commentEnd >= 0) {
+                i = commentEnd + 3
+            }
+            textStart = i
+            continue
+        }
+        if (c == 33 || c == 63) {
+            htAppendAll(tokens, htTextTokens(html, textStart, i))
+            var declEnd = htFind(html, ">", i + 1)
+            i = n
+            if (declEnd >= 0) {
+                i = declEnd + 1
+            }
+            textStart = i
+            continue
+        }
+        var isClosing = c == 47 && i + 2 < n && htIsLetter(bytes.u8(html, i + 2))
+        if (htIsLetter(c) == false && isClosing == false) {
+            i = i + 1
+            continue
+        }
+        htAppendAll(tokens, htTextTokens(html, textStart, i))
+        var tag = htTag(html, i)
+        i = tag["next"]
+        textStart = i
+        var tok = tag["tok"]
+        var name = tok["n"]
+        if (tok["k"] == "o" && (name == "script" || name == "style" || name == "iframe")) {
+            if (name == "iframe") {
+                htAppendAll(tokens, htVideoTokens(tok["a"]))
+            }
+            if (tok["c"] == false) {
+                var contentEnd = htFindClose(html, name, i)
+                i = n
+                if (contentEnd >= 0) {
+                    var closeEnd = htFind(html, ">", contentEnd)
+                    i = n
+                    if (closeEnd >= 0) {
+                        i = closeEnd + 1
+                    }
+                }
+                textStart = i
+            }
+            continue
+        }
+        tokens.append(tok)
+    }
+    htAppendAll(tokens, htTextTokens(html, textStart, n))
+    return tokens
+}
+
+// --- Markdown ----------------------------------------------------------------------
+
+// The number of a heading tag (h1 to h6), 0 for any other name.
+method htHeadingLevel(string name): integer {
+    if (bytes.size(name) == 2 && bytes.u8(name, 0) == 104) {
+        var d = bytes.u8(name, 1) - 48
+        if (d >= 1 && d <= 6) {
+            return d
+        }
+    }
+    return 0
+}
+
+// Elements that wrap their content in Markdown marks.
+method htInlineMark(string name): bool {
+    return name == "strong" || name == "b" || name == "em" || name == "i" || name == "code" || name == "a"
+}
+
+// The target of a CurseForge redirect (/linkout?remoteUrl=...), "" for any other URL.
+// The value is percent-decoded until it is an absolute URL, which takes one decoding
+// for a single encoding and two for a double one.
+method htRedirect(string href): string {
+    var at = href.indexOf("/linkout?")
+    if (at < 0) {
+        return ""
+    }
+    var host = href.substring(0, at)
+    if (host != "" && host.endsWith("curseforge.com") == false) {
+        return ""
+    }
+    var query = href.substring(at + 9, bytes.size(href))
+    var key = query.indexOf("remoteUrl=")
+    if (key < 0) {
+        return ""
+    }
+    var value = query.substring(key + 10, bytes.size(query))
+    var amp = value.indexOf("&")
+    if (amp >= 0) {
+        value = value.substring(0, amp)
+    }
+    var round = 0
+    while (round < 4 && value.contains("%") && htIsAbsolute(value) == false) {
+        value = htPercentDecode(value)
+        round = round + 1
+    }
+    return value
+}
+
+method htIsAbsolute(string url): bool {
+    return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")
+}
+
+// One pass of percent-decoding (%XX escapes; other bytes are kept).
+method htPercentDecode(string text): string {
+    var n = bytes.size(text)
+    var result = ""
+    var i = 0
+    while (i < n) {
+        if (bytes.u8(text, i) == 37 && i + 2 < n) {
+            var high = htDigit(bytes.u8(text, i + 1), true)
+            var low = htDigit(bytes.u8(text, i + 2), true)
+            if (high >= 0 && low >= 0) {
+                result = result + bytes.putU8(high * 16 + low)
+                i = i + 3
+                continue
+            }
+        }
+        result = result + bytes.slice(text, i, i + 1)
+        i = i + 1
+    }
+    return result
+}
+
+// A URL as Markdown needs it inside (...): spaces and parentheses percent-encoded.
+method htUrl(string url): string {
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+}
+
+// Collapses every run of HTML white space to one space.
+method htCollapse(string raw): string {
+    var result = ""
+    var lastSpace = false
+    var n = bytes.size(raw)
+    var i = 0
+    while (i < n) {
+        var b = bytes.u8(raw, i)
+        if (htIsSpace(b)) {
+            if (lastSpace == false) {
+                result = result + " "
+                lastSpace = true
+            }
+        } else {
+            result = result + bytes.slice(raw, i, i + 1)
+            lastSpace = false
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Escapes text that would start a Markdown block at a line start: "# ", "> ", "- ",
+// "+ ", "* " or "1. ".
+method htEscapeStart(string text): string {
+    var n = bytes.size(text)
+    var first = bytes.u8(text, 0)
+    var marker = first == 35 || first == 62 || first == 45 || first == 43 || first == 42
+    if (marker && (n == 1 || bytes.u8(text, 1) == 32)) {
+        return "\\" + text
+    }
+    var k = 0
+    while (k < n && bytes.u8(text, k) >= 48 && bytes.u8(text, k) <= 57) {
+        k = k + 1
+    }
+    if (k > 0 && k < n && (bytes.u8(text, k) == 46 || bytes.u8(text, k) == 41) && (k + 1 == n || bytes.u8(text, k + 1) == 32)) {
+        return bytes.slice(text, 0, k) + "\\" + bytes.slice(text, k, n)
+    }
+    return text
+}
+
+// Escapes what would otherwise read as inline Markdown: "<" before a tag-like byte,
+// and "]" where it would close a link early (inside a link's text, or before "(").
+method htEscapeInline(string text, bool inLink): string {
+    var result = text
+    if (inLink) {
+        result = result.replace("]", "\\]")
+    } else if (result.contains("](")) {
+        result = result.replace("](", "\\](")
+    }
+    if (result.contains("<") == false) {
+        return result
+    }
+    var escaped = ""
+    var n = bytes.size(result)
+    var i = 0
+    while (i < n) {
+        if (bytes.u8(result, i) == 60 && i + 1 < n) {
+            var next = bytes.u8(result, i + 1)
+            if (htIsLetter(next) || next == 47 || next == 33 || next == 63) {
+                escaped = escaped + "\\"
+            }
+        }
+        escaped = escaped + bytes.slice(result, i, i + 1)
+        i = i + 1
+    }
+    return escaped
+}
+
+// Spaces, n of them.
+method htSpaces(integer n): string {
+    var result = ""
+    var k = 0
+    while (k < n) {
+        result = result + " "
+        k = k + 1
+    }
+    return result
+}
+
+// Turns the token stream into Markdown. `out` is the text so far; every block
+// boundary goes through breakLine (a new line) or blankLine (a new paragraph).
+define class HtmlWriter {
+    private string out: get, set
+    private array lists: get, set      // open lists, innermost last: {"t": "ul" | "ol", "n": next number}
+    private integer quotes: get, set   // open blockquotes
+    private array marks: get, set      // open inline elements: {"n": tag name, "p": offset in out, "h": link target}
+
+    method token(object tok) {
+        var kind = tok["k"]
+        if (kind == "t") {
+            addText("" + tok["v"])
+        } else if (kind == "o") {
+            openTag("" + tok["n"], tok["a"])
+        } else if (kind == "c") {
+            closeTag("" + tok["n"])
+        }
+    }
+
+    method atLineStart(): bool {
+        return out == "" || out.endsWith("\n")
+    }
+
+    // Whether a link is open (its text is written now).
+    method inLink(): bool {
+        for (mark in marks) {
+            if (("" + mark["n"]) == "a") {
+                return true
+            }
+        }
+        return false
+    }
+
+    // "> " for each open blockquote.
+    method quotePrefix(): string {
+        var prefix = ""
+        var q = 0
+        while (q < quotes) {
+            prefix = prefix + "> "
+            q = q + 1
+        }
+        return prefix
+    }
+
+    // The start of a line: the blockquote marks, then two spaces per open list level.
+    method linePrefix(): string {
+        return quotePrefix() + htSpaces(2 * lists.length())
+    }
+
+    // Writes a fragment at the current position, after the line prefix at a line start.
+    method emitRaw(string fragment) {
+        if (atLineStart()) {
+            out = out + linePrefix()
+        }
+        out = out + fragment
+    }
+
+    method trimEnd() {
+        while (out.endsWith(" ")) {
+            out = out.substring(0, bytes.size(out) - 1)
+        }
+    }
+
+    // Ends the current line.
+    method breakLine() {
+        trimEnd()
+        if (out != "" && out.endsWith("\n") == false) {
+            out = out + "\n"
+        }
+    }
+
+    // Ends the paragraph: one blank line, or the blockquote's ">" line inside a quote.
+    method blankLine() {
+        breakLine()
+        if (out == "") {
+            return
+        }
+        if (quotes > 0) {
+            var marker = quotePrefix().trim()
+            if (out.endsWith(marker + "\n") == false) {
+                out = out + marker + "\n"
+            }
+        } else if (out.endsWith("\n\n") == false) {
+            out = out + "\n"
+        }
+    }
+
+    method addText(string raw) {
+        var text = htCollapse(raw)
+        if (text == "") {
+            return
+        }
+        if (atLineStart()) {
+            if (text.startsWith(" ")) {
+                text = text.substring(1, bytes.size(text))
+            }
+            if (text == "") {
+                return
+            }
+            out = out + linePrefix()
+            text = htEscapeStart(text)
+        } else if (out.endsWith(" ") && text.startsWith(" ")) {
+            text = text.substring(1, bytes.size(text))
+        }
+        out = out + htEscapeInline(text, inLink())
+    }
+
+    method openTag(string name, object attrs) {
+        var level = htHeadingLevel(name)
+        if (name == "p" || name == "div") {
+            blankLine()
+        } else if (level > 0) {
+            blankLine()
+            var hashes = ""
+            var k = 0
+            while (k < level) {
+                hashes = hashes + "#"
+                k = k + 1
+            }
+            emitRaw(hashes + " ")
+        } else if (name == "br") {
+            if (atLineStart() == false) {
+                trimEnd()
+                out = out + "  \n"
+            }
+        } else if (name == "ul" || name == "ol") {
+            if (lists.length() == 0) {
+                blankLine()
+            } else {
+                breakLine()
+            }
+            lists.append({"t": name, "n": 1})
+        } else if (name == "li") {
+            breakLine()
+            var depth = lists.length()
+            var indent = 0
+            var marker = "- "
+            if (depth > 0) {
+                indent = 2 * (depth - 1)
+                var top = lists[depth - 1]
+                if (top["t"] == "ol") {
+                    marker = "" + top["n"] + ". "
+                    top["n"] = top["n"] + 1
+                }
+            }
+            out = out + quotePrefix() + htSpaces(indent) + marker
+        } else if (name == "blockquote") {
+            blankLine()
+            quotes = quotes + 1
+        } else if (name == "img") {
+            addImage(attrs)
+        } else if (htInlineMark(name)) {
+            emitRaw("")
+            var target = ""
+            if (name == "a") {
+                target = htRedirect(htAttr(attrs, "href"))
+                if (target == "") {
+                    target = htAttr(attrs, "href")
+                }
+            }
+            marks.append({"n": name, "p": bytes.size(out), "h": target})
+        }
+    }
+
+    method closeTag(string name) {
+        if (name == "p" || name == "div" || htHeadingLevel(name) > 0 || name == "table") {
+            blankLine()
+        } else if (name == "blockquote") {
+            if (quotes > 0) {
+                quotes = quotes - 1
+            }
+            blankLine()
+        } else if (name == "ul" || name == "ol") {
+            if (lists.length() > 0) {
+                lists.pop()
+            }
+            if (lists.length() == 0) {
+                blankLine()
+            } else {
+                breakLine()
+            }
+        } else if (name == "li" || name == "tr") {
+            breakLine()
+        } else if (htInlineMark(name)) {
+            closeMark(name)
+        }
+    }
+
+    // An image, or a CurseForge redirect that stands in an image's place (a link).
+    method addImage(object attrs) {
+        var src = htAttr(attrs, "src")
+        if (src == "") {
+            return
+        }
+        var alt = htCollapse(htAttr(attrs, "alt")).trim().replace("]", "\\]")
+        var target = htRedirect(src)
+        if (target != "") {
+            if (alt == "") {
+                alt = target
+            }
+            emitRaw("[" + alt + "](" + htUrl(target) + ")")
+            return
+        }
+        emitRaw("![" + alt + "](" + htUrl(src) + ")")
+    }
+
+    // Closes the innermost open element of that name (and any left open inside it).
+    method closeMark(string name) {
+        var at = marks.length() - 1
+        while (at >= 0 && ("" + marks[at]["n"]) != name) {
+            at = at - 1
+        }
+        if (at < 0) {
+            return
+        }
+        var mark = marks[at]
+        while (marks.length() > at) {
+            marks.pop()
+        }
+        wrapMark(mark)
+    }
+
+    // Wraps what was written since the mark in its Markdown form.
+    method wrapMark(object mark) {
+        integer pos = mark["p"]
+        var size = bytes.size(out)
+        if (pos > size) {
+            return
+        }
+        var inner = out.substring(pos, size)
+        out = out.substring(0, pos)
+        var name = "" + mark["n"]
+        var text = inner.trim()
+        var lead = ""
+        if (inner.startsWith(" ")) {
+            lead = " "
+        }
+        var trail = ""
+        if (inner.endsWith(" ")) {
+            trail = " "
+        }
+        if (name == "a") {
+            var href = "" + mark["h"]
+            if (href == "") {
+                out = out + inner
+                return
+            }
+            if (text == "") {
+                text = href
+            }
+            out = out + lead + "[" + text + "](" + htUrl(href) + ")" + trail
+            return
+        }
+        if (text == "") {
+            out = out + inner
+            return
+        }
+        var delimiter = "*"
+        if (name == "strong" || name == "b") {
+            delimiter = "**"
+        } else if (name == "code") {
+            delimiter = "`"
+        }
+        out = out + lead + delimiter + text + delimiter + trail
+    }
+}
+
+// Trims the whole text and keeps at most one blank line between paragraphs.
+method htTidy(string text): string {
+    var result = text.trim()
+    while (result.contains("\n\n\n")) {
+        result = result.replace("\n\n\n", "\n\n")
+    }
+    return result
+}
+
+// CurseForge HTML as Markdown (see the top of this file). Empty in, empty out.
+method htmlToMarkdown(string html): string {
+    if (html.trim() == "") {
+        return ""
+    }
+    var writer = HtmlWriter{out = "", lists = [], quotes = 0, marks = []}
+    for (tok in htTokens(html)) {
+        writer.token(tok)
+    }
+    return htTidy(writer.out())
+}

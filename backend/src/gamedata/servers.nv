@@ -1,0 +1,224 @@
+package gamedata
+
+import core
+import os
+import path
+
+// The multiplayer list: <gameDir>/servers.dat, plain (not gzip) NBT with one
+// list tag "servers" of compounds {name, ip, icon, acceptTextures}. The index
+// is the position in that list, which is how the game identifies an entry.
+//
+//   GET    /api/profiles/:id/servers           {"servers": [Server]}
+//   POST   /api/profiles/:id/servers           {"name"?, "address"} -> 201 {"server"}
+//   PATCH  /api/profiles/:id/servers/:index    {"name"?, "address"?} -> {"server"}
+//   DELETE /api/profiles/:id/servers/:index    -> {"deleted": index}
+//
+// Server: {index, name, address, icon (data URL, "" when never pinged), acceptTextures}.
+// Entries keep every field they had; only name, ip and new entries are written.
+
+final SERVER_LIMIT = 512
+
+method serversFile(string profileId): string {
+    return path.join(core.profileDir(profileId), "servers.dat")
+}
+
+// A list of compounds (the servers) of a document, or none when it has no list.
+method serverItems(map<string, object> document): object {
+    var root = document["root"]
+    if (root.has("servers") == false || core.isMap(root["servers"]["v"]) == false) {
+        return core.none()
+    }
+    return root["servers"]["v"]["items"]
+}
+
+// The Server object of one entry (a compound).
+method serverJson(integer index, map<string, object> compound): map<string, object> {
+    string name = tagValue(compound, "name", "")
+    string address = tagValue(compound, "ip", "")
+    string icon = tagValue(compound, "icon", "")
+    integer accept = tagValue(compound, "acceptTextures", 0)
+    var iconUrl = ""
+    if (icon != "") {
+        iconUrl = icon
+        if (icon.startsWith("data:") == false) {
+            iconUrl = "data:image/png;base64," + icon
+        }
+    }
+    return {
+        "index": index,
+        "name": name,
+        "address": address,
+        "icon": iconUrl,
+        "acceptTextures": accept != 0
+    }
+}
+
+define class ServerListTask {
+    private string file: get, set
+
+    method run(): object {
+        var document = nbtReadFile(file)
+        var items = serverItems(document)
+        var out = []
+        if (core.isNull(items)) {
+            return out
+        }
+        var index = 0
+        for (item in items) {
+            out.append(serverJson(index, item))
+            index = index + 1
+        }
+        return out
+    }
+}
+
+// All entries of servers.dat, in file order. A missing file is an empty list.
+method listServers(string profileId): array {
+    var file = serversFile(profileId)
+    if (os.isFile(file) == false) {
+        return []
+    }
+    var outcome = core.runTrapped(ServerListTask{file = file})
+    if (outcome.failed()) {
+        core.internal("servers.dat could not be read: " + outcome.error())
+    }
+    return outcome.result()
+}
+
+// The address from a request: required, trimmed.
+method addressText(object address): string {
+    if (core.isString(address) == false) {
+        core.badRequest("'address' is required and must be a string")
+    }
+    string text = address
+    text = text.trim()
+    if (text == "") {
+        core.badRequest("'address' is required")
+    }
+    return text
+}
+
+// The name from a request, trimmed; an empty name means the fallback (the address).
+method nameText(object name, string fallback): string {
+    if (core.isString(name) == false) {
+        return fallback
+    }
+    string text = name
+    text = text.trim()
+    if (text == "") {
+        return fallback
+    }
+    return text
+}
+
+method nbtText(string text): map<string, object> {
+    return {"t": 8, "v": text}
+}
+
+// The servers.dat document to change: the file's own, or an empty list.
+method serversDocument(string file): map<string, object> {
+    if (os.isFile(file)) {
+        return nbtReadFile(file)
+    }
+    return {"gzip": false, "rootName": "", "root": {"servers": {"t": 9, "v": {"e": 10, "items": []}}}}
+}
+
+// Adds a server at the end of the list (created when the profile never had one).
+method addServer(string profileId, object name, object address): map<string, object> {
+    var text = addressText(address)
+    var title = nameText(name, text)
+    var file = serversFile(profileId)
+    var document = serversDocument(file)
+    var root = document["root"]
+    if (root.has("servers") == false || core.isMap(root["servers"]["v"]) == false) {
+        root["servers"] = {"t": 9, "v": {"e": 10, "items": []}}
+    }
+    var list = root["servers"]["v"]
+    var items = list["items"]
+    if (items.length() >= SERVER_LIMIT) {
+        core.conflict("The server list is full")
+    }
+    list["e"] = 10
+    var entry = {
+        "name": nbtText(title),
+        "ip": nbtText(text),
+        "acceptTextures": {"t": 1, "v": 0}
+    }
+    items.append(entry)
+    nbtSaveFile(file, document)
+    return serverJson(items.length() - 1, entry)
+}
+
+// Changes name and/or address of the entry at `index`. A field that was not
+// sent keeps its value.
+method editServer(string profileId, integer index, bool hasName, object name, bool hasAddress, object address): map<string, object> {
+    var file = serversFile(profileId)
+    if (os.isFile(file) == false) {
+        core.notFound("this profile has no server list")
+    }
+    var document = nbtReadFile(file)
+    var items = serverItems(document)
+    if (core.isNull(items) || index < 0 || index >= items.length()) {
+        core.notFound("no server at position " + index)
+    }
+    var entry = items[index]
+    if (hasAddress) {
+        entry["ip"] = nbtText(addressText(address))
+    }
+    if (hasName) {
+        string current = tagValue(entry, "ip", "")
+        entry["name"] = nbtText(nameText(name, current))
+    }
+    nbtSaveFile(file, document)
+    return serverJson(index, entry)
+}
+
+// Removes the entry at `index`.
+method removeServer(string profileId, integer index): integer {
+    var file = serversFile(profileId)
+    if (os.isFile(file) == false) {
+        core.notFound("this profile has no server list")
+    }
+    var document = nbtReadFile(file)
+    var items = serverItems(document)
+    if (core.isNull(items) || index < 0 || index >= items.length()) {
+        core.notFound("no server at position " + index)
+    }
+    items.remove(index)
+    nbtSaveFile(file, document)
+    return index
+}
+
+// --- work objects (see jobs.nv) ----------------------------------------------------
+
+define class AddServerWork based GameDataWork {
+    private string profileId: get, set
+    private object name: get, set
+    private object address: get, set
+
+    method work(string jobId): object {
+        return addServer(profileId, name, address)
+    }
+}
+
+define class EditServerWork based GameDataWork {
+    private string profileId: get, set
+    private integer index: get, set
+    private bool hasName: get, set
+    private object name: get, set
+    private bool hasAddress: get, set
+    private object address: get, set
+
+    method work(string jobId): object {
+        return editServer(profileId, index, hasName, name, hasAddress, address)
+    }
+}
+
+define class RemoveServerWork based GameDataWork {
+    private string profileId: get, set
+    private integer index: get, set
+
+    method work(string jobId): object {
+        return {"deleted": removeServer(profileId, index)}
+    }
+}

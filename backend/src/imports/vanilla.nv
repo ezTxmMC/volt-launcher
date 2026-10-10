@@ -1,0 +1,81 @@
+package imports
+
+import core
+import os
+import path
+import strings
+
+// The Minecraft launcher by Mojang (docs/IMPORT-FORMATS.md section 10): the profiles
+// object of <.minecraft>/launcher_profiles.json. Only a plain release id (1.21.1, 26.1)
+// is mapped to a vanilla profile; loader and snapshot ids are refused, not parsed.
+//
+// The .minecraft folder itself is never a game folder: it holds launcher_profiles.json,
+// which has the account tokens. A profile whose gameDir is that folder is refused.
+
+// True for a plain release id: two or three dot-separated numbers ("1.21", "1.21.1", "26.1").
+method isPlainVersion(string text): bool {
+    var parts = text.split(".")
+    if (parts.length() < 2 || parts.length() > 3) {
+        return false
+    }
+    for (part in parts) {
+        if (part == "" || strings.isNumeric(part) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+method detectVanilla(array bases): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var file = path.join(base, "launcher_profiles.json")
+        checked.append(file)
+        if (os.isFile(file) == false) {
+            continue
+        }
+        var doc = core.readJsonFile(file, {})
+        var profiles = mapAt(doc, "profiles")
+        for (id in profiles) {
+            records.append(readVanillaProfile(file, base, id, mapAt(profiles, id)))
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readVanillaProfile(string file, string root, string id, map<string, object> p): map<string, object> {
+    var name = textOf(p, "name")
+    if (name == "") {
+        name = id
+    }
+    var source = file + "#" + id
+    var rec = newRecord("vanilla", source, source, name)
+    var type = textOf(p, "type")
+    var last = textOf(p, "lastVersionId")
+    if (type == "latest-release" || type == "latest-snapshot") {
+        refuse(rec, "the profile follows the latest release or snapshot: it has no fixed version")
+    } else if (isPlainVersion(last)) {
+        rec["minecraftVersion"] = last
+        rec["loader"] = "vanilla"
+    } else {
+        refuse(rec, "version '" + last + "' is a loader or snapshot id: not mapped (IMPORT-FORMATS.md section 10)")
+    }
+    var gameDir = textOf(p, "gameDir")
+    if (gameDir == "") {
+        refuse(rec, "the profile uses the shared .minecraft folder: copying it would also copy launcher_profiles.json with the account tokens")
+    } else if (path.isAbsolute(gameDir) == false) {
+        refuse(rec, "gameDir is not an absolute path")
+    } else if (path.normalize(gameDir) == path.normalize(root)) {
+        refuse(rec, "the profile uses the shared .minecraft folder: copying it would also copy launcher_profiles.json with the account tokens")
+    } else {
+        rec["gameDir"] = path.normalize(gameDir)
+    }
+    if (textOf(p, "javaDir") != "") {
+        rec["javaPath"] = textOf(p, "javaDir")
+    }
+    rec["jvmArgs"] = textOf(p, "javaArgs")
+    addNote(rec, "memory is not imported: the format documents no memory field")
+    finishRecord(rec)
+    return rec
+}

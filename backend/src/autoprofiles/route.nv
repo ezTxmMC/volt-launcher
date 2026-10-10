@@ -1,0 +1,77 @@
+package autoprofiles
+
+import core
+
+// Automatic profiles (see state.nv, check.nv, create.nv).
+//
+//   GET  /api/autoprofiles          {enabled, loader, versions, mods, seen, lastCheck, lastError, results}
+//   POST /api/autoprofiles/create   {"minecraftVersion": "26.3"} -> 202 job for that version
+//                                   (400 unknown version, 409 the profile name exists)
+//   POST /api/autoprofiles/check    -> 202 job: a check now, the same as the timer's
+//                                   (409 while a check runs; it runs even when the feature is off)
+//
+// The settings (autoProfilesEnabled, autoProfileLoader, autoProfileVersions, autoProfileMods)
+// change through PATCH /api/settings.
+
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 1) {
+        if (verb == "GET") {
+            return core.ok(autoOverview())
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 2 && segments[1] == "create") {
+        if (verb == "POST") {
+            return core.respond(202, autoStartCreate(body))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 2 && segments[1] == "check") {
+        if (verb == "POST") {
+            return core.respond(202, autoStartCheck())
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    return core.notFound("no such endpoint")
+}
+
+// The manifest entry of a version id, or null.
+method autoFindVersion(map<string, object> manifest, string id): object {
+    for (entry in manifest["versions"]) {
+        if (core.isMap(entry) && core.getOr(entry, "id", "") == id) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// Validates the request and starts the job for one version.
+method autoStartCreate(object body): map<string, object> {
+    var requested = ""
+    if (core.isMap(body)) {
+        var value = core.getOr(body, "minecraftVersion", "")
+        if (core.isString(value)) {
+            requested = value.trim()
+        }
+    }
+    if (requested == "") {
+        core.badRequest("'minecraftVersion' is required")
+    }
+    var entry = autoFindVersion(autoManifest(), requested)
+    if (core.isNull(entry)) {
+        core.badRequest("unknown Minecraft version '" + requested + "'")
+    }
+    var name = autoProfileName(requested)
+    if (autoNameTaken(name)) {
+        core.conflict("a profile named '" + name + "' already exists")
+    }
+    return core.startJob("autoprofile", "Erstelle " + name, AutoProfileCreateJob{minecraftVersion = requested})
+}
+
+// Starts a check job unless one runs.
+method autoStartCheck(): map<string, object> {
+    if (autoClaimCheck() == false) {
+        core.conflict("a check is already running")
+    }
+    return core.startJob("autoprofile", "Prüfe die Minecraft-Versionen", AutoProfileCheckJob{})
+}

@@ -1,0 +1,466 @@
+package gamedata
+
+import bytes
+import core
+import hash
+import os
+import zlib
+
+// NBT, Minecraft's binary tree format (big endian), and the gzip wrapper that
+// level.dat uses. servers.dat is plain NBT, without gzip.
+//
+// A parsed tag is {"t": tag type, "v": value}; a compound's value maps each
+// name to such a tag. The value by tag type:
+//   1 byte, 2 short, 3 int, 4 long      integer
+//   5 float, 6 double                   float
+//   7 byte array                        string of raw bytes
+//   8 string                            UTF-8 text (Java's modified UTF-8 is converted both ways)
+//   9 list                              {"e": element tag type, "items": [value, ...]}
+//   10 compound                         map name -> tag
+//   11 int array, 12 long array         array of integers
+//
+// A document is {"gzip": bool, "rootName": text, "root": compound value}.
+// Parsing raises on malformed input, so callers run it under core.runTrapped.
+// Maps iterate in key order, so a written file lists its compound keys sorted;
+// the game does not depend on key order.
+
+final NBT_MAX_DEPTH = 64
+final NBT_MAX_GUNZIP = 67108864
+
+// --- bounds and little endian helpers ------------------------------------------
+
+// Raises unless `count` bytes exist at `at`.
+method nbtNeed(string data, integer at, integer count) {
+    if (at < 0 || count < 0 || at + count > bytes.size(data)) {
+        core.raise("NBT data is truncated")
+    }
+}
+
+// An unsigned 16 bit little endian value (gzip header fields).
+method leReadU16(string data, integer at): integer {
+    return bytes.u8(data, at) | (bytes.u8(data, at + 1) << 8)
+}
+
+// 2 and 4 byte little endian strings (gzip trailer, zip headers).
+method leBytes16(integer value): string {
+    return bytes.putU8(value & 0xFF) + bytes.putU8((value >> 8) & 0xFF)
+}
+
+method leBytes32(integer value): string {
+    return leBytes16(value & 0xFFFF) + leBytes16((value >> 16) & 0xFFFF)
+}
+
+// --- modified UTF-8 and UTF-8 ----------------------------------------------------
+
+// The code point of the UTF-8 sequence at `at`: {"cp", "n"}, n being the next offset.
+// Invalid bytes give U+FFFD and advance by one.
+method nbtUtf8At(string text, integer at): map<string, object> {
+    var b = bytes.u8(text, at)
+    var size = 1
+    var cp = b
+    if (b < 0x80) {
+        return {"cp": b, "n": at + 1}
+    } else if (b >= 0xC0 && b < 0xE0) {
+        size = 2
+        cp = b & 0x1F
+    } else if (b >= 0xE0 && b < 0xF0) {
+        size = 3
+        cp = b & 0x0F
+    } else if (b >= 0xF0 && b < 0xF8) {
+        size = 4
+        cp = b & 0x07
+    } else {
+        return {"cp": 0xFFFD, "n": at + 1}
+    }
+    if (at + size > bytes.size(text)) {
+        return {"cp": 0xFFFD, "n": at + 1}
+    }
+    var k = 1
+    while (k < size) {
+        cp = (cp << 6) | (bytes.u8(text, at + k) & 0x3F)
+        k = k + 1
+    }
+    return {"cp": cp, "n": at + size}
+}
+
+// The UTF-8 bytes of one code point.
+method nbtUtf8Char(integer cp): string {
+    if (cp < 0x80) {
+        return bytes.putU8(cp)
+    }
+    if (cp < 0x800) {
+        return bytes.putU8(0xC0 | (cp >> 6)) + bytes.putU8(0x80 | (cp & 0x3F))
+    }
+    if (cp < 0x10000) {
+        return bytes.putU8(0xE0 | (cp >> 12)) + bytes.putU8(0x80 | ((cp >> 6) & 0x3F)) + bytes.putU8(0x80 | (cp & 0x3F))
+    }
+    return bytes.putU8(0xF0 | (cp >> 18)) + bytes.putU8(0x80 | ((cp >> 12) & 0x3F))
+        + bytes.putU8(0x80 | ((cp >> 6) & 0x3F)) + bytes.putU8(0x80 | (cp & 0x3F))
+}
+
+// One UTF-16 unit of modified UTF-8 at `at`: {"u", "n"}. NUL is C0 80.
+method nbtMutf8Unit(string data, integer at): map<string, object> {
+    var b = bytes.u8(data, at)
+    if (b < 0x80) {
+        return {"u": b, "n": at + 1}
+    }
+    if ((b & 0xE0) == 0xC0 && at + 1 < bytes.size(data)) {
+        return {"u": ((b & 0x1F) << 6) | (bytes.u8(data, at + 1) & 0x3F), "n": at + 2}
+    }
+    if ((b & 0xF0) == 0xE0 && at + 2 < bytes.size(data)) {
+        var unit = ((b & 0x0F) << 12) | ((bytes.u8(data, at + 1) & 0x3F) << 6) | (bytes.u8(data, at + 2) & 0x3F)
+        return {"u": unit, "n": at + 3}
+    }
+    return {"u": 0xFFFD, "n": at + 1}
+}
+
+// Modified UTF-8 (NBT strings) to UTF-8. Surrogate pairs become one code point.
+method nbtFromMutf8(string data): string {
+    var n = bytes.size(data)
+    var out = ""
+    var i = 0
+    while (i < n) {
+        var first = nbtMutf8Unit(data, i)
+        integer unit = first["u"]
+        i = first["n"]
+        integer cp = unit
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            var paired = false
+            if (i < n) {
+                var second = nbtMutf8Unit(data, i)
+                integer low = second["u"]
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    cp = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                    i = second["n"]
+                    paired = true
+                }
+            }
+            if (paired == false) {
+                cp = 0xFFFD
+            }
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            cp = 0xFFFD
+        }
+        out = out + nbtUtf8Char(cp)
+    }
+    return out
+}
+
+// One code unit (below 0x10000) in modified UTF-8. NUL uses the two byte form.
+method nbtMutf8Char(integer unit): string {
+    if (unit > 0 && unit < 0x80) {
+        return bytes.putU8(unit)
+    }
+    if (unit < 0x800) {
+        return bytes.putU8(0xC0 | (unit >> 6)) + bytes.putU8(0x80 | (unit & 0x3F))
+    }
+    return bytes.putU8(0xE0 | (unit >> 12)) + bytes.putU8(0x80 | ((unit >> 6) & 0x3F)) + bytes.putU8(0x80 | (unit & 0x3F))
+}
+
+// UTF-8 text to modified UTF-8. Code points above U+FFFF become surrogate pairs.
+method nbtToMutf8(string text): string {
+    var n = bytes.size(text)
+    var out = ""
+    var i = 0
+    while (i < n) {
+        var decoded = nbtUtf8At(text, i)
+        integer cp = decoded["cp"]
+        i = decoded["n"]
+        if (cp < 0x10000) {
+            out = out + nbtMutf8Char(cp)
+        } else {
+            var rest = cp - 0x10000
+            out = out + nbtMutf8Char(0xD800 + (rest >> 10)) + nbtMutf8Char(0xDC00 + (rest & 0x3FF))
+        }
+    }
+    return out
+}
+
+// A string as NBT writes it: u16 length, then the modified UTF-8 bytes.
+method nbtStringBytes(string text): string {
+    var encoded = nbtToMutf8(text)
+    var length = bytes.size(encoded)
+    if (length > 65535) {
+        core.raise("NBT string is longer than 65535 bytes")
+    }
+    return bytes.putI16(length) + encoded
+}
+
+// --- reading -------------------------------------------------------------------
+
+// A u16-prefixed string at `at`: {"v": UTF-8 text, "n": next offset}.
+method nbtReadString(string data, integer at): map<string, object> {
+    nbtNeed(data, at, 2)
+    var length = bytes.u16(data, at)
+    nbtNeed(data, at + 2, length)
+    var raw = bytes.slice(data, at + 2, at + 2 + length)
+    return {"v": nbtFromMutf8(raw), "n": at + 2 + length}
+}
+
+// An i32 element count at `at`; negative counts are broken data.
+method nbtReadCount(string data, integer at): integer {
+    nbtNeed(data, at, 4)
+    var count = bytes.i32(data, at)
+    if (count < 0) {
+        core.raise("NBT has a negative length")
+    }
+    return count
+}
+
+// The payload of a tag of `type` at `at`: {"v": value, "n": next offset}.
+method nbtReadPayload(string data, integer type, integer at, integer depth): map<string, object> {
+    if (depth > NBT_MAX_DEPTH) {
+        core.raise("NBT is nested too deeply")
+    }
+    if (type == 1) {
+        nbtNeed(data, at, 1)
+        return {"v": bytes.i8(data, at), "n": at + 1}
+    }
+    if (type == 2) {
+        nbtNeed(data, at, 2)
+        return {"v": bytes.i16(data, at), "n": at + 2}
+    }
+    if (type == 3) {
+        nbtNeed(data, at, 4)
+        return {"v": bytes.i32(data, at), "n": at + 4}
+    }
+    if (type == 4) {
+        nbtNeed(data, at, 8)
+        return {"v": bytes.i64(data, at), "n": at + 8}
+    }
+    if (type == 5) {
+        nbtNeed(data, at, 4)
+        return {"v": bytes.f32(data, at), "n": at + 4}
+    }
+    if (type == 6) {
+        nbtNeed(data, at, 8)
+        return {"v": bytes.f64(data, at), "n": at + 8}
+    }
+    if (type == 7) {
+        var size = nbtReadCount(data, at)
+        nbtNeed(data, at + 4, size)
+        return {"v": bytes.slice(data, at + 4, at + 4 + size), "n": at + 4 + size}
+    }
+    if (type == 8) {
+        return nbtReadString(data, at)
+    }
+    if (type == 9) {
+        nbtNeed(data, at, 5)
+        var elem = bytes.u8(data, at)
+        var count = nbtReadCount(data, at + 1)
+        var items = []
+        var next = at + 5
+        var k = 0
+        while (k < count) {
+            var item = nbtReadPayload(data, elem, next, depth + 1)
+            items.append(item["v"])
+            next = item["n"]
+            k = k + 1
+        }
+        return {"v": {"e": elem, "items": items}, "n": next}
+    }
+    if (type == 10) {
+        var entries = {}
+        var next = at
+        var done = false
+        while (done == false) {
+            nbtNeed(data, next, 1)
+            var tagType = bytes.u8(data, next)
+            if (tagType == 0) {
+                next = next + 1
+                done = true
+            } else {
+                var name = nbtReadString(data, next + 1)
+                string key = name["v"]
+                var body = nbtReadPayload(data, tagType, name["n"], depth + 1)
+                entries[key] = {"t": tagType, "v": body["v"]}
+                next = body["n"]
+            }
+        }
+        return {"v": entries, "n": next}
+    }
+    if (type == 11) {
+        var count = nbtReadCount(data, at)
+        nbtNeed(data, at + 4, count * 4)
+        var ints = []
+        var k = 0
+        while (k < count) {
+            ints.append(bytes.i32(data, at + 4 + k * 4))
+            k = k + 1
+        }
+        return {"v": ints, "n": at + 4 + count * 4}
+    }
+    if (type == 12) {
+        var count = nbtReadCount(data, at)
+        nbtNeed(data, at + 4, count * 8)
+        var longs = []
+        var k = 0
+        while (k < count) {
+            longs.append(bytes.i64(data, at + 4 + k * 8))
+            k = k + 1
+        }
+        return {"v": longs, "n": at + 4 + count * 8}
+    }
+    core.raise("unknown NBT tag type " + type)
+    return {}
+}
+
+// Parses uncompressed NBT bytes into a document.
+method nbtParse(string data, bool gzipped): map<string, object> {
+    nbtNeed(data, 0, 3)
+    if (bytes.u8(data, 0) != 10) {
+        core.raise("not an NBT document: the root tag is not a compound")
+    }
+    var name = nbtReadString(data, 1)
+    var body = nbtReadPayload(data, 10, name["n"], 0)
+    return {"gzip": gzipped, "rootName": name["v"], "root": body["v"]}
+}
+
+// Reads an NBT file, gzip-compressed or not (the first bytes decide).
+method nbtReadFile(string file): map<string, object> {
+    var raw = os.readFile(file)
+    var gzipped = bytes.size(raw) >= 2 && bytes.u8(raw, 0) == 0x1F && bytes.u8(raw, 1) == 0x8B
+    if (gzipped) {
+        return nbtParse(gunzip(raw, NBT_MAX_GUNZIP), true)
+    }
+    return nbtParse(raw, false)
+}
+
+// --- writing -------------------------------------------------------------------
+
+// The bytes of a tag payload of `type` that holds `value` (the form nbtReadPayload reads).
+method nbtWritePayload(integer type, object value, integer depth): string {
+    if (depth > NBT_MAX_DEPTH) {
+        core.raise("NBT is nested too deeply")
+    }
+    if (type == 1) {
+        integer number = value
+        return bytes.putU8(number & 0xFF)
+    }
+    if (type == 2) {
+        integer number = value
+        return bytes.putI16(number)
+    }
+    if (type == 3) {
+        integer number = value
+        return bytes.putI32(number)
+    }
+    if (type == 4) {
+        integer number = value
+        return bytes.putI64(number)
+    }
+    if (type == 5) {
+        float number = value
+        return bytes.putF32(number)
+    }
+    if (type == 6) {
+        float number = value
+        return bytes.putF64(number)
+    }
+    if (type == 7) {
+        string raw = value
+        return bytes.putI32(bytes.size(raw)) + raw
+    }
+    if (type == 8) {
+        string text = value
+        return nbtStringBytes(text)
+    }
+    if (type == 9) {
+        integer elem = value["e"]
+        var items = value["items"]
+        var out = bytes.putU8(elem) + bytes.putI32(items.length())
+        for (item in items) {
+            out = out + nbtWritePayload(elem, item, depth + 1)
+        }
+        return out
+    }
+    if (type == 10) {
+        var out = ""
+        for (name in value) {
+            var tag = value[name]
+            integer tagType = tag["t"]
+            out = out + bytes.putU8(tagType) + nbtStringBytes(name) + nbtWritePayload(tagType, tag["v"], depth + 1)
+        }
+        return out + bytes.putU8(0)
+    }
+    if (type == 11 || type == 12) {
+        var out = bytes.putI32(value.length())
+        for (number in value) {
+            if (type == 11) {
+                out = out + bytes.putI32(number)
+            } else {
+                out = out + bytes.putI64(number)
+            }
+        }
+        return out
+    }
+    core.raise("cannot write NBT tag type " + type)
+    return ""
+}
+
+// The document as bytes: gzip-compressed when it was read that way.
+method nbtSerialize(map<string, object> document): string {
+    string rootName = document["rootName"]
+    var raw = bytes.putU8(10) + nbtStringBytes(rootName) + nbtWritePayload(10, document["root"], 0)
+    if (document["gzip"] == true) {
+        return gzipCompress(raw)
+    }
+    return raw
+}
+
+// Writes the document to `file` atomically (temporary file, then rename).
+method nbtSaveFile(string file, map<string, object> document) {
+    var error = core.writeFileAtomic(file, nbtSerialize(document))
+    if (error != "") {
+        core.internal("cannot write " + file + ": " + error)
+    }
+}
+
+// --- gzip ----------------------------------------------------------------------
+
+// The inflated content of a gzip member (RFC 1952). The header fields are
+// skipped; the deflate body goes to zlib.decompress behind a zlib header.
+method gunzip(string data, integer limit): string {
+    var n = bytes.size(data)
+    if (n < 18 || bytes.u8(data, 0) != 0x1F || bytes.u8(data, 1) != 0x8B || bytes.u8(data, 2) != 8) {
+        core.raise("not a gzip stream")
+    }
+    var flags = bytes.u8(data, 3)
+    var at = 10
+    if ((flags & 4) != 0) {
+        at = at + 2 + leReadU16(data, at)
+    }
+    if ((flags & 8) != 0) {
+        while (at < n && bytes.u8(data, at) != 0) {
+            at = at + 1
+        }
+        at = at + 1
+    }
+    if ((flags & 16) != 0) {
+        while (at < n && bytes.u8(data, at) != 0) {
+            at = at + 1
+        }
+        at = at + 1
+    }
+    if ((flags & 2) != 0) {
+        at = at + 2
+    }
+    if (at > n - 8) {
+        core.raise("gzip header is truncated")
+    }
+    var raw = bytes.slice(data, at, n - 8)
+    var inflated = zlib.decompress(bytes.putU8(0x78) + bytes.putU8(0x9C) + raw, limit)
+    if (zlib.failed()) {
+        core.raise("cannot inflate gzip stream")
+    }
+    return inflated
+}
+
+// A gzip member of `data`: fixed header, deflate body from zlib.compress, then CRC-32 and size.
+method gzipCompress(string data): string {
+    var wrapped = zlib.compress(data)
+    var body = bytes.slice(wrapped, 2, bytes.size(wrapped) - 4)
+    var header = bytes.putU8(0x1F) + bytes.putU8(0x8B) + bytes.putU8(8) + bytes.putU8(0) + bytes.zeros(4)
+        + bytes.putU8(0) + bytes.putU8(255)
+    return header + body + leBytes32(hash.crc32(data)) + leBytes32(bytes.size(data))
+}

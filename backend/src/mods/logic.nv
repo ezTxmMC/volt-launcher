@@ -1,0 +1,598 @@
+package mods
+
+import os
+import path
+import time
+import core
+
+// Scanning, identification, update checks and updates of the content of a
+// profile (mods, resource packs, shader packs, data packs). Every function
+// takes a ContentLoc (store.nv); the mods endpoints pass the "mods" location.
+
+final DISABLED_SUFFIX = ".disabled"
+final BACKUP_DIR = ".volt-backup"
+
+// --- file names ------------------------------------------------------------------
+
+// The file extension of a content kind: jars for mods, zips for the packs.
+method contentExtension(string kind): string {
+    if (kind == "mods") {
+        return ".jar"
+    }
+    return ".zip"
+}
+
+// A content file name as it may appear on disk: <name>.jar|.zip or the same
+// with ".disabled", no path.
+method isContentFileName(string kind, string name): bool {
+    var ext = contentExtension(kind)
+    if (name.endsWith(ext) == false && name.endsWith(ext + DISABLED_SUFFIX) == false) {
+        return false
+    }
+    if (name.contains("/") || name.contains("\\") || name.contains("..") || name.contains(chr(0))) {
+        return false
+    }
+    if (name.startsWith(".") || name == ext || name == ext + DISABLED_SUFFIX) {
+        return false
+    }
+    return true
+}
+
+method isModFileName(string name): bool {
+    return isContentFileName("mods", name)
+}
+
+// 400 unless `name` is a valid file name of the kind.
+method requireContentFileName(string kind, string name): string {
+    if (isContentFileName(kind, name) == false) {
+        var ext = contentExtension(kind)
+        core.badRequest("invalid file name '" + name + "' (expected <name>" + ext + " or <name>" + ext + ".disabled, no path)")
+    }
+    return name
+}
+
+method requireModFileName(string name): string {
+    return requireContentFileName("mods", name)
+}
+
+method isEnabledName(string name): bool {
+    return name.endsWith(DISABLED_SUFFIX) == false
+}
+
+// The name without ".disabled" for a disabled file, the name itself otherwise.
+method enabledNameOf(string name): string {
+    if (isEnabledName(name)) {
+        return name
+    }
+    return name.substring(0, name.length() - DISABLED_SUFFIX.length())
+}
+
+// The name a file gets when its enabled state is flipped to `enabled`.
+method nameWithState(string name, bool enabled): string {
+    var base = enabledNameOf(name)
+    if (enabled) {
+        return base
+    }
+    return base + DISABLED_SUFFIX
+}
+
+// --- scanning ----------------------------------------------------------------------
+
+// The content file names of the location (sorted, files only; [] when the folder is missing).
+method contentFileNames(ContentLoc loc): array {
+    var names = []
+    if (os.isDir(loc.dir()) == false) {
+        return names
+    }
+    for (name in os.listDir(loc.dir())) {
+        if (isContentFileName(loc.kind(), name) && os.isFile(path.join(loc.dir(), name))) {
+            names.append(name)
+        }
+    }
+    return names
+}
+
+// {"sha1", "metadata"} of a file of the location; metadata only for mods.
+method hashOf(ContentLoc loc, string file): map<string, object> {
+    return fileInfoFor(file, os.fileSize(file), os.modifiedMillis(file), loc.kind() == "mods")
+}
+
+// One ModFile entry; `mods` is the store (sha1 -> entry).
+method modFile(ContentLoc loc, string name, map<string, object> mods): map<string, object> {
+    var file = path.join(loc.dir(), name)
+    var size = os.fileSize(file)
+    var info = hashOf(loc, file)
+    var sha = info["sha1"]
+    var source = core.none()
+    var update = core.none()
+    if (mods.has(sha) && core.isMap(mods[sha])) {
+        source = core.getOr(mods[sha], "source", core.none())
+        update = core.getOr(mods[sha], "update", core.none())
+    }
+    var metadata = core.none()
+    if (loc.kind() == "mods") {
+        metadata = info["metadata"]
+    }
+    return {
+        "fileName": name,
+        "enabled": isEnabledName(name),
+        "size": size,
+        "sha1": sha,
+        "metadata": metadata,
+        "source": source,
+        "update": update
+    }
+}
+
+// ModFile[] of the location (the folder is not created here).
+method scanContent(ContentLoc loc): array {
+    var mods = loadStore(loc)
+    var out = []
+    for (name in contentFileNames(loc)) {
+        out.append(modFile(loc, name, mods))
+    }
+    return out
+}
+
+// True when a file other than `except` has this sha1.
+method otherFileHasSha(ContentLoc loc, string except, string sha): bool {
+    for (name in contentFileNames(loc)) {
+        if (name != except) {
+            var info = hashOf(loc, path.join(loc.dir(), name))
+            if (info["sha1"] == sha) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// --- small helpers ----------------------------------------------------------------------
+
+method toFloat(integer value): float {
+    float f = value
+    return f
+}
+
+// The step `done` of `total`, mapped into from..to.
+method stepProgress(float from, float to, integer done, integer total): float {
+    if (total <= 0) {
+        return to
+    }
+    return from + (to - from) * toFloat(done) / toFloat(total)
+}
+
+method uniqueStrings(array values): array {
+    var seen = {}
+    var out = []
+    for (v in values) {
+        if (core.isString(v) && seen.has(v) == false) {
+            seen[v] = true
+            out.append(v)
+        }
+    }
+    return out
+}
+
+method slice(array values, integer from, integer to): array {
+    var out = []
+    var i = from
+    while (i < to && i < values.length()) {
+        out.append(values[i])
+        i = i + 1
+    }
+    return out
+}
+
+// --- identify ---------------------------------------------------------------------------
+
+// Asks Modrinth for every file without a source and records what it knows.
+// Progress goes from `from` to `to`. Returns {"total", "identified", "unknown", "queried"}.
+method identifyContent(string jobId, ContentLoc loc, float from, float to): map<string, object> {
+    core.jobProgress(jobId, from, "Lese Dateien")
+    var files = scanContent(loc)
+    var pending = []
+    var nameBySha = {}
+    var metadataBySha = {}
+    for (f in files) {
+        var sha = f["sha1"]
+        if (core.isNull(f["source"]) && nameBySha.has(sha) == false) {
+            pending.append(sha)
+            nameBySha[sha] = f["fileName"]
+            metadataBySha[sha] = f["metadata"]
+        }
+    }
+    var found = 0
+    var done = 0
+    while (done < pending.length()) {
+        core.checkCancelled(jobId)
+        var chunk = slice(pending, done, done + MODRINTH_BATCH)
+        core.jobProgress(jobId, stepProgress(from, to, done, pending.length()), "Identifiziere " + (done + chunk.length()) + " / " + pending.length())
+        var versions = versionsByHash(chunk)
+        var projectIds = []
+        for (sha in chunk) {
+            if (versions.has(sha) && core.isMap(versions[sha])) {
+                projectIds.append(field(versions[sha], "project_id"))
+            }
+        }
+        var titles = projectTitlesOrEmpty(uniqueStrings(projectIds))
+        core.checkCancelled(jobId)
+        var puts = []
+        for (sha in chunk) {
+            if (versions.has(sha) && core.isMap(versions[sha])) {
+                var source = sourceOf(versions[sha], titles, metadataBySha[sha])
+                if (core.isNull(source) == false) {
+                    puts.append({"sha1": sha, "fileName": nameBySha[sha], "source": source})
+                    found = found + 1
+                }
+            }
+        }
+        if (puts.length() > 0) {
+            changeStore(loc, puts, [])
+        }
+        done = done + chunk.length()
+    }
+    core.jobProgress(jobId, to, "" + found + " von " + pending.length() + " Dateien erkannt")
+    var identified = 0
+    for (f in scanContent(loc)) {
+        if (core.isNull(f["source"]) == false) {
+            identified = identified + 1
+        }
+    }
+    return {"total": files.length(), "identified": identified, "unknown": files.length() - identified, "queried": pending.length()}
+}
+
+// The ModFile source of a Modrinth version object, or null when it lacks ids.
+method sourceOf(object version, map<string, object> titles, object metadata): object {
+    var projectId = textField(version, "project_id")
+    var versionId = textField(version, "id")
+    if (core.isNull(projectId) || core.isNull(versionId)) {
+        return core.none()
+    }
+    var name = core.none()
+    if (titles.has(projectId)) {
+        name = titles[projectId]
+    }
+    if (core.isNull(name)) {
+        name = textField(metadata, "name")
+    }
+    if (core.isNull(name)) {
+        name = textField(version, "name")
+    }
+    return {
+        "provider": "modrinth",
+        "projectId": projectId,
+        "versionId": versionId,
+        "versionNumber": textField(version, "version_number"),
+        "name": name
+    }
+}
+
+// --- check updates ------------------------------------------------------------------------
+
+method stringArray(object value): array {
+    var out = []
+    if (core.isArray(value)) {
+        for (v in value) {
+            if (core.isString(v)) {
+                out.append(v)
+            }
+        }
+    }
+    return out
+}
+
+// The ModFile update of a latest-version object, or null when it is the
+// installed version (or unusable).
+method updateOf(object version, string currentSha, object source): object {
+    var versionId = textField(version, "id")
+    var file = primaryFile(version)
+    if (core.isNull(versionId) || core.isNull(file)) {
+        return core.none()
+    }
+    if (versionId == field(source, "versionId")) {
+        return core.none()
+    }
+    var sha = textField(field(file, "hashes"), "sha1")
+    var url = textField(file, "url")
+    var fileName = textField(file, "filename")
+    if (core.isNull(sha) || core.isNull(url) || core.isNull(fileName)) {
+        return core.none()
+    }
+    sha = sha.toLower()
+    if (sha == currentSha) {
+        return core.none()
+    }
+    return {
+        "versionId": versionId,
+        "versionNumber": textField(version, "version_number"),
+        "fileName": fileName,
+        "sha1": sha,
+        "url": url,
+        "gameVersions": stringArray(field(version, "game_versions")),
+        "loaders": stringArray(field(version, "loaders"))
+    }
+}
+
+// Identifies unknown files, then asks Modrinth for the latest version of every
+// identified one (for `loaders` and `gameVersions`) and stores `update`.
+method checkContent(string jobId, ContentLoc loc, array loaders, array gameVersions): map<string, object> {
+    var identify = identifyContent(jobId, loc, 0.0, 0.4)
+    core.checkCancelled(jobId)
+    var files = scanContent(loc)
+    var hashes = []
+    var sourceBySha = {}
+    for (f in files) {
+        var sha = f["sha1"]
+        if (core.isNull(f["source"]) == false && sourceBySha.has(sha) == false) {
+            hashes.append(sha)
+            sourceBySha[sha] = f["source"]
+        }
+    }
+    var updates = 0
+    var done = 0
+    while (done < hashes.length()) {
+        core.checkCancelled(jobId)
+        var chunk = slice(hashes, done, done + MODRINTH_BATCH)
+        core.jobProgress(jobId, stepProgress(0.4, 1.0, done, hashes.length()), "Prüfe Updates " + (done + chunk.length()) + " / " + hashes.length())
+        var latest = latestVersionsByHash(chunk, loaders, gameVersions)
+        var puts = []
+        for (sha in chunk) {
+            var update = core.none()
+            if (latest.has(sha) && core.isMap(latest[sha])) {
+                update = updateOf(latest[sha], sha, sourceBySha[sha])
+            }
+            if (core.isNull(update) == false) {
+                updates = updates + 1
+            }
+            puts.append({"sha1": sha, "update": update})
+        }
+        changeStore(loc, puts, [])
+        done = done + chunk.length()
+    }
+    core.jobProgress(jobId, 1.0, "" + updates + " Updates verfügbar")
+    return {
+        "total": files.length(),
+        "identified": identify["identified"],
+        "checked": hashes.length(),
+        "updates": updates
+    }
+}
+
+// --- install an update / version ---------------------------------------------------
+
+define class WriteBytesTask {
+    private string target: get, set
+    private string content: get, set
+
+    method run(): object {
+        os.writeFile(target, content)
+        return true
+    }
+}
+
+// <dir>/.volt-backup/<fileName>.<timestamp>, made unique.
+method backupPath(string dir, string fileName): string {
+    var backupDir = core.ensureDir(path.join(dir, BACKUP_DIR))
+    var stamp = time.format(time.now(), "%Y%m%dT%H%M%SZ")
+    var target = path.join(backupDir, fileName + "." + stamp)
+    var n = 1
+    while (os.exists(target)) {
+        target = path.join(backupDir, fileName + "." + stamp + "-" + n)
+        n = n + 1
+    }
+    return target
+}
+
+// Replaces the file with the release described by `update`
+// ({versionId, versionNumber, fileName, sha1, url}). The download is verified
+// before the old file moves to .volt-backup. Keeps the enabled state. Returns the new ModFile.
+method installUpdate(string jobId, ContentLoc loc, string fileName, map<string, object> update, float from, float to): map<string, object> {
+    requireContentFileName(loc.kind(), fileName)
+    var dir = loc.dir()
+    var oldFile = path.join(dir, fileName)
+    var current = modFile(loc, fileName, loadStore(loc))
+    var newBase = core.getOr(update, "fileName", "")
+    if (core.isString(newBase) == false || isContentFileName(loc.kind(), newBase) == false || newBase.endsWith(DISABLED_SUFFIX)) {
+        core.upstream("Modrinth named the new version of '" + fileName + "' with an unusable file name")
+    }
+    var targetName = newBase
+    if (isEnabledName(fileName) == false) {
+        targetName = newBase + DISABLED_SUFFIX
+    }
+    var targetFile = path.join(dir, targetName)
+    if (targetName != fileName && os.exists(targetFile)) {
+        core.conflict("'" + targetName + "' already exists in the folder")
+    }
+    var expected = ("" + core.getOr(update, "sha1", "")).toLower()
+
+    core.jobProgress(jobId, from, "Lade " + newBase)
+    var content = modrinthDownload("" + core.getOr(update, "url", ""))
+    var got = sha1Hex(content)
+    if (got != expected) {
+        core.upstream("sha1 mismatch for " + newBase + ": expected " + expected + ", got " + got)
+    }
+    core.checkCancelled(jobId)
+    core.jobProgress(jobId, from + (to - from) * 0.8, "Installiere " + newBase)
+
+    // Never ends in the content extension, so a scan never lists a half written download.
+    var temp = path.join(dir, ".volt-download-" + core.newId() + ".tmp")
+    var written = core.runTrapped(WriteBytesTask{target = temp, content = content})
+    if (written.failed()) {
+        os.remove(temp)
+        core.internal("cannot write " + temp + ": " + written.error())
+    }
+    var backup = backupPath(dir, fileName)
+    if (os.rename(oldFile, backup) == false) {
+        os.remove(temp)
+        core.internal("cannot move '" + fileName + "' to " + BACKUP_DIR)
+    }
+    if (os.rename(temp, targetFile) == false) {
+        os.rename(backup, oldFile)
+        os.remove(temp)
+        core.internal("cannot move the download to '" + targetName + "'")
+    }
+    core.logInfo("mods: " + loc.profileId() + ": " + loc.kind() + ": " + fileName + " -> " + targetName + " (backup " + backup + ")")
+
+    var oldSource = current["source"]
+    var newSource = {
+        "provider": "modrinth",
+        "projectId": field(oldSource, "projectId"),
+        "versionId": core.getOr(update, "versionId", core.none()),
+        "versionNumber": core.getOr(update, "versionNumber", core.none()),
+        "name": field(oldSource, "name")
+    }
+    var removes = []
+    if (current["sha1"] != got && otherFileHasSha(loc, targetName, current["sha1"]) == false) {
+        removes.append(current["sha1"])
+    }
+    changeStore(loc, [{"sha1": got, "fileName": targetName, "source": newSource, "update": core.none()}], removes)
+    core.jobProgress(jobId, to, newBase + " installiert")
+    return modFile(loc, targetName, loadStore(loc))
+}
+
+// Installs the update the store knows for the file.
+method updateContent(string jobId, ContentLoc loc, string fileName, float from, float to): map<string, object> {
+    requireContentFileName(loc.kind(), fileName)
+    if (os.isFile(path.join(loc.dir(), fileName)) == false) {
+        core.notFound("file '" + fileName + "' not found")
+    }
+    var current = modFile(loc, fileName, loadStore(loc))
+    var update = current["update"]
+    if (core.isMap(update) == false) {
+        core.conflict("no update known for '" + fileName + "' (run check-updates first)")
+    }
+    return installUpdate(jobId, loc, fileName, update, from, to)
+}
+
+// Installs every known update of the location, one by one; the job's progress
+// runs from from to to. Used by the update-all job.
+method updateAllContent(string jobId, ContentLoc loc): map<string, object> {
+    var names = []
+    for (f in scanContent(loc)) {
+        if (core.isMap(f["update"])) {
+            names.append(f["fileName"])
+        }
+    }
+    var updated = []
+    var failed = []
+    var i = 0
+    while (i < names.length()) {
+        core.checkCancelled(jobId)
+        var name = names[i]
+        var from = stepProgress(0.0, 1.0, i, names.length())
+        var to = stepProgress(0.0, 1.0, i + 1, names.length())
+        core.jobProgress(jobId, from, "Update " + (i + 1) + " / " + names.length() + ": " + name)
+        var outcome = core.runTrapped(UpdateOneTask{jobId = jobId, loc = loc, fileName = name, from = from, to = to})
+        if (outcome.failed()) {
+            if (core.isCancelFailure(outcome.error())) {
+                core.raiseCancelled()
+            }
+            var failure = core.decodeFailure(outcome.error())
+            core.logWarn("mods: " + loc.profileId() + ": update of " + name + " failed: " + failure["message"])
+            failed.append({"fileName": name, "error": failure["message"]})
+        } else {
+            updated.append({"from": name, "to": outcome.result()["fileName"]})
+        }
+        i = i + 1
+    }
+    if (names.length() > 0 && failed.length() == names.length()) {
+        var messages = []
+        for (f in failed) {
+            messages.append(f["fileName"] + ": " + f["error"])
+        }
+        core.fail(502, "upstream", "no update could be installed - " + messages.join("; "))
+    }
+    core.jobProgress(jobId, 1.0, "" + updated.length() + " von " + names.length() + " aktualisiert")
+    return {"updated": updated, "failed": failed}
+}
+
+define class UpdateOneTask {
+    private string jobId: get, set
+    private ContentLoc loc: get, set
+    private string fileName: get, set
+    private float from: get, set
+    private float to: get, set
+
+    method run(): object {
+        return updateContent(jobId, loc, fileName, from, to)
+    }
+}
+
+// --- toggle / delete ------------------------------------------------------------------------
+
+// Renames x to x.disabled or back. Returns the new ModFile.
+method toggleContent(ContentLoc loc, string fileName): map<string, object> {
+    requireContentFileName(loc.kind(), fileName)
+    var dir = loc.dir()
+    var file = path.join(dir, fileName)
+    if (os.isFile(file) == false) {
+        core.notFound("file '" + fileName + "' not found")
+    }
+    var targetName = nameWithState(fileName, isEnabledName(fileName) == false)
+    var target = path.join(dir, targetName)
+    if (os.exists(target)) {
+        core.conflict("'" + targetName + "' already exists in the folder")
+    }
+    if (os.rename(file, target) == false) {
+        core.internal("cannot rename '" + fileName + "' to '" + targetName + "'")
+    }
+    var result = modFile(loc, targetName, loadStore(loc))
+    if (core.isNull(result["source"]) == false) {
+        changeStore(loc, [{"sha1": result["sha1"], "fileName": targetName}], [])
+    }
+    return result
+}
+
+// Switches every file of the location to `enabled`. Files whose target name is
+// taken are skipped and listed. Returns {changed, enabled, skipped}.
+method toggleAllContent(ContentLoc loc, bool enabled): map<string, object> {
+    var mods = loadStore(loc)
+    var changed = 0
+    var skipped = []
+    var puts = []
+    for (name in contentFileNames(loc)) {
+        if (isEnabledName(name) == enabled) {
+            continue
+        }
+        var targetName = nameWithState(name, enabled)
+        var target = path.join(loc.dir(), targetName)
+        if (os.exists(target) || os.rename(path.join(loc.dir(), name), target) == false) {
+            skipped.append(name)
+            continue
+        }
+        changed = changed + 1
+        var info = modFile(loc, targetName, mods)
+        if (core.isNull(info["source"]) == false) {
+            puts.append({"sha1": info["sha1"], "fileName": targetName})
+        }
+    }
+    if (puts.length() > 0) {
+        changeStore(loc, puts, [])
+    }
+    var state = "disabled"
+    if (enabled) {
+        state = "enabled"
+    }
+    core.logInfo("mods: " + loc.profileId() + ": " + loc.kind() + ": " + changed + " file(s) " + state)
+    return {"changed": changed, "enabled": enabled, "skipped": skipped}
+}
+
+method deleteContent(ContentLoc loc, string fileName): map<string, object> {
+    requireContentFileName(loc.kind(), fileName)
+    var dir = loc.dir()
+    var file = path.join(dir, fileName)
+    if (os.isFile(file) == false) {
+        core.notFound("file '" + fileName + "' not found")
+    }
+    var info = hashOf(loc, file)
+    if (os.remove(file) == false) {
+        core.internal("cannot delete '" + fileName + "'")
+    }
+    var sha = info["sha1"]
+    if (otherFileHasSha(loc, fileName, sha) == false && loadStore(loc).has(sha)) {
+        changeStore(loc, [], [sha])
+    }
+    core.logInfo("mods: " + loc.profileId() + ": " + loc.kind() + ": deleted " + fileName)
+    return {"deleted": fileName}
+}

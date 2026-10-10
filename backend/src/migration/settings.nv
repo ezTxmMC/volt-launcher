@@ -1,0 +1,81 @@
+package migration
+
+import core
+import json
+import path
+
+// Settings of the old Java launcher (<legacy>/config/settings.json) mapped onto
+// the keys of core/settings.nv. A value is only written when the new
+// settings.json still holds the default for that key or has no entry for it:
+// a value the user changed in the new launcher is kept.
+
+// Old key -> new key. An old key that is not listed is reported as skipped.
+method settingKeyMap(): map<string, object> {
+    return {
+        "defaultMaxMemoryMb": "memoryMb",
+        "defaultMinMemoryMb": "minMemoryMb",
+        "curseForgeBridgeUrl": "bridgeUrl",
+        "accentColor": "accentColor",
+        "maxConcurrentDownloads": "downloadThreads",
+        "language": "language",
+        "animationsEnabled": "animationsEnabled",
+        "uiScale": "uiScale",
+        "openLogsOnLaunch": "openLogsOnLaunch",
+        "discordPresence": "discordPresence",
+        "discordApplicationId": "discordApplicationId",
+        "updateRepository": "updateRepository",
+        "profileSort": "profileSort",
+        "backupBeforePackUpdate": "backupBeforePackUpdate",
+        "backupsToKeep": "backupsToKeep",
+        "defaultJvmArgs": "defaultJvmArgs",
+        "showFps": "showFps",
+        "javaRuntimes": "javaRuntimes",
+        "favouritesFirst": "favouritesFirst",
+        "autoUpdate": "autoUpdate",
+        "betaUpdates": "betaUpdates",
+        "hideLauncherOnLaunch": "closeOnLaunch"
+    }
+}
+
+// The old settings file as a map, or none when it is missing or unreadable.
+method legacySettingsOf(string legacyDir): object {
+    return core.readJsonFile(path.join(legacyDir, "config", "settings.json"), core.none())
+}
+
+// What the settings step writes: {"changes": {newKey: value}, "skipped": [text]}.
+// Reads only; nothing is written here.
+method settingsPlan(string legacyDir): map<string, object> {
+    var changes = {}
+    var skipped = []
+    var old = legacySettingsOf(legacyDir)
+    if (core.isMap(old) == false) {
+        skipped.append("config/settings.json is missing or unreadable: no settings mapped")
+        return {"changes": changes, "skipped": skipped}
+    }
+    var keyMap = settingKeyMap()
+    var defaults = core.defaultSettings()
+    var stored = core.readJsonFile(core.settingsFile(), {})
+    for (key in old) {
+        if (keyMap.has(key) == false) {
+            skipped.append(key + ": no equivalent in the new settings")
+            continue
+        }
+        var target = "" + keyMap[key]
+        var value = old[key]
+        if (core.isNull(value)) {
+            skipped.append(key + ": no value")
+            continue
+        }
+        var problem = core.validSetting(target, value)
+        if (problem != "") {
+            skipped.append(key + " -> " + target + ": " + problem)
+            continue
+        }
+        if (core.isMap(stored) && stored.has(target) && json.stringify(stored[target]) != json.stringify(core.getOr(defaults, target, core.none()))) {
+            skipped.append(key + " -> " + target + ": the new settings already hold a value you changed")
+            continue
+        }
+        changes[target] = value
+    }
+    return {"changes": changes, "skipped": skipped}
+}

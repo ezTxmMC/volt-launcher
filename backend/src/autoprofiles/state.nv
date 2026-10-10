@@ -1,0 +1,332 @@
+package autoprofiles
+
+import json
+import os
+import path
+import thread
+import core
+
+// Automatic profiles: a background checker (check.nv) reads Mojang's version
+// manifest and creates a "<version> Performance" profile with the preset mods
+// (create.nv) for every new version of the selected kind. Settings:
+// autoProfilesEnabled, autoProfileLoader, autoProfileVersions, autoProfileMods.
+//
+// State: <dataDir>/autoprofiles.json
+//   {"baselined": bool, "seen": [version ids], "lastCheck": ISO | null,
+//    "lastError": text | null, "results": [{minecraftVersion, status, reason, profileId}]}
+//
+// "seen" holds every version id the checker has looked at, whatever its type, so
+// switching autoProfileVersions does not create profiles for versions that were
+// already listed. "baselined" becomes true with the first check that only records
+// the versions present (no profiles are created then).
+//
+// Nothing inside a sync block raises: the state is copied out under the lock and
+// the values are built afterwards (see core/errors.nv).
+
+var autoLock = thread.mutex()
+var autoBaselined = false
+var autoRecordOnlyNext = false   // the next check only records (set when the feature is switched on)
+var autoWasEnabled = false
+var autoNextCheck = 0           // unix seconds of the next timer check
+var autoCheckRunning = false
+var autoSeen = []
+var autoLastCheck = ""          // "" = none yet
+var autoLastError = ""          // "" = none
+var autoResults = []            // newest first
+var autoNameClaims = {}         // profile name -> true while it is being created
+
+final AUTO_RESULTS_STORED = 200
+final AUTO_RESULTS_SHOWN = 50
+final AUTO_FIRST_CHECK_DELAY_SECONDS = 30
+final AUTO_CHECK_INTERVAL_SECONDS = 3600
+final AUTO_FIXTURES_ENV = "VOLT_AUTOPROFILES_FIXTURES"
+
+method autoStatePath(): string {
+    return path.join(core.dataDir(), "autoprofiles.json")
+}
+
+// The fixture directory of the tests: honoured only with --enable-test-routes, where
+// it replaces the Mojang manifest (manifest.json) and the loader lookups (loaders.json).
+// "" in every other case.
+method autoFixtureDir(): string {
+    if (core.testRoutes() == false) {
+        return ""
+    }
+    return os.env(AUTO_FIXTURES_ENV)
+}
+
+// --- settings ---------------------------------------------------------------------------
+
+method autoEnabled(): bool {
+    return core.setting("autoProfilesEnabled") == true
+}
+
+method autoLoaderSetting(): string {
+    var value = core.setting("autoProfileLoader")
+    if (core.isString(value)) {
+        return "" + value
+    }
+    return "fabric"
+}
+
+method autoVersionsSetting(): string {
+    var value = core.setting("autoProfileVersions")
+    if (core.isString(value)) {
+        return "" + value
+    }
+    return "release"
+}
+
+method autoModsSetting(): array {
+    var value = core.setting("autoProfileMods")
+    if (core.isArray(value)) {
+        return value
+    }
+    return []
+}
+
+// Whether a version of this manifest type gets a profile (release always, snapshots when chosen).
+method autoVersionWanted(string versionType): bool {
+    if (versionType == "release") {
+        return true
+    }
+    return versionType == "snapshot" && autoVersionsSetting() == "snapshots"
+}
+
+// --- persistence ------------------------------------------------------------------------
+
+// The text or null: "" stands for "none yet".
+method autoNullable(string text): object {
+    if (text == "") {
+        return core.none()
+    }
+    return text
+}
+
+// Writes the state. Call with autoLock held; never raises.
+method autoSaveLocked() {
+    var state = {
+        "baselined": autoBaselined,
+        "seen": autoSeen,
+        "lastCheck": autoNullable(autoLastCheck),
+        "lastError": autoNullable(autoLastError),
+        "results": autoResults
+    }
+    var problem = core.writeFileAtomic(autoStatePath(), json.pretty(state) + "\n")
+    if (problem != "") {
+        core.logWarn("autoprofiles: cannot save the state: " + problem)
+    }
+}
+
+method autoSaveNow() {
+    sync (autoLock) {
+        autoSaveLocked()
+    }
+}
+
+// Loads autoprofiles.json (a missing or broken file gives a fresh state). Called once at startup.
+method autoLoadState() {
+    var stored = core.readJsonFile(autoStatePath(), {})
+    if (core.isMap(stored) == false) {
+        stored = {}
+    }
+    var baselined = core.getOr(stored, "baselined", false) == true
+    var seen = []
+    var rawSeen = core.getOr(stored, "seen", [])
+    if (core.isArray(rawSeen)) {
+        for (id in rawSeen) {
+            if (core.isString(id)) {
+                seen.append("" + id)
+            }
+        }
+    }
+    var lastCheck = ""
+    var storedCheck = core.getOr(stored, "lastCheck", "")
+    if (core.isString(storedCheck)) {
+        lastCheck = "" + storedCheck
+    }
+    var lastError = ""
+    var storedError = core.getOr(stored, "lastError", "")
+    if (core.isString(storedError)) {
+        lastError = "" + storedError
+    }
+    var results = []
+    var rawResults = core.getOr(stored, "results", [])
+    if (core.isArray(rawResults)) {
+        for (row in rawResults) {
+            if (core.isMap(row) && results.length() < AUTO_RESULTS_STORED) {
+                results.append(core.copyJson(row))
+            }
+        }
+    }
+    sync (autoLock) {
+        autoBaselined = baselined
+        autoSeen = seen
+        autoLastCheck = lastCheck
+        autoLastError = lastError
+        autoResults = results
+    }
+}
+
+// --- checker state ------------------------------------------------------------------------
+
+// Whether the next check only records the versions present: until the first check has
+// run, and once more after the feature was switched on (set by the timer).
+method autoRecordOnlyDue(): bool {
+    var due = false
+    sync (autoLock) {
+        due = autoBaselined == false || autoRecordOnlyNext
+    }
+    return due
+}
+
+// Ends a record-only check: the versions present are seen, the next checks create profiles.
+method autoRecordBaseline(array entries, string at) {
+    sync (autoLock) {
+        for (entry in entries) {
+            var id = "" + core.getOr(entry, "id", "")
+            if (autoSeen.contains(id) == false) {
+                autoSeen.append(id)
+            }
+        }
+        autoBaselined = true
+        autoRecordOnlyNext = false
+        autoLastCheck = at
+        autoLastError = ""
+        autoSaveLocked()
+    }
+}
+
+// The last attempt: its time and the error text ("" when it worked).
+method autoNoteCheck(string at, string problem) {
+    sync (autoLock) {
+        autoLastCheck = at
+        autoLastError = problem
+        autoSaveLocked()
+    }
+}
+
+method autoSeenCopy(): array {
+    var text = ""
+    sync (autoLock) {
+        text = json.stringify(autoSeen)
+    }
+    return json.parse(text)
+}
+
+// Adds a version id to the seen list (saved by the caller with autoSaveNow).
+method autoMarkSeen(string id) {
+    sync (autoLock) {
+        if (autoSeen.contains(id) == false) {
+            autoSeen.append(id)
+        }
+    }
+}
+
+// Puts a result first in the list (newest first, at most AUTO_RESULTS_STORED kept) and saves.
+method autoRecordResult(string minecraftVersion, map<string, object> result) {
+    var row = {
+        "minecraftVersion": minecraftVersion,
+        "status": core.getOr(result, "status", "failed"),
+        "reason": core.getOr(result, "reason", core.none()),
+        "profileId": core.getOr(result, "profileId", core.none())
+    }
+    sync (autoLock) {
+        var rows = [row]
+        for (old in autoResults) {
+            if (rows.length() < AUTO_RESULTS_STORED) {
+                rows.append(old)
+            }
+        }
+        autoResults = rows
+        autoSaveLocked()
+    }
+}
+
+// Only one check runs at a time (the timer and POST /api/autoprofiles/check share it).
+method autoClaimCheck(): bool {
+    var claimed = false
+    sync (autoLock) {
+        if (autoCheckRunning == false) {
+            autoCheckRunning = true
+            claimed = true
+        }
+    }
+    return claimed
+}
+
+method autoReleaseCheck() {
+    sync (autoLock) {
+        autoCheckRunning = false
+    }
+}
+
+// A profile name is claimed while its profile is being created, so a check and a
+// manual create cannot make two profiles of one version.
+method autoClaimName(string name): bool {
+    var claimed = false
+    sync (autoLock) {
+        if (autoNameClaims.has(name) == false) {
+            autoNameClaims[name] = true
+            claimed = true
+        }
+    }
+    return claimed
+}
+
+method autoReleaseName(string name) {
+    sync (autoLock) {
+        autoNameClaims.remove(name)
+    }
+}
+
+// The profile name rule: "<version> Performance".
+method autoProfileName(string minecraftVersion): string {
+    return minecraftVersion + " Performance"
+}
+
+method autoNameTaken(string name): bool {
+    for (p in core.profiles()) {
+        if (core.getOr(p, "name", "") == name) {
+            return true
+        }
+    }
+    return false
+}
+
+// --- reading ------------------------------------------------------------------------------
+
+// GET /api/autoprofiles: the settings, the state and the last 50 results (newest first).
+method autoOverview(): map<string, object> {
+    var seenCount = 0
+    var lastCheck = ""
+    var lastError = ""
+    var resultsText = ""
+    sync (autoLock) {
+        seenCount = autoSeen.length()
+        lastCheck = autoLastCheck
+        lastError = autoLastError
+        resultsText = json.stringify(autoResults)
+    }
+    var rows = []
+    for (row in json.parse(resultsText)) {
+        if (rows.length() < AUTO_RESULTS_SHOWN) {
+            rows.append({
+                "minecraftVersion": core.getOr(row, "minecraftVersion", ""),
+                "status": core.getOr(row, "status", "failed"),
+                "reason": core.getOr(row, "reason", core.none()),
+                "profileId": core.getOr(row, "profileId", core.none())
+            })
+        }
+    }
+    return {
+        "enabled": autoEnabled(),
+        "loader": autoLoaderSetting(),
+        "versions": autoVersionsSetting(),
+        "mods": autoModsSetting(),
+        "seen": seenCount,
+        "lastCheck": autoNullable(lastCheck),
+        "lastError": autoNullable(lastError),
+        "results": rows
+    }
+}

@@ -1,0 +1,365 @@
+package migration
+
+import core
+import json
+import os
+import path
+
+// Migration of the old Java VoltLauncher data into the new backend layout.
+//
+// The legacy folder (--legacy-dir, default: the data dir, where the old launcher
+// kept everything too) holds the old layout when instances/instances.json exists.
+// main calls startup() once after core.init; it runs unless <dataDir>/migration.json
+// says "done". Per old instance: one profile (profiles.nv), whose game directory
+// stays in the old folder, plus its mod sources (sources.nv). Settings (settings.nv)
+// are mapped once. Errors per instance are recorded and the others continue; a
+// run with failures leaves status "partial" and the next start retries those.
+//
+// Legacy files are only read. The writes inside the legacy folder are the
+// .volt/<kind>.json caches of mods, and only where no cache exists yet; a dry
+// run writes none.
+//
+//   GET /api/migration   -> the content of migration.json, or {"status": "none"}
+
+// One trapped step of a migration run (see core/errors.nv): "profile", "sources" or "settings".
+define class StepTask {
+    private string step: get, set
+    private object input: get, set
+
+    method run(): object {
+        if (step == "profile") {
+            return createOrReuseProfile(input)
+        }
+        if (step == "sources") {
+            return recordSources(input)
+        }
+        if (step == "settings") {
+            return core.patchSettings(input)
+        }
+        return core.raise("unknown migration step '" + step + "'")
+    }
+}
+
+// Creates the profile of an old instance, or keeps the one an earlier, failed
+// run created (its id is in `previousId`). Returns {"profileId"}.
+method createOrReuseProfile(object input): map<string, object> {
+    var id = "" + input["previousId"]
+    var existing = core.none()
+    if (id != "") {
+        existing = core.findProfile(id)
+    }
+    if (core.isNull(existing)) {
+        var created = core.createProfile(input["body"])
+        id = "" + created["id"]
+    }
+    var update = input["update"]
+    if (core.isMap(update) && update.length() > 0) {
+        core.updateProfile(id, update)
+    }
+    return {"profileId": id}
+}
+
+// A slug is used as a folder name, so only plain names are accepted.
+method safeSlug(object value): bool {
+    if (core.isString(value) == false) {
+        return false
+    }
+    var slug = "" + value
+    if (slug == "" || slug == "." || slug == "..") {
+        return false
+    }
+    for (ch in slug) {
+        if ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// The index of the entry for `slug` in `entries`, or -1.
+method indexOfSlug(array entries, string slug): integer {
+    var i = 0
+    while (i < entries.length()) {
+        if (entries[i]["slug"] == slug) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// `entries` with the entry at `index` replaced, or `entry` appended when index is -1.
+method withEntry(array entries, integer index, map<string, object> entry): array {
+    if (index < 0) {
+        entries.append(entry)
+        return entries
+    }
+    var out = []
+    var i = 0
+    while (i < entries.length()) {
+        if (i == index) {
+            out.append(entry)
+        } else {
+            out.append(entries[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Migrates one old instance. Returns its migration.json entry; never raises.
+// A failure leaves status "failed" with the message; a profile that was
+// already created keeps its id, so a retry reuses it instead of duplicating it.
+method migrateInstance(string legacyDir, map<string, object> old, string slug, string previousId, bool dry): map<string, object> {
+    var notes = []
+    var entry = {
+        "slug": slug,
+        "profileId": previousId,
+        "status": "failed",
+        "name": slug,
+        "message": "",
+        "modSourcesMapped": 0,
+        "modSourcesSkipped": 0,
+        "skipped": [],
+        "notes": notes,
+        "backupArchives": legacyBackupCount(legacyDir, slug),
+        "backupsPath": ""
+    }
+    var versionText = textOf(core.getOr(old, "versionId", core.none()))
+    if (core.isNull(versionText)) {
+        entry["message"] = "the instance has no version id"
+        return entry
+    }
+    var parsedVersion = parseVersionId("" + versionText)
+    if (parsedVersion["ok"] == false) {
+        entry["message"] = "the version id '" + versionText + "' is not one the new backend knows"
+        return entry
+    }
+    var settings = core.getOr(old, "settings", {})
+    if (core.isMap(settings) == false) {
+        settings = {}
+    }
+    var gameDir = path.join(legacyDir, "instances", slug, "game")
+    var custom = textOf(core.getOr(settings, "gameDirectory", core.none()))
+    if (core.isNull(custom) == false && path.isAbsolute(custom)) {
+        gameDir = path.normalize(custom)
+    }
+    var hasGameDir = os.isDir(gameDir)
+    if (hasGameDir == false) {
+        notes.append("the game folder " + gameDir + " does not exist: the profile starts with an empty game directory")
+    }
+    var name = textOf(core.getOr(old, "name", core.none()))
+    if (core.isNull(name)) {
+        name = slug
+    }
+    if (name.length() > MAX_NAME_LENGTH) {
+        notes.append("the name is longer than 100 characters and was cut")
+        name = name.substring(0, MAX_NAME_LENGTH)
+    }
+    entry["name"] = name
+
+    var content = core.readJsonFile(path.join(legacyDir, "instances", slug, "content.json"), core.none())
+    if (core.isMap(content) == false) {
+        notes.append("no provenance file (content.json): no mod sources recorded")
+    }
+    var pack = modpackSourceOf(content)
+    var body = profileBody(old, settings, name, parsedVersion, gameDir, hasGameDir, notes)
+    var update = profileUpdate(old, pack)
+
+    var created = core.runTrapped(StepTask{step = "profile", input = {"previousId": previousId, "body": body, "update": update}})
+    if (created.failed()) {
+        entry["message"] = core.decodeFailure(created.error())["message"]
+        return entry
+    }
+    var profileId = "" + created.result()["profileId"]
+    entry["profileId"] = profileId
+
+    var sources = core.runTrapped(StepTask{step = "sources", input = {"profileId": profileId, "gameDir": gameDir, "content": content, "dry": dry}})
+    if (sources.failed()) {
+        entry["message"] = "mod sources: " + core.decodeFailure(sources.error())["message"]
+        return entry
+    }
+    var counts = sources.result()
+    entry["modSourcesMapped"] = counts["mapped"]
+    entry["modSourcesSkipped"] = counts["skipped"]
+    entry["skipped"] = counts["reasons"]
+    if (entry["backupArchives"] > 0) {
+        entry["backupsPath"] = path.join(legacyDir, "backups", slug)
+    }
+    entry["status"] = "migrated"
+    return entry
+}
+
+// The migration.json the legacy folder would produce, read as it stands.
+method currentResult(): map<string, object> {
+    var file = path.join(core.dataDir(), "migration.json")
+    if (os.isFile(file) == false) {
+        return {"status": "none"}
+    }
+    var stored = core.readJsonFile(file, {})
+    if (core.isMap(stored) && stored.has("status")) {
+        return stored
+    }
+    return {"status": "unreadable"}
+}
+
+// Runs the migration (when the legacy layout is there and not done) and writes
+// <dataDir>/migration.json. Returns that content. With `dry`, the previous
+// state is ignored and everything is written to the data dir only.
+method runMigration(string dataDir, string legacyDir, bool dry): map<string, object> {
+    var file = path.join(dataDir, "migration.json")
+    var instancesFile = path.join(legacyDir, "instances", "instances.json")
+    if (os.isFile(instancesFile) == false) {
+        return {"status": "none"}
+    }
+    var exists = os.isFile(file)
+    var previous = core.readJsonFile(file, {})
+    var usable = core.isMap(previous) && previous.has("status")
+    if (dry) {
+        usable = false
+    }
+    if (exists && usable == false && dry == false) {
+        core.logError("migration: " + file + " cannot be read, so the legacy data was not migrated")
+        return {"status": "unreadable"}
+    }
+    if (usable && previous["status"] == "done") {
+        return previous
+    }
+
+    var startedAt = core.nowIso()
+    var settingsDone = false
+    var settingsMapped = 0
+    var settingsSkipped = []
+    var entries = []
+    if (usable) {
+        startedAt = "" + previous["startedAt"]
+        settingsDone = (previous["settingsDone"] == true)
+        settingsMapped = core.toInteger(core.getOr(previous, "settingsMapped", 0))
+        settingsSkipped = core.getOr(previous, "settingsSkipped", [])
+        entries = core.getOr(previous, "profiles", [])
+    }
+    var status = "done"
+
+    if (settingsDone == false) {
+        var plan = settingsPlan(legacyDir)
+        settingsSkipped = plan["skipped"]
+        var changes = plan["changes"]
+        var outcome = core.runTrapped(StepTask{step = "settings", input = changes})
+        if (outcome.failed()) {
+            settingsSkipped.append("settings not written: " + core.decodeFailure(outcome.error())["message"])
+            settingsMapped = 0
+        } else {
+            settingsMapped = changes.length()
+            settingsDone = true
+        }
+    }
+
+    var instancesDoc = core.readJsonFile(instancesFile, {})
+    var listed = core.getOr(instancesDoc, "instances", core.none())
+    var notes = [
+        "accounts: sign in with Microsoft once",
+        "accounts: the old encrypted session (auth/account-session.enc) is not readable by the new backend and was not migrated",
+        "game folders are used in place: nothing was copied, so the old instances folder must stay",
+        "backups: the archives stay in the old backups folder (see backupsLeftInPlace); the new backend lists only its own folder",
+        "runtimes: the old runtimes folder was not moved; the new backend uses shared/runtimes"
+    ]
+    if (dry) {
+        notes.append("dry run: nothing was written to the legacy folder")
+    }
+    if (core.isMap(instancesDoc) == false || core.isArray(listed) == false) {
+        notes.append("instances/instances.json cannot be read: no profiles were migrated")
+        status = "partial"
+    } else {
+        for (old in listed) {
+            if (core.isMap(old) == false) {
+                status = "partial"
+                continue
+            }
+            var slug = "" + core.getOr(old, "slug", "")
+            var index = indexOfSlug(entries, slug)
+            var previousId = ""
+            if (index >= 0) {
+                if (entries[index]["status"] == "migrated") {
+                    continue
+                }
+                previousId = "" + entries[index]["profileId"]
+            }
+            if (safeSlug(core.getOr(old, "slug", core.none())) == false) {
+                entries = withEntry(entries, index, {"slug": slug, "profileId": "", "status": "failed", "message": "the slug is missing or is not usable as a folder name"})
+                status = "partial"
+                continue
+            }
+            var result = migrateInstance(legacyDir, old, slug, previousId, dry)
+            entries = withEntry(entries, index, result)
+        }
+    }
+
+    var mapped = 0
+    var skipped = 0
+    var leftInPlace = []
+    for (entry in entries) {
+        if (entry["status"] != "migrated") {
+            status = "partial"
+            continue
+        }
+        mapped = mapped + core.toInteger(core.getOr(entry, "modSourcesMapped", 0))
+        skipped = skipped + core.toInteger(core.getOr(entry, "modSourcesSkipped", 0))
+        if (entry["backupArchives"] > 0) {
+            leftInPlace.append(entry["backupsPath"] + " (" + entry["backupArchives"] + " archives)")
+        }
+    }
+    if (settingsDone == false) {
+        status = "partial"
+    }
+
+    var result = {
+        "status": status,
+        "legacyDir": legacyDir,
+        "startedAt": startedAt,
+        "finishedAt": core.nowIso(),
+        "dryRun": dry,
+        "settingsDone": settingsDone,
+        "settingsMapped": settingsMapped,
+        "settingsSkipped": settingsSkipped,
+        "profiles": entries,
+        "modSourcesMapped": mapped,
+        "modSourcesSkipped": skipped,
+        "backupsMoved": [],
+        "backupsLeftInPlace": leftInPlace,
+        "notes": notes
+    }
+    var writeError = core.writeFileAtomic(file, json.pretty(result) + "\n")
+    if (writeError != "") {
+        core.logError("migration: cannot write " + file + ": " + writeError)
+    }
+    core.logInfo("migration: " + status + ", " + entries.length() + " profiles, " + settingsMapped + " settings mapped, " + mapped + " mod sources mapped")
+    return result
+}
+
+// Called by main once, after core.init and before the server starts.
+method startup(string dataDir, string legacyDir) {
+    runMigration(dataDir, legacyDir, false)
+}
+
+// --migration-dry-run: runs the migration into --data-dir (a scratch directory,
+// never the legacy folder) and prints the result. Returns the exit code.
+method dryRun(string dataDir, string legacyDir): integer {
+    if (path.normalize(dataDir) == path.normalize(legacyDir)) {
+        eprintln "volt-backend: --migration-dry-run needs a --data-dir other than the legacy folder"
+        return 2
+    }
+    var result = runMigration(dataDir, legacyDir, true)
+    println json.pretty(result)
+    return 0
+}
+
+// GET /api/migration. Only GET is allowed.
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() != 1) {
+        core.notFound("no such endpoint")
+    }
+    if (verb != "GET") {
+        return core.methodNotAllowed(verb, segments)
+    }
+    return core.ok(currentResult())
+}

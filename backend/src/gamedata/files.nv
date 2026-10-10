@@ -1,0 +1,163 @@
+package gamedata
+
+import bytes
+import core
+import os
+import path
+
+// File helpers for worlds, screenshots, logs and backups: directory trees,
+// copies with progress, and the checks that keep names inside their folder.
+
+// Shared by the copy and the backup jobs; progress is reported per file.
+method fraction(integer done, integer total): float {
+    if (total <= 0) {
+        return 1.0
+    }
+    return core.toFloat(done) / core.toFloat(total)
+}
+
+// Every directory and regular file below `root` as paths relative to it:
+// {"dirs": [...], "files": [...]}, parents before children. Symbolic links are
+// skipped. With `working` true, the launcher's and the game's lock and temporary
+// files are left out too (the backup exclusions).
+method treeOf(string root, bool working): map<string, object> {
+    var dirs = []
+    var files = []
+    treeWalk(root, "", working, dirs, files)
+    return {"dirs": dirs, "files": files}
+}
+
+method treeWalk(string root, string rel, bool working, array<string> dirs, array<string> files) {
+    var here = root
+    if (rel != "") {
+        here = path.join(root, rel)
+    }
+    for (name in os.listDir(here)) {
+        var child = name
+        if (rel != "") {
+            child = rel + "/" + name
+        }
+        var full = path.join(root, child)
+        if (os.isSymlink(full)) {
+            continue
+        }
+        if (working && treeIsWorking(child, name)) {
+            continue
+        }
+        if (os.isDir(full)) {
+            dirs.append(child)
+            treeWalk(root, child, working, dirs, files)
+        } else if (os.isFile(full)) {
+            files.append(child)
+        }
+    }
+}
+
+// The exclusions of a backup (see InstanceBackupService in the Java launcher).
+method treeIsWorking(string child, string name): bool {
+    var top = child
+    if (child.contains("/")) {
+        top = child.substring(0, child.indexOf("/"))
+    }
+    if (top.endsWith(".restoring") || top.endsWith(".previous")) {
+        return true
+    }
+    return name.endsWith(".tmp") || name.endsWith(".lock") || name == "session.lock"
+}
+
+// The total size of the regular files of a tree.
+method treeSize(string root): integer {
+    var total = 0
+    var tree = treeOf(root, false)
+    for (file in tree["files"]) {
+        total = total + os.fileSize(path.join(root, file))
+    }
+    return total
+}
+
+// Creates `dir` with its parents unless it is a directory already. Raises on failure.
+method ensureDirectory(string dir) {
+    if (os.isDir(dir) == false && os.mkdir(dir) == false) {
+        core.internal("cannot create directory '" + dir + "'")
+    }
+}
+
+// Copies a whole tree. Progress goes to the job `jobId` (may be "" for none);
+// a cancel request stops between files. Returns the number of files copied.
+method copyTree(string source, string target, string jobId): integer {
+    var tree = treeOf(source, false)
+    ensureDirectory(target)
+    for (dir in tree["dirs"]) {
+        ensureDirectory(path.join(target, dir))
+    }
+    var files = tree["files"]
+    var i = 0
+    while (i < files.length()) {
+        var file = files[i]
+        if (jobId != "") {
+            core.checkCancelled(jobId)
+            core.jobProgress(jobId, fraction(i, files.length()), "Kopiere " + file)
+        }
+        if (os.copy(path.join(source, file), path.join(target, file)) == false) {
+            core.internal("cannot copy '" + file + "'")
+        }
+        i = i + 1
+    }
+    return files.length()
+}
+
+// A single name from a request (world folder, screenshot, log or backup file):
+// no separators, no parent references, not empty. Anything else is a 400.
+method safeName(object value, string label): string {
+    if (core.isString(value) == false) {
+        core.badRequest("'" + label + "' is required")
+    }
+    string name = value
+    if (name.trim() == "") {
+        core.badRequest("'" + label + "' is required")
+    }
+    if (name.contains("/") || name.contains("\\") || name == "." || name.contains("..") || name.contains(chr(0))) {
+        core.badRequest("invalid " + label + ": " + name)
+    }
+    return name
+}
+
+// A folder name for a title, the way the game names new worlds: unsafe
+// characters become "_", and "(1)", "(2)" are appended until the name is free.
+method freeFolder(string parent, string title): string {
+    var base = ""
+    for (ch in title.trim()) {
+        if (("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _.-").contains(ch)) {
+            base = base + ch
+        } else {
+            base = base + "_"
+        }
+    }
+    base = base.trim()
+    if (base == "" || base == "." || base == "..") {
+        base = "World"
+    }
+    var candidate = base
+    var i = 1
+    while (os.exists(path.join(parent, candidate)) && i < 1000) {
+        candidate = base + " (" + i + ")"
+        i = i + 1
+    }
+    return candidate
+}
+
+// Whether a name is a plain file name (no separators), used before reading zip entries.
+method plainEntryName(string name): bool {
+    if (name == "" || name.startsWith("/") || name.startsWith("\\") || name.contains("\\") || name.contains(chr(0))) {
+        return false
+    }
+    if (name.length() > 1 && name.substring(1, 2) == ":") {
+        return false
+    }
+    for (part in name.split("/")) {
+        if (part == "..") {
+            return false
+        }
+    }
+    return true
+}

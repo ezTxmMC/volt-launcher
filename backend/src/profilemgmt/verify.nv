@@ -1,0 +1,185 @@
+package profilemgmt
+
+import json
+import os
+import path
+import thread
+import core
+import launch
+
+// Verify (check and repair) of a profile's game installation.
+//
+// A check reads every library of the version and compares its hash with the metadata,
+// and the client jar with its sha1. With repair, the installation runs again the way a
+// launch does: missing or broken files are downloaded, assets and natives are verified,
+// loaders are installed again. The last report of each profile is kept in memory.
+
+var verifyLock = thread.mutex()
+var verifyReports = {}   // profileId -> report
+
+// The last report of a profile, or null.
+method verifyReport(string id): object {
+    var text = ""
+    sync (verifyLock) {
+        if (verifyReports.has(id)) {
+            text = json.stringify(verifyReports[id])
+        }
+    }
+    if (text == "") {
+        return core.none()
+    }
+    return json.parse(text)
+}
+
+method storeVerifyReport(string id, map<string, object> report) {
+    var copy = core.copyJson(report)
+    sync (verifyLock) {
+        verifyReports[id] = copy
+    }
+}
+
+// The libraries whose file is missing or whose hash does not match: their names.
+method brokenLibraries(map<string, object> plan): array {
+    var broken = []
+    for (item in plan["downloads"]) {
+        if (launch.launchHashOk(item["path"], item["hash"]) == false) {
+            broken.append(path.basename(item["path"]))
+        }
+    }
+    return broken
+}
+
+// The client jar matches its sha1 (any existing file counts when the metadata has none).
+method clientJarOk(map<string, object> resolved, map<string, object> meta): bool {
+    var jar = resolved["clientJar"]
+    var sha = ""
+    var downloads = core.getOr(meta, "downloads", core.none())
+    if (core.isMap(downloads)) {
+        var client = core.getOr(downloads, "client", core.none())
+        if (core.isMap(client)) {
+            sha = core.getOr(client, "sha1", "")
+        }
+    }
+    if (sha == "") {
+        return os.isFile(jar)
+    }
+    return launch.launchHashOk(jar, sha)
+}
+
+define class VerifyJavaTask {
+    private map<string, object> profile: get, set
+    private integer major: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return launch.launchSelectJava(profile, major, jobId)
+    }
+}
+
+define class VerifyInstallTask {
+    private map<string, object> resolved: get, set
+    private string javaPath: get, set
+    private string gameDir: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return launch.launchInstall(resolved, javaPath, gameDir, jobId, true)
+    }
+}
+
+// The check, and with repair the installation again. Returns the report.
+method verifyProfile(string profileId, bool repair, string jobId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var gameDir = launch.launchEnsureDir(profile["gameDir"])
+    core.jobProgress(jobId, 0.02, "Prüfe " + profile["name"])
+    var resolved = launch.launchResolve(profile, jobId)
+    var meta = resolved["meta"]
+    var pinned = core.getOr(profile, "loaderVersion", core.none())
+    if (core.isNull(resolved["loaderVersion"]) == false && (core.isString(pinned) == false || pinned.trim() == "")) {
+        core.updateProfile(profileId, {"loaderVersion": resolved["loaderVersion"]})
+    }
+    core.checkCancelled(jobId)
+
+    core.jobProgress(jobId, 0.3, "Prüfe Bibliotheken")
+    var plan = launch.launchPlanLibraries(meta)
+    var brokenBefore = brokenLibraries(plan)
+    var clientBefore = clientJarOk(resolved, meta)
+    var brokenAfter = brokenBefore
+    var clientAfter = clientBefore
+    var repaired = false
+
+    if (repair) {
+        core.checkCancelled(jobId)
+        var major = launch.launchRequiredJava(meta, resolved["minecraftVersion"])
+        core.jobProgress(jobId, 0.4, "Prüfe Java " + major)
+        var javaPath = launch.launchLocked("jdk-" + major, jobId, VerifyJavaTask{profile = profile, major = major, jobId = jobId})
+        core.checkCancelled(jobId)
+        launch.launchLocked("version:" + launch.launchFolderName(resolved["versionId"]), jobId,
+            VerifyInstallTask{resolved = resolved, javaPath = javaPath, gameDir = gameDir, jobId = jobId})
+        repaired = true
+        brokenAfter = brokenLibraries(launch.launchPlanLibraries(meta))
+        clientAfter = clientJarOk(resolved, meta)
+    }
+
+    var examples = []
+    for (name in brokenAfter) {
+        if (examples.length() < 20) {
+            examples.append(name)
+        }
+    }
+    var report = {
+        "checkedAt": core.nowIso(),
+        "libraries": {
+            "checked": plan["downloads"].length(),
+            "brokenBefore": brokenBefore.length(),
+            "brokenAfter": brokenAfter.length(),
+            "examples": examples
+        },
+        "client": {"okBefore": clientBefore, "okAfter": clientAfter},
+        "repaired": repaired,
+        "ok": brokenAfter.length() == 0 && clientAfter
+    }
+    storeVerifyReport(profileId, report)
+    core.logInfo("verify: profile " + profileId + " - " + brokenBefore.length() + " broken libraries, repaired " + repaired)
+    return report
+}
+
+define class VerifyTask {
+    private string profileId: get, set
+    private bool repair: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return verifyProfile(profileId, repair, jobId)
+    }
+}
+
+define class VerifyJob based JobBody {
+    private string profileId: get, set
+    private bool repair: get, set
+
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(VerifyTask{profileId = profileId, repair = repair, jobId = jobId})
+        launch.launchReleaseProfile(profileId)
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+// POST /api/profiles/:id/verify: claims the profile and starts the job.
+method startVerify(string id, bool repair): map<string, object> {
+    var profile = core.requireProfile(id)
+    if (launch.launchIsRunning(id)) {
+        core.conflict("the game of this profile is running")
+    }
+    if (launch.launchClaimProfile(id, "verify") == false) {
+        core.conflict("this profile is busy (" + launch.launchGameStatus(id)["phase"] + ")")
+    }
+    var title = "Prüfe " + profile["name"]
+    if (repair) {
+        title = "Repariere " + profile["name"]
+    }
+    return core.startJob("profile-verify", title, VerifyJob{profileId = id, repair = repair})
+}

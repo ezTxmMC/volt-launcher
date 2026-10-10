@@ -1,0 +1,268 @@
+package core
+
+import json
+import thread
+
+// Jobs: long running work outside the request path.
+//
+//   GET  /api/jobs              all jobs, newest first
+//   GET  /api/jobs/:id          one job
+//   POST /api/jobs/:id/cancel   asks a running job to stop
+//
+// A feature module subclasses JobBody and starts it with startJob():
+//
+//   define class IdentifyMods based JobBody {
+//       private string profileId: get, set
+//       method execute(string jobId): object {
+//           core.jobProgress(jobId, 0.5, "Halfway")
+//           core.checkCancelled(jobId)          // raises when cancel was requested
+//           return {"identified": 12}           // becomes job.result
+//       }
+//   }
+//   return core.respond(202, core.startJob("mods-identify", "Identify mods", IdentifyMods{profileId = id}))
+//
+// execute() runs on its own operating system thread. core.fail() or any
+// runtime error inside it marks the job failed (job.error = the message),
+// checkCancelled() after a cancel request marks it cancelled, and a normal
+// return marks it done with the returned value as result. Cancelling is
+// cooperative: a body that never calls checkCancelled() runs to its end.
+
+define abstract JobBody {
+    abstract method execute(string jobId): object
+}
+
+var jobLock = thread.mutex()
+var jobsById = {}
+var jobOrder = []          // ids, oldest first
+var cancelRequests = {}    // id -> true
+
+final MAX_FINISHED_JOBS = 200
+
+// The thread entry point: runs the body with errors trapped.
+define class JobTask {
+    private string jobId: get, set
+    private JobBody body: get, set
+
+    method run(): object {
+        var result = body.execute(jobId)
+        // Only plain JSON data leaves the job (a copy, made here and not
+        // under the lock, because stringify of odd values could raise).
+        return copyJson(result)
+    }
+}
+
+// Registers a job in state "running" and starts its body on a new thread.
+// Returns a copy of the job (for the 202 answer).
+method startJob(string kind, string title, JobBody body): map<string, object> {
+    var id = newId()
+    var job = {
+        "id": id,
+        "kind": kind,
+        "title": title,
+        "state": "running",
+        "progress": 0.0,
+        "message": "",
+        "error": none(),
+        "result": none(),
+        "createdAt": nowIso(),
+        "finishedAt": none()
+    }
+    var text = ""
+    sync (jobLock) {
+        while (jobsById.has(id)) {
+            id = newId()
+            job["id"] = id
+        }
+        jobsById[id] = job
+        jobOrder.append(id)
+        text = json.stringify(job)
+        pruneJobsLocked()
+    }
+    logInfo("job ${id} started: ${kind} - ${title}")
+    thread runJob(id, body)
+    return json.parse(text)
+}
+
+method runJob(string id, JobBody body) {
+    var outcome = runTrapped(JobTask{jobId = id, body = body})
+    if (outcome.failed() == false) {
+        finishJob(id, "done", none(), outcome.result())
+        return
+    }
+    if (isCancelFailure(outcome.error())) {
+        finishJob(id, "cancelled", none(), none())
+        return
+    }
+    var failure = decodeFailure(outcome.error())
+    finishJob(id, "failed", failure["message"], none())
+}
+
+method finishJob(string id, string state, object error, object result) {
+    sync (jobLock) {
+        if (jobsById.has(id)) {
+            var job = jobsById[id]
+            job["state"] = state
+            job["error"] = error
+            job["result"] = result
+            job["finishedAt"] = nowIso()
+            if (state == "done") {
+                job["progress"] = 1.0
+            }
+            if (state == "cancelled") {
+                job["message"] = "Abgebrochen"
+            }
+        }
+        cancelRequests.remove(id)
+    }
+    if (state == "failed") {
+        logWarn("job ${id} failed: ${error}")
+    } else {
+        logInfo("job ${id} ${state}")
+    }
+}
+
+// Drops the oldest finished jobs beyond MAX_FINISHED_JOBS. Lock held.
+method pruneJobsLocked() {
+    var finished = 0
+    for (id in jobOrder) {
+        if (jobsById[id]["state"] != "running") {
+            finished = finished + 1
+        }
+    }
+    if (finished <= MAX_FINISHED_JOBS) {
+        return
+    }
+    var kept = []
+    for (id in jobOrder) {
+        if (finished > MAX_FINISHED_JOBS && jobsById[id]["state"] != "running") {
+            jobsById.remove(id)
+            finished = finished - 1
+        } else {
+            kept.append(id)
+        }
+    }
+    jobOrder = kept
+}
+
+// --- for job bodies ------------------------------------------------------------------
+
+// Reports progress (clamped to 0..1) and a status line.
+method jobProgress(string id, float progress, string message) {
+    var value = progress
+    if (value < 0.0) {
+        value = 0.0
+    }
+    if (value > 1.0) {
+        value = 1.0
+    }
+    sync (jobLock) {
+        if (jobsById.has(id) && jobsById[id]["state"] == "running") {
+            jobsById[id]["progress"] = value
+            jobsById[id]["message"] = message
+        }
+    }
+}
+
+method jobMessage(string id, string message) {
+    sync (jobLock) {
+        if (jobsById.has(id) && jobsById[id]["state"] == "running") {
+            jobsById[id]["message"] = message
+        }
+    }
+}
+
+method cancelRequested(string id): bool {
+    var requested = false
+    sync (jobLock) {
+        requested = cancelRequests.has(id)
+    }
+    return requested
+}
+
+// Ends the job as cancelled when a cancel was requested (raises).
+method checkCancelled(string id) {
+    if (cancelRequested(id)) {
+        raiseCancelled()
+    }
+}
+
+// --- reading ---------------------------------------------------------------------------
+
+method jobs(): array {
+    var text = ""
+    sync (jobLock) {
+        var newestFirst = []
+        var i = jobOrder.length() - 1
+        while (i >= 0) {
+            newestFirst.append(jobsById[jobOrder[i]])
+            i = i - 1
+        }
+        text = json.stringify(newestFirst)
+    }
+    return json.parse(text)
+}
+
+// The job, or null.
+method findJob(string id): object {
+    var text = ""
+    sync (jobLock) {
+        if (jobsById.has(id)) {
+            text = json.stringify(jobsById[id])
+        }
+    }
+    if (text == "") {
+        return none()
+    }
+    return json.parse(text)
+}
+
+method requireJob(string id): map<string, object> {
+    var found = findJob(id)
+    if (isNull(found)) {
+        notFound("job '${id}' not found")
+    }
+    return found
+}
+
+// Asks a running job to stop; a finished job is answered unchanged.
+method cancelJob(string id): map<string, object> {
+    var job = requireJob(id)
+    if (job["state"] == "running") {
+        sync (jobLock) {
+            cancelRequests[id] = true
+            if (jobsById.has(id) && jobsById[id]["state"] == "running") {
+                jobsById[id]["message"] = "Abbruch angefordert"
+            }
+        }
+        logInfo("job ${id}: cancel requested")
+    }
+    return requireJob(id)
+}
+
+// --- routes ----------------------------------------------------------------------------
+
+method jobsRoute(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 1) {
+        if (verb == "GET") {
+            return ok(jobs())
+        }
+        return methodNotAllowed(verb, segments)
+    }
+    var id = segments[1]
+    if (isId(id) == false) {
+        notFound("job '${id}' not found")
+    }
+    if (segments.length() == 2) {
+        if (verb == "GET") {
+            return ok(requireJob(id))
+        }
+        return methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 3 && segments[2] == "cancel") {
+        if (verb == "POST") {
+            return ok(cancelJob(id))
+        }
+        return methodNotAllowed(verb, segments)
+    }
+    return notFound("no such endpoint")
+}

@@ -1,0 +1,93 @@
+package system
+
+import core
+import launch
+import path
+
+// Launcher directories for the settings page. The backend creates the folder and
+// answers its path; the renderer opens it with window.volt.openPath (Electron).
+//
+//   GET  /api/settings/directories             [{id, label, path}]
+//   POST /api/settings/directories/:id/open    {path}
+
+method systemDirectoryIds(): array<string> {
+    return ["root", "profiles", "logs", "exports", "backups", "updates", "runtimes", "cache"]
+}
+
+// The directory behind an id, or "" for an unknown id.
+method systemDirectoryPath(string id): string {
+    if (id == "root") {
+        return core.dataDir()
+    }
+    if (id == "profiles") {
+        return core.profilesRoot()
+    }
+    if (id == "runtimes") {
+        return launch.launchRuntimesDir()
+    }
+    if (id == "logs" || id == "exports" || id == "backups" || id == "updates" || id == "cache") {
+        return path.join(core.dataDir(), id)
+    }
+    return ""
+}
+
+// The English label of the old launcher (the renderer shows its own translation by id).
+method systemDirectoryLabel(string id): string {
+    if (id == "root") {
+        return "Launcher directory"
+    }
+    if (id == "profiles") {
+        return "Profiles"
+    }
+    if (id == "logs") {
+        return "Logs"
+    }
+    if (id == "exports") {
+        return "Exported packs"
+    }
+    if (id == "backups") {
+        return "Profile backups"
+    }
+    if (id == "updates") {
+        return "Downloaded updates"
+    }
+    if (id == "runtimes") {
+        return "Java runtimes"
+    }
+    return "Cache"
+}
+
+method systemDirectoryList(): array {
+    var list = []
+    for (id in systemDirectoryIds()) {
+        list.append({"id": id, "label": systemDirectoryLabel(id), "path": systemDirectoryPath(id)})
+    }
+    return list
+}
+
+// Creates the folder if needed and answers its path (404 for an unknown id).
+method systemOpenDirectory(string id): map<string, object> {
+    var dir = systemDirectoryPath(id)
+    if (dir == "") {
+        core.notFound("unknown directory '" + id + "'")
+    }
+    core.ensureDir(dir)
+    return {"path": dir}
+}
+
+method systemDirectoriesRoute(string verb, array<string> segments): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "directories") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(systemDirectoryList())
+    }
+    if (segments.length() == 4 && segments[1] == "directories" && segments[3] == "open") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(systemOpenDirectory(segments[2]))
+    }
+    core.notFound("no such endpoint")
+    return {}
+}

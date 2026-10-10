@@ -1,0 +1,148 @@
+package accounts
+
+import base64
+import bytes
+import crypto
+import os
+import path
+import core
+
+// Encryption of the account store (tokens never reach the disk in plain text).
+//
+// std/crypto offers AES-128 in CFB-8 mode and SHA-2, but no GCM, no AES-256 and
+// no HMAC. The store therefore uses encrypt-then-MAC:
+//   - AES-128-CFB8 (random 16 byte IV per save) for secrecy,
+//   - HMAC-SHA256 over iv || ciphertext for integrity (built here from crypto.sha256).
+// Both keys are derived with HMAC-SHA256 (the HKDF-Expand construction) from one
+// 256 bit master key, which is created once per installation in
+// <dataDir>/accounts/master.key (base64 text, owner-only permissions where the OS
+// supports them). Copying accounts.enc to another machine without master.key makes
+// it unreadable; a wrong key or a modified file fails the MAC check and is reported,
+// never silently replaced by an empty store.
+
+final AC_KEY_BYTES = 32
+final AC_IV_BYTES = 16
+
+// HMAC-SHA256 (RFC 2104) of message under key.
+method acHmac(string key, string message): string {
+    var k = key
+    if (bytes.size(k) > 64) {
+        k = crypto.sha256(k)
+    }
+    var padded = k + bytes.zeros(64 - bytes.size(k))
+    var inner = ""
+    var outer = ""
+    var i = 0
+    while (i < 64) {
+        var b = bytes.u8(padded, i)
+        inner = inner + bytes.putU8(b ^ 54)
+        outer = outer + bytes.putU8(b ^ 92)
+        i = i + 1
+    }
+    return crypto.sha256(outer + crypto.sha256(inner + message))
+}
+
+// Compares two byte strings without stopping at the first difference.
+method acSameBytes(string a, string b): bool {
+    if (bytes.size(a) != bytes.size(b)) {
+        return false
+    }
+    var difference = 0
+    var i = 0
+    while (i < bytes.size(a)) {
+        difference = difference | (bytes.u8(a, i) ^ bytes.u8(b, i))
+        i = i + 1
+    }
+    return difference == 0
+}
+
+method acDir(): string {
+    return path.join(core.dataDir(), "accounts")
+}
+
+// Creates <dataDir>/accounts (owner-only) when missing.
+method acEnsureDir(): string {
+    var dir = acDir()
+    core.ensureDir(dir)
+    acChmod(dir, "700")
+    return dir
+}
+
+// Owner-only permissions. A no-op where chmod is not available (Windows).
+method acChmod(string target, string mode) {
+    os.run("chmod " + mode + " " + os.shellQuote(target) + " 2>/dev/null")
+}
+
+method acMasterKeyPath(): string {
+    return path.join(acDir(), "master.key")
+}
+
+// The 32 byte master key. With create = false a missing key answers "" (nothing
+// can be decrypted without it); with create = true it is generated once.
+method acMasterKey(bool create): string {
+    var file = acMasterKeyPath()
+    if (os.isFile(file)) {
+        var raw = base64.decode(os.readFile(file).trim())
+        if (bytes.size(raw) != AC_KEY_BYTES) {
+            core.internal("the account key file is damaged")
+        }
+        return raw
+    }
+    if (create == false) {
+        return ""
+    }
+    var fresh = crypto.random(AC_KEY_BYTES)
+    acEnsureDir()
+    var problem = core.writeFileAtomic(file, base64.encode(fresh) + "\n")
+    if (problem != "") {
+        core.internal("cannot write the account key: " + problem)
+    }
+    acChmod(file, "600")
+    return fresh
+}
+
+method acEncKey(string master): string {
+    return bytes.slice(acHmac(master, "volt-accounts encryption"), 0, 16)
+}
+
+method acMacKey(string master): string {
+    return acHmac(master, "volt-accounts authentication")
+}
+
+// {iv, data, mac} as base64 text, for the plain text JSON given.
+method acSeal(string master, string plain): map<string, object> {
+    var iv = crypto.random(AC_IV_BYTES)
+    var handle = crypto.cipher(acEncKey(master), iv, true)
+    if (handle < 0) {
+        core.internal("the cipher could not be set up")
+    }
+    var ciphertext = crypto.update(handle, plain)
+    crypto.release(handle)
+    var mac = acHmac(acMacKey(master), iv + ciphertext)
+    return {
+        "iv": base64.encode(iv),
+        "data": base64.encode(ciphertext),
+        "mac": base64.encode(mac)
+    }
+}
+
+// The plain text of a sealed payload; raises when the MAC does not match.
+method acOpen(string master, string ivText, string dataText, string macText): string {
+    var iv = base64.decode(ivText)
+    var ciphertext = base64.decode(dataText)
+    var mac = base64.decode(macText)
+    if (bytes.size(iv) != AC_IV_BYTES) {
+        core.internal("the account store is damaged")
+    }
+    var expected = acHmac(acMacKey(master), iv + ciphertext)
+    if (acSameBytes(expected, mac) == false) {
+        core.internal("the account store failed its integrity check (wrong key or damaged file)")
+    }
+    var handle = crypto.cipher(acEncKey(master), iv, false)
+    if (handle < 0) {
+        core.internal("the cipher could not be set up")
+    }
+    var plain = crypto.update(handle, ciphertext)
+    crypto.release(handle)
+    return plain
+}

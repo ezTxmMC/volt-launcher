@@ -1,0 +1,74 @@
+package main
+
+import cli
+import os
+import path
+import strings
+import core
+import migration
+import server
+import system
+import autoprofiles
+
+// volt-backend - the local HTTP service of VoltLauncher (docs/ARCHITECTURE.md).
+//
+//   volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--enable-test-routes]
+//   volt-backend --migration-dry-run --data-dir <scratch> --legacy-dir <old folder>
+//
+// Started by the Electron main process; listens on 127.0.0.1 only, prints
+// "VOLT_BACKEND_READY port=<port>" once it accepts requests and logs to stderr.
+// --legacy-dir is where the old Java launcher kept its data (default: the data
+// dir); a migration from there runs once at start (migration/).
+
+method usage() {
+    eprintln "usage: volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--enable-test-routes]"
+    eprintln "       volt-backend --migration-dry-run --data-dir <scratch dir> --legacy-dir <old folder>"
+}
+
+method main(array<string> arguments) {
+    var parsed = cli.parse(arguments)
+    if (cli.flag(parsed, "help") || cli.flag(parsed, "h")) {
+        usage()
+        return 0
+    }
+    var dataDir = cli.option(parsed, "data-dir", "")
+    if (dataDir == "" || dataDir == "true") {
+        dataDir = path.join(os.home(), ".voltlauncher")
+    }
+    dataDir = path.absolute(dataDir)
+    var legacyDir = cli.option(parsed, "legacy-dir", "")
+    if (legacyDir == "" || legacyDir == "true") {
+        legacyDir = dataDir
+    } else {
+        legacyDir = path.absolute(legacyDir)
+    }
+    if (cli.flag(parsed, "migration-dry-run")) {
+        core.init(dataDir, false)
+        return migration.dryRun(dataDir, legacyDir)
+    }
+
+    var portText = cli.option(parsed, "port", "")
+    if (portText == "" || strings.isNumeric(portText) == false || portText.contains(".") || portText.contains("-")) {
+        eprintln "volt-backend: --port <int> is required"
+        usage()
+        return 2
+    }
+    var port = parseInt(portText)
+    if (port < 1 || port > 65535) {
+        eprintln "volt-backend: --port must be between 1 and 65535"
+        return 2
+    }
+    var token = cli.option(parsed, "token", "")
+    if (token == "" || token == "true") {
+        eprintln "volt-backend: --token <hex> is required"
+        usage()
+        return 2
+    }
+
+    core.init(dataDir, cli.flag(parsed, "enable-test-routes"))
+    migration.startup(dataDir, legacyDir)
+    system.systemStartBackground()
+    autoprofiles.startBackground()
+    server.serve(port, token)
+    return 0
+}

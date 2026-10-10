@@ -1,0 +1,454 @@
+package launch
+
+import json
+import os
+import path
+import strings
+import thread
+import core
+
+// Installing a resolved version (see launchResolve): client jar, the loader
+// installer (Forge/NeoForge), libraries and natives, assets and the logging
+// configuration. Everything lives in the shared directories; files that are
+// present with the right hash are skipped.
+
+final LAUNCH_DEFAULT_MAVEN = "https://libraries.minecraft.net/"
+final LAUNCH_RESOURCES_URL = "https://resources.download.minecraft.net/"
+
+// group:artifact:version[:classifier][@ext] -> group/path/artifact/version/artifact-version[-classifier].ext
+method launchMavenPath(string gav): string {
+    var parts = gav.trim().split(":")
+    if (parts.length() < 3) {
+        return ""
+    }
+    var group = parts[0]
+    var artifact = parts[1]
+    var version = parts[2]
+    var classifier = ""
+    if (parts.length() >= 4) {
+        classifier = parts[3]
+    }
+    var extension = "jar"
+    var at = version.indexOf("@")
+    if (at >= 0) {
+        if (version.substring(at + 1, version.length()).trim() != "") {
+            extension = version.substring(at + 1, version.length()).trim()
+        }
+        version = version.substring(0, at)
+    }
+    at = classifier.indexOf("@")
+    if (at >= 0) {
+        if (classifier.substring(at + 1, classifier.length()).trim() != "") {
+            extension = classifier.substring(at + 1, classifier.length()).trim()
+        }
+        classifier = classifier.substring(0, at)
+    }
+    var file = artifact + "-" + version
+    if (classifier != "") {
+        file = file + "-" + classifier
+    }
+    return group.replace(".", "/") + "/" + artifact + "/" + version + "/" + file + "." + extension
+}
+
+// A path below `root`, or "" when `relative` would leave it.
+method launchInside(string root, string relative): string {
+    var clean = relative.replace("\\", "/")
+    if (clean == "" || clean.startsWith("/") || clean.contains(":")) {
+        return ""
+    }
+    var full = path.normalize(path.join(root, clean))
+    if (full.startsWith(path.normalize(root) + "/") == false) {
+        return ""
+    }
+    return full
+}
+
+method launchText(object value): string {
+    if (core.isString(value)) {
+        return value
+    }
+    return ""
+}
+
+// --- libraries ---------------------------------------------------------------------
+
+// What the libraries of `meta` need: {classpath: [...], downloads: [{url, path, hash}],
+// natives: [{archive, exclude: [...]}], generated: [paths without a URL]}.
+method launchPlanLibraries(map<string, object> meta): map<string, object> {
+    var libsDir = launchLibrariesDir()
+    var classpath = []
+    var downloads = []
+    var natives = []
+    var generated = []
+    var planned = {}
+    var libraries = core.getOr(meta, "libraries", [])
+    if (core.isArray(libraries) == false) {
+        libraries = []
+    }
+    for (lib in libraries) {
+        if (core.isMap(lib) == false) {
+            continue
+        }
+        if (launchRulesAllow(core.getOr(lib, "rules", core.none()), {}) == false) {
+            continue
+        }
+        var name = launchText(core.getOr(lib, "name", ""))
+        var excludes = []
+        var extract = core.getOr(lib, "extract", core.none())
+        if (core.isMap(extract) && core.isArray(core.getOr(extract, "exclude", 0))) {
+            for (prefix in extract["exclude"]) {
+                if (core.isString(prefix)) {
+                    excludes.append(prefix)
+                }
+            }
+        }
+        var dls = core.getOr(lib, "downloads", core.none())
+        if (core.isMap(dls) == false) {
+            // a plain Maven coordinate (Fabric, Quilt, older Forge)
+            var relative = launchMavenPath(name)
+            if (relative == "") {
+                continue
+            }
+            var target = launchInside(libsDir, relative)
+            if (target == "") {
+                continue
+            }
+            var repo = launchText(core.getOr(lib, "url", "")).trim()
+            if (repo == "") {
+                repo = LAUNCH_DEFAULT_MAVEN
+            }
+            if (repo.endsWith("/") == false) {
+                repo = repo + "/"
+            }
+            if (planned.has(target) == false) {
+                planned[target] = true
+                downloads.append({"url": repo + relative, "path": target, "hash": launchText(core.getOr(lib, "sha1", "")), "optional": true})
+            }
+            if (classpath.contains(target) == false) {
+                classpath.append(target)
+            }
+            continue
+        }
+        var artifact = core.getOr(dls, "artifact", core.none())
+        if (core.isMap(artifact)) {
+            var relative = launchText(core.getOr(artifact, "path", ""))
+            if (relative == "") {
+                relative = launchMavenPath(name)
+            }
+            var target = launchInside(libsDir, relative)
+            if (target != "") {
+                var url = launchText(core.getOr(artifact, "url", "")).trim()
+                if (url == "") {
+                    // produced by the Forge/NeoForge installer's processors
+                    generated.append(target)
+                } else if (planned.has(target) == false) {
+                    planned[target] = true
+                    downloads.append({"url": url, "path": target, "hash": launchText(core.getOr(artifact, "sha1", "")), "optional": false})
+                }
+                if (classpath.contains(target) == false) {
+                    classpath.append(target)
+                }
+                var lower = name.toLower()
+                if (url != "" && (lower.contains(":natives-") || lower.contains("-natives-"))) {
+                    natives.append({"archive": target, "exclude": excludes})
+                }
+            }
+        }
+        var classifiers = core.getOr(dls, "classifiers", core.none())
+        var classifier = launchNativeClassifier(core.getOr(lib, "natives", core.none()))
+        if (core.isMap(classifiers) && classifier != "" && core.isMap(core.getOr(classifiers, classifier, 0))) {
+            var native = classifiers[classifier]
+            var target = launchInside(libsDir, launchText(core.getOr(native, "path", "")))
+            var url = launchText(core.getOr(native, "url", "")).trim()
+            if (target != "" && url != "") {
+                if (planned.has(target) == false) {
+                    planned[target] = true
+                    downloads.append({"url": url, "path": target, "hash": launchText(core.getOr(native, "sha1", "")), "optional": false})
+                }
+                natives.append({"archive": target, "exclude": excludes})
+            }
+        }
+    }
+    return {"classpath": classpath, "downloads": downloads, "natives": natives, "generated": generated}
+}
+
+// --- assets --------------------------------------------------------------------------
+
+// Downloads the asset index and the objects; returns the asset index id.
+// `verify`: hash every present object (install-game) instead of checking its size (launch).
+method launchInstallAssets(map<string, object> meta, string gameDir, string jobId, bool verify): string {
+    var assetsDir = launchAssetsDir()
+    var assetIndexId = launchText(core.getOr(meta, "assets", "legacy"))
+    var assetIndex = core.getOr(meta, "assetIndex", core.none())
+    if (core.isMap(assetIndex) == false) {
+        return assetIndexId
+    }
+    assetIndexId = launchText(core.getOr(assetIndex, "id", assetIndexId))
+    var indexFile = launchInside(path.join(assetsDir, "indexes"), assetIndexId + ".json")
+    if (indexFile == "") {
+        core.upstream("invalid asset index id '" + assetIndexId + "'")
+    }
+    core.jobProgress(jobId, 0.6, "Lade den Asset-Index " + assetIndexId)
+    launchDownload(launchText(core.getOr(assetIndex, "url", "")), indexFile, launchText(core.getOr(assetIndex, "sha1", "")))
+    var index = launchReadJsonMap(indexFile)
+    var objects = core.getOr(index, "objects", {})
+    if (core.isMap(objects) == false) {
+        objects = {}
+    }
+    var objectsDir = path.join(assetsDir, "objects")
+    var missing = []
+    var seen = {}
+    var checked = 0
+    for (name in objects) {
+        var entry = objects[name]
+        if (core.isMap(entry) == false) {
+            continue
+        }
+        var hash = launchText(core.getOr(entry, "hash", "")).toLower()
+        if (hash.length() < 2 || seen.has(hash)) {
+            continue
+        }
+        seen[hash] = true
+        var prefix = hash.substring(0, 2)
+        var target = path.join(objectsDir, prefix, hash)
+        var present = false
+        if (verify) {
+            present = launchHashOk(target, hash)
+        } else {
+            var size = core.getOr(entry, "size", -1)
+            present = os.isFile(target) && (core.isWholeNumber(size) == false || os.fileSize(target) == core.toInteger(size))
+        }
+        if (present == false) {
+            missing.append({"url": LAUNCH_RESOURCES_URL + prefix + "/" + hash, "path": target, "hash": hash})
+        }
+        checked = checked + 1
+        if (checked % 500 == 0) {
+            core.checkCancelled(jobId)
+            core.jobMessage(jobId, "Prüfe Assets (" + checked + ")")
+        }
+    }
+    core.logInfo("launch: asset index " + assetIndexId + ": " + seen.length() + " objects, " + missing.length() + " to download")
+    launchDownloadMany(missing, jobId, 0.62, 0.96, "Lade Assets")
+
+    var isVirtual = core.getOr(index, "virtual", false) == true
+    var toResources = core.getOr(index, "map_to_resources", false) == true
+    if (isVirtual || toResources) {
+        core.jobProgress(jobId, 0.97, "Kopiere Assets")
+        var targets = []
+        if (isVirtual) {
+            targets.append(path.join(assetsDir, "virtual", assetIndexId))
+        }
+        if (toResources) {
+            targets.append(path.join(gameDir, "resources"))
+        }
+        for (root in targets) {
+            for (name in objects) {
+                var hash = launchText(core.getOr(objects[name], "hash", "")).toLower()
+                var dest = launchInside(root, name)
+                if (hash.length() < 2 || dest == "" || os.isFile(dest)) {
+                    continue
+                }
+                launchEnsureDir(path.dirname(dest))
+                os.copy(path.join(objectsDir, hash.substring(0, 2), hash), dest)
+            }
+        }
+    }
+    return assetIndexId
+}
+
+// The client logging configuration (downloaded, not passed to the game:
+// its XML layout is meant for a log viewer, the plain output is kept in
+// launch.log instead). Returns the file or "".
+method launchInstallLogging(map<string, object> meta): string {
+    var logging = core.getOr(meta, "logging", core.none())
+    if (core.isMap(logging) == false || core.isMap(core.getOr(logging, "client", 0)) == false) {
+        return ""
+    }
+    var file = core.getOr(logging["client"], "file", core.none())
+    if (core.isMap(file) == false) {
+        return ""
+    }
+    var target = launchInside(path.join(launchAssetsDir(), "log_configs"), launchText(core.getOr(file, "id", "")))
+    var url = launchText(core.getOr(file, "url", ""))
+    if (target == "" || url == "") {
+        return ""
+    }
+    launchDownload(url, target, launchText(core.getOr(file, "sha1", "")))
+    return target
+}
+
+// --- Forge / NeoForge installer ---------------------------------------------------------
+
+// The last non-empty line of a (log) file, shortened.
+method launchLastLine(string file): string {
+    if (os.isFile(file) == false) {
+        return ""
+    }
+    var lines = os.readFile(file).split("\n")
+    var i = lines.length() - 1
+    while (i >= 0) {
+        var line = lines[i].trim()
+        if (line != "") {
+            if (line.length() > 160) {
+                return line.substring(0, 160) + "..."
+            }
+            return line
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+// Runs the official installer headless: java -jar installer.jar --installClient <shared>.
+// It downloads the loader libraries into shared/libraries, runs the
+// processors (binary patches, remapping with Mojang's mappings) and writes
+// shared/versions/<id>/<id>.json. Skipped when that JSON exists and every
+// processor output listed by the version is present.
+// Minecraft 1.12.2 and older: the installer has no headless mode, so it is
+// read as a zip instead (legacyforge.nv) and never run.
+method launchRunInstaller(map<string, object> resolved, map<string, object> plan, string javaPath, string jobId) {
+    if (launchIsLegacyForge(launchText(resolved["minecraftVersion"]))) {
+        launchLegacyForgeInstall(resolved, jobId)
+        return
+    }
+    var versionId = resolved["versionId"]
+    var installed = launchVersionJson(versionId)
+    var complete = os.isFile(installed)
+    for (file in plan["generated"]) {
+        if (os.isFile(file) == false) {
+            complete = false
+        }
+    }
+    if (complete) {
+        return
+    }
+    var shared = launchSharedDir()
+    var profiles = path.join(shared, "launcher_profiles.json")
+    if (os.isFile(profiles) == false) {
+        // the installer refuses to run without a launcher profile file
+        launchWriteJson(profiles, {"profiles": {}})
+    }
+    var installer = resolved["installer"]
+    var log = installer + ".log"
+    os.remove(log)
+    core.jobProgress(jobId, 0.4, "Führe den " + resolved["loader"] + "-Installer aus")
+    core.logInfo("launch: running " + path.basename(installer) + " --installClient " + shared)
+    var started = launchSpawn([javaPath, "-jar", installer, "--installClient", shared], launchInstallersDir(), log)
+    if (started["pid"] <= 0) {
+        core.internal("cannot start the installer: " + started["error"])
+    }
+    var pid = started["pid"]
+    var code = -2
+    var ticks = 0
+    while (code == -2) {
+        thread.sleep(500)
+        code = launchPoll(pid)
+        if (code != -2) {
+            break
+        }
+        if (core.cancelRequested(jobId)) {
+            launchSignal(pid, true)
+            launchWaitPid(pid)
+            core.checkCancelled(jobId)
+        }
+        ticks = ticks + 1
+        if (ticks % 4 == 0) {
+            var line = launchLastLine(log)
+            if (line != "") {
+                core.jobMessage(jobId, resolved["loader"] + "-Installer: " + line)
+            }
+        }
+    }
+    if (code != 0 || os.isFile(installed) == false) {
+        core.fail(500, "internal", "the " + resolved["loader"] + " installer failed (exit code " + code + "): " + launchLastLine(log) + " - see " + log)
+    }
+    for (file in plan["generated"]) {
+        if (os.isFile(file) == false) {
+            core.fail(500, "internal", "the " + resolved["loader"] + " installer did not produce " + file + " - see " + log)
+        }
+    }
+}
+
+// --- the whole installation ---------------------------------------------------------------
+
+// Installs everything and returns
+//   {versionId, versionName, meta, classpath: [...], clientJar, nativesDir, assetIndex, assetsDir}
+method launchInstall(map<string, object> resolved, string javaPath, string gameDir, string jobId, bool verify): map<string, object> {
+    var meta = resolved["meta"]
+    var versionId = resolved["versionId"]
+    var versionsDir = launchEnsureDir(launchVersionsDir())
+    launchEnsureDir(launchLibrariesDir())
+    launchEnsureDir(path.join(launchAssetsDir(), "indexes"))
+    launchEnsureDir(path.join(launchAssetsDir(), "objects"))
+    var nativesDir = launchEnsureDir(path.join(launchNativesRoot(), launchFolderName(versionId)))
+
+    // client jar (the vanilla one, also for loaders)
+    var client = core.none()
+    var dls = core.getOr(meta, "downloads", core.none())
+    if (core.isMap(dls)) {
+        client = core.getOr(dls, "client", core.none())
+    }
+    if (core.isMap(client) == false) {
+        core.internal("the metadata of " + resolved["minecraftVersion"] + " has no client download")
+    }
+    var clientJar = resolved["clientJar"]
+    core.jobProgress(jobId, 0.3, "Lade den Minecraft-Client")
+    launchDownload(launchText(core.getOr(client, "url", "")), clientJar, launchText(core.getOr(client, "sha1", "")))
+    core.checkCancelled(jobId)
+
+    var plan = launchPlanLibraries(meta)
+    if (resolved["installer"] != "") {
+        launchRunInstaller(resolved, plan, javaPath, jobId)
+        core.checkCancelled(jobId)
+    }
+
+    core.jobProgress(jobId, 0.5, "Prüfe Bibliotheken")
+    var missing = []
+    for (item in plan["downloads"]) {
+        if (launchHashOk(item["path"], item["hash"]) == false) {
+            missing.append(item)
+        }
+    }
+    launchDownloadMany(missing, jobId, 0.5, 0.58, "Lade Bibliotheken")
+
+    core.jobProgress(jobId, 0.58, "Entpacke Natives")
+    for (native in plan["natives"]) {
+        if (os.isFile(native["archive"])) {
+            launchZipExtract(native["archive"], nativesDir, native["exclude"])
+        }
+    }
+
+    var assetIndex = launchInstallAssets(meta, gameDir, jobId, verify)
+    launchInstallLogging(meta)
+
+    // The client jar goes last on the classpath. Forge and NeoForge get a copy
+    // in their own version folder, like the official launcher makes it: their
+    // arguments name it (-DignoreList=...,${version_name}.jar).
+    var classpathJar = clientJar
+    if (resolved["installer"] != "") {
+        classpathJar = launchVersionJar(versionId)
+        if (os.isFile(classpathJar) == false || os.fileSize(classpathJar) != os.fileSize(clientJar)) {
+            launchEnsureDir(path.dirname(classpathJar))
+            if (os.copy(clientJar, classpathJar) == false) {
+                core.internal("cannot copy the client jar to " + classpathJar)
+            }
+        }
+    }
+    var classpath = []
+    for (entry in plan["classpath"]) {
+        if (entry != classpathJar) {
+            classpath.append(entry)
+        }
+    }
+    classpath.append(classpathJar)
+    return {
+        "versionId": versionId,
+        "meta": meta,
+        "classpath": classpath,
+        "clientJar": classpathJar,
+        "nativesDir": nativesDir,
+        "assetIndex": assetIndex,
+        "assetsDir": launchAssetsDir(),
+        "librariesDir": launchLibrariesDir()
+    }
+}

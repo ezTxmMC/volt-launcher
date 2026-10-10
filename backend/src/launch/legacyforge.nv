@@ -1,0 +1,107 @@
+package launch
+
+import json
+import os
+import path
+import core
+
+// Forge installers of Minecraft 1.12.2 and older (below 1.13).
+//
+// The current installers run headless (java -jar installer.jar --installClient
+// <dir>). The old ones do not know that option: their SimpleInstaller refuses
+// it (joptsimple.UnrecognizedOptionException: 'installClient'). So for these
+// versions the launcher does what the older launchers did: it reads the
+// installer as a zip and writes the two files the installer would have written.
+//
+//   install_profile.json  install.filePath (the universal jar, named inside the
+//                         installer) -> libraries/<Maven path of install.path>
+//                         versionInfo  -> versions/<id>/<id>.json
+//
+// The libraries of versionInfo are fetched by the normal library step
+// (launchPlanLibraries): they have a url or a Maven coordinate. The universal
+// jar is on disk by then, so that step does not fetch it again. The old
+// installers have no processors, so nothing runs.
+
+// True for a Minecraft version below 1.13 ("1.12.2", "1.7.10"). Snapshots and
+// other ids are not legacy and take the headless path.
+method launchIsLegacyForge(string mc): bool {
+    var version = mc.trim()
+    if (version.startsWith("1.") == false) {
+        return false
+    }
+    return launchCompareVersions(version, "1.13") < 0
+}
+
+// The central directory entry named `name`, or core.none().
+method launchLegacyEntry(array entries, string name): object {
+    for (entry in entries) {
+        if (entry["name"] == name) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// Writes the files of a legacy installer (see above). `resolved` is the result
+// of launchResolve: "installer" is the installer jar, "versionId" the id the
+// launch uses. Fails with 500 internal, naming the installer and what is
+// missing, when install_profile.json, the universal jar or versionInfo is
+// absent or inconsistent. Files that are already there are kept.
+method launchLegacyForgeInstall(map<string, object> resolved, string jobId) {
+    var installer = launchText(resolved["installer"])
+    var name = path.basename(installer)
+    core.jobProgress(jobId, 0.4, "Lese den " + resolved["loader"] + "-Installer")
+    var data = os.readFile(installer)
+    var entries = launchZipList(data)
+
+    var profileEntry = launchLegacyEntry(entries, "install_profile.json")
+    if (core.isNull(profileEntry)) {
+        core.internal("the installer " + name + " has no install_profile.json")
+    }
+    var profile = json.tryParse(launchZipRead(data, profileEntry))
+    if (core.isMap(profile) == false) {
+        core.internal("the install_profile.json of " + name + " is not valid JSON")
+    }
+    var install = core.getOr(profile, "install", core.none())
+    var versionInfo = core.getOr(profile, "versionInfo", core.none())
+    if (core.isMap(install) == false) {
+        core.internal("the install_profile.json of " + name + " has no install object")
+    }
+    if (core.isMap(versionInfo) == false) {
+        core.internal("the install_profile.json of " + name + " has no versionInfo object")
+    }
+
+    var fileName = launchText(core.getOr(install, "filePath", ""))
+    var target = launchInside(launchLibrariesDir(), launchMavenPath(launchText(core.getOr(install, "path", ""))))
+    if (fileName == "" || target == "") {
+        core.internal("the install object of " + name + " has no usable path or filePath")
+    }
+
+    // the universal jar -> libraries/<Maven path>, written atomically
+    var jar = launchLegacyEntry(entries, fileName)
+    if (core.isNull(jar)) {
+        core.internal("the installer " + name + " has no " + fileName + " (install.filePath)")
+    }
+    if (os.isFile(target) == false || os.fileSize(target) != jar["size"]) {
+        launchEnsureDir(path.dirname(target))
+        var temp = launchTempName(target)
+        os.writeFile(temp, launchZipRead(data, jar))
+        if (launchReplace(temp, target) == false) {
+            core.internal("cannot write " + target)
+        }
+    }
+
+    // versionInfo -> versions/<id>/<id>.json; the id must be the one the launch
+    // looks up (launchVersionJson(resolved versionId))
+    var id = launchText(core.getOr(versionInfo, "id", ""))
+    var expected = launchText(resolved["versionId"])
+    if (id == "" || id != expected) {
+        core.internal("the installer " + name + " writes the version '" + id + "', the profile expects '" + expected + "'")
+    }
+    var versionJson = launchVersionJson(id)
+    if (os.isFile(versionJson) == false) {
+        launchEnsureDir(path.dirname(versionJson))
+        launchWriteJson(versionJson, versionInfo)
+    }
+    core.logInfo("launch: " + name + ": " + fileName + " -> " + target)
+}

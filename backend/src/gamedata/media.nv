@@ -1,0 +1,107 @@
+package gamedata
+
+import base64
+import core
+import os
+import path
+import time
+
+// Screenshots of a profile: <gameDir>/screenshots/*.png|jpg|jpeg|webp.
+//
+//   GET    /api/profiles/:id/screenshots                    {"screenshots": [Screenshot]}
+//   DELETE /api/profiles/:id/screenshots/:file              -> {"deleted": file}
+//   GET    /api/profiles/:id/screenshots/:file/image        {"dataUrl", "contentType"}
+//   POST   /api/profiles/:id/screenshots/open-folder        {"path"} (Electron opens it)
+//
+// Screenshot: {fileName, takenAt (ISO), sizeBytes}. The image comes back as a
+// data URL because the HTTP layer answers JSON only.
+
+method screenshotsDir(string profileId): string {
+    return path.join(core.profileDir(profileId), "screenshots")
+}
+
+// The MIME type of an image file name, "" when it is not an image.
+method imageType(string fileName): string {
+    var lower = fileName.toLower()
+    if (lower.endsWith(".png")) {
+        return "image/png"
+    }
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+        return "image/jpeg"
+    }
+    if (lower.endsWith(".webp")) {
+        return "image/webp"
+    }
+    return ""
+}
+
+// A screenshot name from a request: a plain image file name.
+method screenshotName(object value): string {
+    var name = safeName(value, "screenshot")
+    if (imageType(name) == "") {
+        core.badRequest("not an image file: " + name)
+    }
+    return name
+}
+
+// The file of a screenshot; 404 when it is not there.
+method screenshotFile(string profileId, object value): string {
+    var name = screenshotName(value)
+    var file = path.join(screenshotsDir(profileId), name)
+    if (os.isFile(file) == false) {
+        core.notFound("screenshot '" + name + "' not found")
+    }
+    return file
+}
+
+// Newest first. Empty when the game has not written a screenshot yet.
+method listScreenshots(string profileId): array {
+    var dir = screenshotsDir(profileId)
+    var sorted = []
+    if (os.isDir(dir) == false) {
+        return sorted
+    }
+    for (name in os.listDir(dir)) {
+        var file = path.join(dir, name)
+        if (imageType(name) != "" && os.isFile(file)) {
+            var entry = {
+                "fileName": name,
+                "takenAt": time.iso(os.modified(file)),
+                "sizeBytes": os.fileSize(file)
+            }
+            var at = sorted.length()
+            while (at > 0 && (sorted[at - 1]["takenAt"] < entry["takenAt"]
+                    || (sorted[at - 1]["takenAt"] == entry["takenAt"] && sorted[at - 1]["fileName"] > name))) {
+                at = at - 1
+            }
+            sorted.insert(at, entry)
+        }
+    }
+    return sorted
+}
+
+// One screenshot as a data URL.
+method screenshotImage(string profileId, object value): map<string, object> {
+    var file = screenshotFile(profileId, value)
+    var type = imageType(path.basename(file))
+    return {
+        "fileName": path.basename(file),
+        "contentType": type,
+        "dataUrl": "data:" + type + ";base64," + base64.encode(os.readFile(file))
+    }
+}
+
+method deleteScreenshot(string profileId, object value): string {
+    var file = screenshotFile(profileId, value)
+    if (os.remove(file) == false) {
+        core.internal("cannot delete " + path.basename(file))
+    }
+    return path.basename(file)
+}
+
+// The screenshots folder, created when missing, so the file manager can open it.
+method openScreenshotFolder(string profileId): map<string, object> {
+    var dir = screenshotsDir(profileId)
+    ensureDirectory(dir)
+    return {"path": dir}
+}

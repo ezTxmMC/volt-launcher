@@ -1,0 +1,520 @@
+package providers
+
+import core
+import json
+import os
+import thread
+
+// CurseForge, through the launcher's bridge (bridge/, setting "bridgeUrl").
+// The bridge holds the API key and mirrors CurseForge's own routes, plus
+// GET /health and GET /v1/files/:fileId.
+
+private final CF_GAME = 432
+private final CF_CLASS_MOD = 6
+private final CF_CLASS_MODPACK = 4471
+private final CF_CLASS_RESOURCEPACK = 12
+private final CF_CLASS_SHADER = 6552
+private final CF_CLASS_DATAPACK = 6945
+private final CF_HEALTH_SECONDS = 60
+
+var cfHealthLock = thread.mutex()
+var cfHealth = {"at": 0, "url": "", "ok": false, "message": ""}
+
+method cfBridgeUrl(): string {
+    var url = "" + core.setting("bridgeUrl")
+    url = url.trim()
+    while (url.endsWith("/")) {
+        url = url.substring(0, url.length() - 1)
+    }
+    return url
+}
+
+method cfHeaders(): map<string, string> {
+    return {"Accept": "application/json"}
+}
+
+// {ok, message}: whether the bridge answers and has a working key. Asked at
+// most every 60 seconds (per bridge URL); the request itself runs without
+// the lock.
+method cfStatus(): map<string, object> {
+    var url = cfBridgeUrl()
+    var now = os.time()
+    var cached = {}
+    sync (cfHealthLock) {
+        if (cfHealth["url"] == url && now - cfHealth["at"] < CF_HEALTH_SECONDS) {
+            cached = {"ok": cfHealth["ok"], "message": cfHealth["message"]}
+        }
+    }
+    if (cached.has("ok")) {
+        return cached
+    }
+    var ok = false
+    var message = ""
+    var file = pvTempFile(".health")
+    var res = curlFetch("GET", url + "/health", cfHeaders(), "", file, 5)
+    var text = ""
+    if (os.isFile(file)) {
+        text = os.readFile(file)
+        os.remove(file)
+    }
+    if (res["status"] == 200) {
+        var parsed = json.tryParse(text)
+        if (jbool(parsed, "ok") && jbool(parsed, "curseforge")) {
+            ok = true
+        } else {
+            var reason = jstr(parsed, "reason")
+            message = "The CurseForge bridge at " + url + " is running but has no working API key"
+            if (reason != "") {
+                message = message + " (" + reason + ")"
+            }
+        }
+    } else {
+        message = "The CurseForge bridge is not reachable at " + url + ". Start it with 'npm start' in bridge/."
+    }
+    sync (cfHealthLock) {
+        cfHealth = {"at": now, "url": url, "ok": ok, "message": message}
+    }
+    return {"ok": ok, "message": message}
+}
+
+method requireBridge() {
+    var status = cfStatus()
+    if (status["ok"] == false) {
+        core.upstream("" + status["message"])
+    }
+}
+
+method cfGet(string apiPath): object {
+    requireBridge()
+    return getJson(cfBridgeUrl() + apiPath, cfHeaders())
+}
+
+method cfPost(string apiPath, object body): object {
+    requireBridge()
+    return postJson(cfBridgeUrl() + apiPath, cfHeaders(), body)
+}
+
+method cfClassFor(string kind): integer {
+    if (kind == "modpack") {
+        return CF_CLASS_MODPACK
+    }
+    if (kind == "resourcepack") {
+        return CF_CLASS_RESOURCEPACK
+    }
+    if (kind == "shader") {
+        return CF_CLASS_SHADER
+    }
+    if (kind == "datapack") {
+        return CF_CLASS_DATAPACK
+    }
+    return CF_CLASS_MOD
+}
+
+method cfKindOf(integer classId): string {
+    if (classId == CF_CLASS_MODPACK) {
+        return "modpack"
+    }
+    if (classId == CF_CLASS_RESOURCEPACK) {
+        return "resourcepack"
+    }
+    if (classId == CF_CLASS_SHADER) {
+        return "shader"
+    }
+    if (classId == CF_CLASS_DATAPACK) {
+        return "datapack"
+    }
+    return "mod"
+}
+
+// The game folder files of a CurseForge class land in.
+method cfFolderOf(integer classId): string {
+    if (classId == CF_CLASS_RESOURCEPACK) {
+        return "resourcepacks"
+    }
+    if (classId == CF_CLASS_SHADER) {
+        return "shaderpacks"
+    }
+    if (classId == CF_CLASS_DATAPACK) {
+        return "datapacks"
+    }
+    return "mods"
+}
+
+// CurseForge sortField of a normalised sort id (filters.nv): 1 Featured (relevance),
+// 2 Popularity, 3 Last updated, 4 Name, 6 Total downloads, 11 Release date.
+method cfSortField(string sort): integer {
+    var s = sort.toLower()
+    if (s == "downloads") {
+        return 6
+    }
+    if (s == "newest") {
+        return 11
+    }
+    if (s == "updated") {
+        return 3
+    }
+    if (s == "name") {
+        return 4
+    }
+    if (s == "follows") {
+        return 2
+    }
+    return 1
+}
+
+// Names are sorted A to Z, everything else largest (or newest) first.
+method cfSortOrder(string sort): string {
+    if (sort.toLower() == "name") {
+        return "asc"
+    }
+    return "desc"
+}
+
+// The category part of a search URL. One id is sent as categoryId; several as
+// categoryIds (a JSON array). Only numeric ids apply: Modrinth names do not.
+method cfCategoryParam(string tags): string {
+    var ids = []
+    for (part in tags.split(",")) {
+        var id = part.trim()
+        if (isDigits(id) && ids.contains(id) == false) {
+            ids.append(id)
+        }
+    }
+    if (ids.length() == 0) {
+        return ""
+    }
+    if (ids.length() == 1) {
+        return "&categoryId=" + ids[0]
+    }
+    return "&categoryIds=" + urlEncode("[" + ids.join(",") + "]")
+}
+
+// The categories of a kind as the bridge lists them: [{id, label}] with CurseForge's
+// numeric category ids. Only the categories of the kind's class (not the class itself).
+method cfCategoryList(string kind): array {
+    var classId = cfClassFor(kind)
+    var response = cfGet("/v1/categories?gameId=" + CF_GAME + "&classId=" + classId)
+    var out = []
+    for (c in jarr(response, "data")) {
+        var id = jint(c, "id", 0)
+        if (id > 0 && jbool(c, "isClass") == false && jint(c, "classId", classId) == classId && jstr(c, "name") != "") {
+            out.append({"id": "" + id, "label": jstr(c, "name")})
+        }
+    }
+    return out
+}
+
+// The lists the Discover filters offer for a CurseForge kind. Game versions are not
+// listed: the bridge does not forward CurseForge's version list (a free text filter stays).
+// Loaders apply to mods and modpacks only.
+method cfFilterLists(string kind): map<string, object> {
+    var loaders = []
+    if (kind == "mod" || kind == "modpack") {
+        loaders = ["fabric", "forge", "neoforge", "quilt"]
+    }
+    return {"categories": cfCategoryList(kind), "gameVersions": [], "loaders": loaders}
+}
+
+method cfLoaderType(string loader): integer {
+    var l = loader.toLower()
+    if (l == "forge") {
+        return 1
+    }
+    if (l == "fabric") {
+        return 4
+    }
+    if (l == "quilt") {
+        return 5
+    }
+    if (l == "neoforge") {
+        return 6
+    }
+    return 0
+}
+
+method cfLoaderName(integer type): string {
+    if (type == 1) {
+        return "forge"
+    }
+    if (type == 4) {
+        return "fabric"
+    }
+    if (type == 5) {
+        return "quilt"
+    }
+    if (type == 6) {
+        return "neoforge"
+    }
+    return ""
+}
+
+method cfSummary(object mod, string fallbackKind): map<string, object> {
+    var authors = jarr(mod, "authors")
+    var author = ""
+    if (authors.length() > 0) {
+        author = jstr(authors[0], "name")
+    }
+    var categories = []
+    for (c in jarr(mod, "categories")) {
+        if (jstr(c, "name") != "") {
+            categories.append(jstr(c, "name"))
+        }
+    }
+    var gameVersions = []
+    var loaders = []
+    for (index in jarr(mod, "latestFilesIndexes")) {
+        var gv = jstr(index, "gameVersion")
+        if (gv != "" && gameVersions.contains(gv) == false) {
+            gameVersions.append(gv)
+        }
+        var ln = cfLoaderName(jint(index, "modLoader", 0))
+        if (ln != "" && loaders.contains(ln) == false) {
+            loaders.append(ln)
+        }
+    }
+    var logo = jobj(mod, "logo")
+    var icon = jstr(logo, "thumbnailUrl")
+    if (icon == "") {
+        icon = jstr(logo, "url")
+    }
+    var kind = fallbackKind
+    if (jint(mod, "classId", 0) > 0) {
+        kind = cfKindOf(jint(mod, "classId", 0))
+    }
+    return {
+        "provider": "curseforge",
+        "id": jstr(mod, "id"),
+        "slug": jstr(mod, "slug"),
+        "name": jstr(mod, "name"),
+        "summary": jstr(mod, "summary"),
+        "iconUrl": icon,
+        "author": author,
+        "downloads": jint(mod, "downloadCount", 0),
+        "follows": jint(mod, "thumbsUpCount", 0),
+        "kind": kind,
+        "categories": categories,
+        "loaders": loaders,
+        "gameVersions": gameVersions,
+        "updated": jstr(mod, "dateModified")
+    }
+}
+
+// tags: comma separated category ids (cfCategoryParam). sort: a normalised sort id.
+method cfSearch(string q, string kind, string gameVersion, string loader, integer offset, integer limit, string sort, string tags): map<string, object> {
+    var pageSize = limit
+    if (pageSize > 50) {
+        pageSize = 50
+    }
+    var url = "/v1/mods/search?gameId=" + CF_GAME + "&classId=" + cfClassFor(kind)
+    url = url + "&sortField=" + cfSortField(sort) + "&sortOrder=" + cfSortOrder(sort) + "&index=" + offset + "&pageSize=" + pageSize
+    if (q != "") {
+        url = url + "&searchFilter=" + urlEncode(q)
+    }
+    if (gameVersion != "") {
+        url = url + "&gameVersion=" + urlEncode(gameVersion)
+    }
+    if (loader != "" && cfLoaderType(loader) > 0) {
+        url = url + "&modLoaderType=" + cfLoaderType(loader)
+    }
+    url = url + cfCategoryParam(tags)
+    var response = cfGet(url)
+    var items = []
+    for (mod in jarr(response, "data")) {
+        items.append(cfSummary(mod, kind))
+    }
+    return {"total": jint(jobj(response, "pagination"), "totalCount", items.length()), "items": items}
+}
+
+method cfProject(string id): map<string, object> {
+    var mod = jobj(cfGet("/v1/mods/" + urlEncode(id)), "data")
+    if (mod.length() == 0) {
+        core.notFound("CurseForge project '" + id + "' not found")
+    }
+    var summary = cfSummary(mod, "mod")
+    var gallery = []
+    for (s in jarr(mod, "screenshots")) {
+        if (jstr(s, "url") != "") {
+            gallery.append(jstr(s, "url"))
+        }
+    }
+    var links = {}
+    var l = jobj(mod, "links")
+    for (pair in [["website", "websiteUrl"], ["issues", "issuesUrl"], ["source", "sourceUrl"], ["wiki", "wikiUrl"]]) {
+        if (jstr(l, pair[1]) != "") {
+            links[pair[0]] = jstr(l, pair[1])
+        }
+    }
+    // The description is HTML; the launcher shows Markdown (htmltext.nv). The summary is plain text.
+    var description = jstr(mod, "descriptionHtml")
+    if (description == "") {
+        description = jstr(mod, "summary")
+    } else {
+        description = htmlToMarkdown(description)
+    }
+    summary["description"] = description
+    summary["gallery"] = gallery
+    summary["links"] = links
+    return summary
+}
+
+// The CDN path every launcher falls back to when downloadUrl is null.
+method cfDownloadUrl(object file): string {
+    var url = jstr(file, "downloadUrl")
+    if (url != "") {
+        return url
+    }
+    var id = jstr(file, "id")
+    var name = jstr(file, "fileName")
+    if (id == "" || name == "" || id.length() < 4) {
+        return ""
+    }
+    var head = id.substring(0, id.length() - 3)
+    var tail = "" + parseInt(id.substring(id.length() - 3, id.length()))
+    return "https://edge.forgecdn.net/files/" + head + "/" + tail + "/" + urlEncode(name)
+}
+
+method cfRelation(integer type): string {
+    if (type == 3) {
+        return "required"
+    }
+    if (type == 4) {
+        return "embedded"
+    }
+    if (type == 5) {
+        return "incompatible"
+    }
+    return "optional"
+}
+
+method cfVersion(object file): map<string, object> {
+    var gameVersions = []
+    var loaders = []
+    for (value in stringList(jarr(file, "gameVersions"))) {
+        var lower = value.toLower()
+        if (cfLoaderType(lower) > 0 || lower == "liteloader" || lower == "cauldron") {
+            loaders.append(lower)
+        } else {
+            gameVersions.append(value)
+        }
+    }
+    var sha1 = ""
+    var md5 = ""
+    for (h in jarr(file, "hashes")) {
+        // algo 1 = SHA-1, 2 = MD5
+        if (jint(h, "algo", 0) == 1 && sha1 == "") {
+            sha1 = jstr(h, "value")
+        }
+        if (jint(h, "algo", 0) == 2 && md5 == "") {
+            md5 = jstr(h, "value")
+        }
+    }
+    var deps = []
+    for (d in jarr(file, "dependencies")) {
+        deps.append({
+            "projectId": jstr(d, "modId"),
+            "versionId": "",
+            "fileName": "",
+            "dependencyType": cfRelation(jint(d, "relationType", 0))
+        })
+    }
+    var releaseType = "release"
+    if (jint(file, "releaseType", 1) == 2) {
+        releaseType = "beta"
+    }
+    if (jint(file, "releaseType", 1) == 3) {
+        releaseType = "alpha"
+    }
+    var display = jstr(file, "displayName")
+    if (display == "") {
+        display = jstr(file, "fileName")
+    }
+    return {
+        "id": jstr(file, "id"),
+        "projectId": jstr(file, "modId"),
+        "name": display,
+        "versionNumber": display,
+        "gameVersions": gameVersions,
+        "loaders": loaders,
+        "releaseType": releaseType,
+        "fileName": jstr(file, "fileName"),
+        "downloadUrl": cfDownloadUrl(file),
+        "sha1": sha1,
+        "md5": md5,
+        "size": jint(file, "fileLength", 0),
+        "datePublished": jstr(file, "fileDate"),
+        "dependencies": deps
+    }
+}
+
+method cfVersions(string projectId, string gameVersion, string loader): array {
+    var url = "/v1/mods/" + urlEncode(projectId) + "/files?pageSize=50"
+    if (gameVersion != "") {
+        url = url + "&gameVersion=" + urlEncode(gameVersion)
+    }
+    if (loader != "" && cfLoaderType(loader) > 0) {
+        url = url + "&modLoaderType=" + cfLoaderType(loader)
+    }
+    var out = []
+    for (file in jarr(cfGet(url), "data")) {
+        out.append(cfVersion(file))
+    }
+    return out
+}
+
+method cfVersionById(string fileId): map<string, object> {
+    if (isDigits(fileId) == false) {
+        core.badRequest("a CurseForge version id is a number")
+    }
+    var file = jobj(cfGet("/v1/files/" + fileId), "data")
+    if (file.length() == 0) {
+        core.notFound("CurseForge file '" + fileId + "' not found")
+    }
+    return cfVersion(file)
+}
+
+// Bulk lookup of file objects by id, in batches of 200.
+method cfFilesById(array fileIds): map<string, object> {
+    var out = {}
+    var i = 0
+    while (i < fileIds.length()) {
+        var batch = pageOf(fileIds, i, 200)
+        for (file in jarr(cfPost("/v1/mods/files", {"fileIds": batch}), "data")) {
+            out[jstr(file, "id")] = file
+        }
+        i = i + 200
+    }
+    return out
+}
+
+// Bulk lookup of project objects by id, in batches of 200.
+method cfModsById(array modIds): map<string, object> {
+    var out = {}
+    var i = 0
+    while (i < modIds.length()) {
+        var batch = pageOf(modIds, i, 200)
+        for (mod in jarr(cfPost("/v1/mods", {"modIds": batch}), "data")) {
+            out[jstr(mod, "id")] = mod
+        }
+        i = i + 200
+    }
+    return out
+}
+
+// The project ids CurseForge knows for these file fingerprints.
+method cfProjectsByFingerprint(array fingerprints): array {
+    var out = []
+    if (fingerprints.length() == 0) {
+        return out
+    }
+    var data = jobj(cfPost("/v1/fingerprints", {"fingerprints": fingerprints}), "data")
+    for (match in jarr(data, "exactMatches")) {
+        var pid = jstr(match, "id")
+        if (pid == "") {
+            pid = jstr(jobj(match, "file"), "modId")
+        }
+        if (pid != "" && out.contains(pid) == false) {
+            out.append(pid)
+        }
+    }
+    return out
+}

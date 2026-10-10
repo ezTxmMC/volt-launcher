@@ -1,0 +1,415 @@
+package providers
+
+import core
+import json
+import os
+import path
+
+// The modpack lifecycle of a profile (see docs/ARCHITECTURE.md, "Inhalte und Modpacks"):
+//
+//   GET  /api/profiles/:id/modpack                 {linked, modpack, provider, projectId, name, versionId, versionNumber,
+//                                                   updateAvailable, latestVersionId, latestVersionNumber, latestReleaseDate, reason}
+//   GET  /api/profiles/:id/modpack/versions        {versions: [ProjectVersion]} (newest first)
+//   POST /api/profiles/:id/modpack/update          {versionId?} -> 202 Job (result {profileId, versionId, installed, removed})
+//   POST /api/profiles/:id/modpack/connect         {provider, projectId, versionId} -> 200 status   (connect.nv)
+//   POST /api/profiles/:id/modpack/disconnect      -> 200 status                                    (connect.nv)
+//   POST /api/modpacks/import                      {path, name?} -> 202 Job (result {profileId})
+//
+// The backup that the setting backupBeforePackUpdate asks for is taken by the
+// caller (the UI calls POST /api/profiles/:id/backups first); this module does not
+// depend on the gamedata module.
+//
+// Updates work for Modrinth and CurseForge packs. The content files a release
+// wrote are listed in <gameDir>/.volt/pack-files.json; an update deletes the ones
+// the new release no longer ships. Worlds, configs and everything the user added
+// stay. Imported packs have no upstream release, so they cannot be updated.
+
+// --- the pack record ------------------------------------------------------------------
+
+method packRecordFile(string gameDir): string {
+    return path.join(gameDir, ".volt", "pack-files.json")
+}
+
+// Writes the pack record; "" or the error text. Never raises.
+method writePackRecordText(string gameDir, string versionId, array files): string {
+    return core.writeFileAtomic(packRecordFile(gameDir), json.pretty({"versionId": versionId, "files": files}) + "\n")
+}
+
+// Remembers the installed release and the content files it wrote ({versionId, files}).
+method writePackRecord(string gameDir, string versionId, array files) {
+    var error = writePackRecordText(gameDir, versionId, files)
+    if (error != "") {
+        core.logWarn("providers: cannot record the pack files in " + gameDir + ": " + error)
+    }
+}
+
+// Deletes the pack record of a game directory (disconnect); "" or the error text.
+// A missing record is not an error. The files it names stay.
+method removePackRecord(string gameDir): string {
+    var file = packRecordFile(gameDir)
+    if (os.isFile(file) == false) {
+        return ""
+    }
+    if (os.remove(file) == false) {
+        return "cannot remove " + file
+    }
+    return ""
+}
+
+// The pack record of a game directory; empty when the profile never recorded one.
+method readPackRecord(string gameDir): map<string, object> {
+    var stored = core.readJsonFile(packRecordFile(gameDir), {})
+    var files = []
+    var versionId = ""
+    if (core.isMap(stored)) {
+        if (stored.has("versionId") && core.isString(stored["versionId"])) {
+            versionId = stored["versionId"]
+        }
+        if (stored.has("files") && core.isArray(stored["files"])) {
+            for (f in stored["files"]) {
+                if (core.isString(f)) {
+                    files.append(f)
+                }
+            }
+        }
+    }
+    return {"versionId": versionId, "files": files}
+}
+
+// Deletes the files of `previous` that `kept` does not contain (with their
+// .disabled twins). Returns the game-relative paths removed.
+method dropStaleFiles(string gameDir, array previous, array kept): array {
+    var keep = {}
+    for (rel in kept) {
+        keep[rel.toLower()] = true
+    }
+    var removed = []
+    for (rel in previous) {
+        if (keep.has(rel.toLower())) {
+            continue
+        }
+        var clean = safeRelative(rel)
+        if (clean == "") {
+            continue
+        }
+        var file = path.join(gameDir, clean)
+        if (os.isFile(file) == false) {
+            continue
+        }
+        if (os.remove(file)) {
+            removed.append(clean)
+            if (os.isFile(file + ".disabled")) {
+                os.remove(file + ".disabled")
+            }
+        }
+    }
+    return removed
+}
+
+// --- versions -------------------------------------------------------------------------
+
+// Every release of the pack's project, newest first. Not for imported packs (no project).
+method packVersions(string provider, string projectId): array {
+    var list = versions(provider, projectId, {})
+    return sortByTextDesc(list, "datePublished")
+}
+
+define class PvPackVersionsTask {
+    private string provider: get, set
+    private string projectId: get, set
+
+    method run(): object {
+        return packVersions(provider, projectId)
+    }
+}
+
+// The newest release of the pack's project, or null.
+method latestPackVersion(string provider, string projectId): object {
+    var list = packVersions(provider, projectId)
+    if (list.length() == 0) {
+        return core.none()
+    }
+    return list[0]
+}
+
+// The source of a profile's pack ({provider, projectId, versionId, ...}), or null.
+method packSourceOf(map<string, object> profile): object {
+    var source = profile["source"]
+    if (core.isMap(source) == false) {
+        return core.none()
+    }
+    return source
+}
+
+// Whether the pack of this source can be checked and updated.
+method packUpdatable(object source): string {
+    if (jstr(source, "projectId") == "") {
+        return "Imported packs have no upstream release to check against."
+    }
+    var provider = jstr(source, "provider")
+    if (provider != "modrinth" && provider != "curseforge") {
+        return providerName(provider) + " packs cannot be updated yet."
+    }
+    return ""
+}
+
+// The status of a profile that has no pack source.
+method unlinkedStatus(string reason): map<string, object> {
+    return {"linked": false, "modpack": core.none(), "updateAvailable": false, "latestVersionId": "", "latestVersionNumber": "", "latestReleaseDate": "", "reason": reason}
+}
+
+// The status of a linked profile. `list` is the provider's releases of the pack, newest first
+// (empty when the provider cannot tell). The release the profile runs gives versionNumber;
+// Technic and FTB name their build or release as the version (see packFallbackSource).
+method linkedStatus(map<string, object> source, array list, string reason): map<string, object> {
+    var provider = jstr(source, "provider")
+    var versionId = jstr(source, "versionId")
+    var versionNumber = ""
+    if (provider == "technic" || provider == "ftb") {
+        versionNumber = versionId
+    }
+    var latestId = ""
+    var latestNumber = ""
+    var latestDate = ""
+    if (list.length() > 0) {
+        latestId = jstr(list[0], "id")
+        latestNumber = jstr(list[0], "versionNumber")
+        latestDate = jstr(list[0], "datePublished")
+    }
+    for (release in list) {
+        if (versionId != "" && jstr(release, "id") == versionId) {
+            versionNumber = jstr(release, "versionNumber")
+        }
+    }
+    var available = latestId != "" && latestId != versionId
+    return {
+        "linked": true,
+        "modpack": source,
+        "provider": provider,
+        "projectId": jstr(source, "projectId"),
+        "name": jstr(source, "name"),
+        "versionId": versionId,
+        "versionNumber": versionNumber,
+        "updateAvailable": available,
+        "latestVersionId": latestId,
+        "latestVersionNumber": latestNumber,
+        "latestReleaseDate": latestDate,
+        "reason": reason
+    }
+}
+
+// GET /api/profiles/:id/modpack
+method modpackStatus(string profileId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var source = packSourceOf(profile)
+    if (core.isNull(source)) {
+        return unlinkedStatus("This profile is not linked to a modpack.")
+    }
+    var reason = packUpdatable(source)
+    var list = []
+    if (reason == "") {
+        var outcome = core.runTrapped(PvPackVersionsTask{provider = jstr(source, "provider"), projectId = jstr(source, "projectId")})
+        if (outcome.failed()) {
+            reason = "Could not reach " + providerName(jstr(source, "provider")) + " to check for updates: " + failureMessage(outcome.error())
+        } else {
+            list = outcome.result()
+        }
+    }
+    return linkedStatus(source, list, reason)
+}
+
+// GET /api/profiles/:id/modpack/versions
+method modpackVersions(string profileId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var source = packSourceOf(profile)
+    if (core.isNull(source) || packUpdatable(source) != "") {
+        return {"versions": []}
+    }
+    return {"versions": packVersions(jstr(source, "provider"), jstr(source, "projectId"))}
+}
+
+// --- update ------------------------------------------------------------------------------
+
+// POST /api/profiles/:id/modpack/update: 202 with a job; versionId or the newest release.
+method modpackUpdate(string profileId, object body): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var source = packSourceOf(profile)
+    if (core.isNull(source)) {
+        core.badRequest("This profile was not created from a modpack.")
+    }
+    var reason = packUpdatable(source)
+    if (reason != "") {
+        core.badRequest(reason)
+    }
+    var provider = jstr(source, "provider")
+    var projectId = jstr(source, "projectId")
+    if (provider == "curseforge") {
+        requireBridge()
+    }
+    var target = ""
+    if (core.isMap(body)) {
+        target = bodyText(body, "versionId")
+    }
+    if (target == "") {
+        var latest = latestPackVersion(provider, projectId)
+        if (core.isNull(latest)) {
+            core.notFound("no release of this pack is available")
+        }
+        target = jstr(latest, "id")
+    }
+    if (target == jstr(source, "versionId")) {
+        core.conflict("this profile already runs release '" + target + "'")
+    }
+    if (busyWith(profileId) != "") {
+        core.conflict("profile '" + profileId + "' is busy (" + busyWith(profileId) + ")")
+    }
+    var job = PvPackUpdateJob{profileId = profileId, provider = provider, projectId = projectId, versionId = target}
+    return core.respond(202, core.startJob("pack-update", "Aktualisiere " + profile["name"], job))
+}
+
+// The update itself: fetch and install the release into the existing profile,
+// then delete what the old release installed and the new one does not.
+method applyPackUpdate(string jobId, string profileId, string provider, string projectId, string versionId): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var gameDir = core.profileDir(profileId)
+    var previous = readPackRecord(gameDir)
+    var staging = stagingDir(jobId)
+    var state = newPackState(profileId, true, "")
+    var outcome = core.runTrapped(PvPackTask{
+        jobId = jobId, provider = provider, projectId = projectId, versionId = versionId,
+        staging = staging, state = state
+    })
+    os.removeAll(staging)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    var removed = dropStaleFiles(gameDir, previous["files"], state.files())
+    writePackRecord(gameDir, versionId, state.files())
+    core.logInfo("modpack update " + profileId + ": " + previous["versionId"] + " -> " + versionId + ", removed " + removed.length() + " file(s)")
+    core.jobProgress(jobId, 1.0, "Modpack aktualisiert")
+    return {"profileId": profileId, "versionId": versionId, "installed": state.files().length(), "removed": removed}
+}
+
+define class PvPackUpdateTask {
+    private string jobId: get, set
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+
+    method run(): object {
+        return applyPackUpdate(jobId, profileId, provider, projectId, versionId)
+    }
+}
+
+define class PvPackUpdateJob based JobBody {
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+
+    method execute(string jobId): object {
+        claimBusy(profileId, "pack-update")
+        var outcome = core.runTrapped(PvPackUpdateTask{
+            jobId = jobId, profileId = profileId, provider = provider,
+            projectId = projectId, versionId = versionId
+        })
+        releaseBusy(profileId)
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+// --- import -------------------------------------------------------------------------------
+
+// Whether some entry of the zip ends with `suffix`.
+method zipHasEnding(PvZip zip, string suffix): bool {
+    for (entry in zip.entries()) {
+        if (entry.directory() == false && entry.name().endsWith(suffix)) {
+            return true
+        }
+    }
+    return false
+}
+
+// Creates a profile from a pack archive on disk. The format is read from the
+// archive, not the extension: a Modrinth .mrpack, a CurseForge zip or a Technic client zip.
+method importPackArchive(string jobId, string file, string name, PvPackState state) {
+    var zip = zipOpenFile(file, "the pack archive")
+    if (core.isNull(zipFind(zip, "modrinth.index.json")) == false) {
+        applyModrinthArchive(jobId, file, "", "", "", state)
+        return
+    }
+    if (core.isNull(zipFind(zip, "manifest.json")) == false) {
+        applyCurseForgeArchive(jobId, file, "", "", "", state)
+        return
+    }
+    if (zipHasEnding(zip, "bin/version.json") || zipHasEnding(zip, "bin/modpack.jar")) {
+        // A Technic zip names nothing inside but its folder: the file name is the fallback.
+        var stem = path.basename(file)
+        if (stem.endsWith(".zip")) {
+            stem = stem.substring(0, stem.length() - 4)
+        }
+        var technicName = name
+        if (technicName == "") {
+            technicName = stem
+        }
+        applyTechnicArchive(jobId, file, technicName, "", "", "", state)
+        return
+    }
+    core.badRequest("Not a supported modpack: " + path.basename(file) + ". Expected a Modrinth .mrpack, a CurseForge .zip export or a Technic client zip.")
+}
+
+define class PvImportTask {
+    private string jobId: get, set
+    private string file: get, set
+    private string name: get, set
+    private PvPackState state: get, set
+
+    method run(): object {
+        importPackArchive(jobId, file, name, state)
+        return true
+    }
+}
+
+define class PvImportJob based JobBody {
+    private string file: get, set
+    private string name: get, set
+
+    method execute(string jobId): object {
+        var state = newPackState("", false, name)
+        var outcome = core.runTrapped(PvImportTask{jobId = jobId, file = file, name = name, state = state})
+        var profileId = state.profileId()
+        releaseBusy(profileId)
+        if (outcome.failed()) {
+            if (profileId != "") {
+                var removed = core.runTrapped(PvDeleteProfileTask{profileId = profileId})
+                if (removed.failed()) {
+                    core.logWarn("import " + jobId + ": cannot remove profile " + profileId + ": " + removed.error())
+                }
+            }
+            core.raise(outcome.error())
+        }
+        writePackRecord(core.profileDir(profileId), "", state.files())
+        return {"profileId": profileId}
+    }
+}
+
+// POST /api/modpacks/import: {path, name?}
+method modpackImport(object body): map<string, object> {
+    if (core.isMap(body) == false) {
+        core.badRequest("expected a JSON object {path, name?}")
+    }
+    var file = bodyText(body, "path")
+    if (file == "") {
+        core.badRequest("'path' is required")
+    }
+    if (os.isFile(file) == false) {
+        core.notFound("pack file not found: " + file)
+    }
+    var name = bodyText(body, "name")
+    var title = "Importiere " + path.basename(file)
+    return core.respond(202, core.startJob("pack-import", title, PvImportJob{file = file, name = name}))
+}

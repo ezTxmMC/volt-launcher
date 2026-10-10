@@ -1,0 +1,295 @@
+package main
+
+import accounts
+import core
+import json
+import launch
+import os
+import path
+
+// Unit tests of the quick play part of the launch module: the validation of the launch body,
+// the version rules, and the game arguments for a 1.21 version (quick play placeholders) and a
+// 1.16 version (--server/--port). quickplay-test.sh writes the version metadata fixtures
+// (1.21.1.json, 1.16.5.json) into a temporary directory and compiles this against src/core,
+// src/accounts and src/launch. Usage: quickplay-unit <fixtureDir> <dataDir>
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+// A failure of a trapped task as "<status> <code>", or "" when it succeeded.
+method failureOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    var decoded = core.decodeFailure(outcome.error())
+    return "" + decoded["status"] + " " + decoded["code"]
+}
+
+// The message of a trapped failure, or "" when the task succeeded.
+method messageOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["message"]
+}
+
+// The value of a trapped task when it succeeded.
+method resultOf(object task): object {
+    var outcome = core.runTrapped(task)
+    return outcome.result()
+}
+
+// Whether any argument still has a placeholder in it.
+method hasLiteralPlaceholder(array list): bool {
+    for (arg in list) {
+        if (arg.contains("$" + "{")) {
+            return true
+        }
+    }
+    return false
+}
+
+// The index of an argument, or -1.
+method indexOfArg(array list, string wanted): integer {
+    var i = 0
+    for (arg in list) {
+        if (arg == wanted) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+define class RequestTask {
+    private object body: get, set
+
+    method run(): object {
+        return launch.launchQuickPlayRequest(body)
+    }
+}
+
+define class BuildTask {
+    private map<string, object> profile: get, set
+    private map<string, object> install: get, set
+    private map<string, object> quick: get, set
+
+    method run(): object {
+        return launch.launchBuildCommandQuick(profile, install, "/usr/bin/java", quick)
+    }
+}
+
+define class PlainBuildTask {
+    private map<string, object> profile: get, set
+    private map<string, object> install: get, set
+
+    method run(): object {
+        return launch.launchBuildCommand(profile, install, "/usr/bin/java")
+    }
+}
+
+define class MetaCheckTask {
+    private map<string, object> meta: get, set
+    private map<string, object> quick: get, set
+
+    method run(): object {
+        launch.launchQuickCheckMeta(meta, quick)
+        return true
+    }
+}
+
+// The install map the launch uses, with the metadata of one fixture version.
+method installOf(map<string, object> meta): map<string, object> {
+    return {
+        "versionId": meta["id"],
+        "meta": meta,
+        "classpath": ["/libs/a.jar", "/versions/client.jar"],
+        "assetsDir": "/assets",
+        "assetIndex": "16",
+        "nativesDir": "/natives",
+        "librariesDir": "/libs"
+    }
+}
+
+// A Microsoft store entry with tokens that only exist in this test.
+method fakeMicrosoft(string id, string name, integer expiresIn, string refresh): map<string, object> {
+    var now = os.time()
+    return {
+        "type": "microsoft",
+        "id": id,
+        "name": name,
+        "xuid": "2535000000000001",
+        "userHash": "FAKEUHS",
+        "minecraftToken": "FAKEMCTOKEN-" + name,
+        "minecraftExpiresAt": now + expiresIn,
+        "microsoftToken": "FAKEMSTOKEN-" + name,
+        "microsoftExpiresAt": now + expiresIn,
+        "microsoftRefresh": refresh
+    }
+}
+
+method requestBody(object quick): map<string, object> {
+    return {"quickPlay": quick}
+}
+
+method main(array<string> arguments): integer {
+    var fixtures = arguments[0]
+    var dataDir = arguments[1]
+    core.init(dataDir, false)
+    var fakeId = "0123abcd-0000-4000-8000-00000000f00d"
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "QuickPlay", 7200, "FAKEREFRESH-Quick"), "select": true})
+
+    var meta121 = json.parse(os.readFile(path.join(fixtures, "1.21.1.json")))
+    var meta116 = json.parse(os.readFile(path.join(fixtures, "1.16.5.json")))
+    var profile = {"id": "a1b2c3d4e5f6", "name": "Quick", "memoryMb": core.none(), "jvmArgs": ""}
+    var install121 = installOf(meta121)
+    var install116 = installOf(meta116)
+
+    // --- the server address
+    var goodServers = ["example.org", "example.org:25565", "[::1]:19132", "[2001:db8::1]", "a-b_c.d:1", "host:65535", "10.0.0.5:8"]
+    for (server in goodServers) {
+        check("server '" + server + "' is accepted", launch.launchParseServer(server).has("host"))
+    }
+    var badServers = ["", "a b", "a/b", "host:", "host:0", "host:65536", "host:99999", "host:port", "host:-1", ":25565", "a:b:c", "[::1", "[]", "[zz]", "[::1]x", "[::1]:", "host@x", "ho st", "[host]"]
+    for (server in badServers) {
+        check("server '" + server + "' is refused", launch.launchParseServer(server).has("host") == false)
+    }
+    var longName = ""
+    var i = 0
+    while (i < 256) {
+        longName = longName + "a"
+        i = i + 1
+    }
+    check("a 255 character server is accepted", launch.launchParseServer(longName.substring(0, 255)).has("host"))
+    check("a 256 character server is refused", launch.launchParseServer(longName).has("host") == false)
+    var split = launch.launchParseServer("[::1]:19132")
+    check("IPv6 host keeps its brackets and the port is split", split["host"] == "[::1]" && split["port"] == "19132" && split["hasPort"] == true)
+
+    // --- the launch body (route): every 400 case, and the accepted forms
+    var refusedBodies = [
+        requestBody({}),
+        requestBody({"mode": "realms", "server": "a"}),
+        requestBody({"mode": 1}),
+        requestBody("multiplayer"),
+        requestBody({"mode": "multiplayer"}),
+        requestBody({"mode": "multiplayer", "server": ""}),
+        requestBody({"mode": "multiplayer", "server": "a b"}),
+        requestBody({"mode": "multiplayer", "server": "a/b"}),
+        requestBody({"mode": "multiplayer", "server": "host:0"}),
+        requestBody({"mode": "multiplayer", "server": "host:65536"}),
+        requestBody({"mode": "multiplayer", "server": "host:port"}),
+        requestBody({"mode": "singleplayer"}),
+        requestBody({"mode": "singleplayer", "world": ""}),
+        requestBody({"mode": "singleplayer", "world": "   "}),
+        requestBody({"mode": "singleplayer", "world": "."}),
+        requestBody({"mode": "singleplayer", "world": ".."}),
+        requestBody({"mode": "singleplayer", "world": "a/b"}),
+        requestBody({"mode": "singleplayer", "world": "a\\b"}),
+        requestBody({"mode": "singleplayer", "world": "x..y"}),
+        requestBody({"mode": "singleplayer", "world": 7})
+    ]
+    var refusedCount = 0
+    for (body in refusedBodies) {
+        if (failureOf(RequestTask{body = body}) == "400 bad_request") {
+            refusedCount = refusedCount + 1
+        }
+    }
+    check("every invalid quickPlay body is 400 bad_request (" + refusedCount + " of " + refusedBodies.length() + ")", refusedCount == refusedBodies.length())
+    check("the quickPlay object message names the field", messageOf(RequestTask{body = requestBody({"mode": "multiplayer"})}).contains("quickPlay.server"))
+
+    var acceptedMulti = resultOf(RequestTask{body = requestBody({"mode": "multiplayer", "server": "example.org:25565"})})
+    check("a multiplayer body is kept as mode and server", acceptedMulti["mode"] == "multiplayer" && acceptedMulti["server"] == "example.org:25565")
+    var acceptedSingle = resultOf(RequestTask{body = requestBody({"mode": "singleplayer", "world": "My World"})})
+    check("a singleplayer body is kept as mode and world", acceptedSingle["mode"] == "singleplayer" && acceptedSingle["world"] == "My World")
+    check("no body means no quick play", resultOf(RequestTask{body = core.none()}).has("mode") == false)
+    check("a body without quickPlay means no quick play", resultOf(RequestTask{body = {"other": 1}}).has("mode") == false)
+    check("quickPlay null means no quick play", resultOf(RequestTask{body = {"quickPlay": core.none()}}).has("mode") == false)
+    check("a body that is not a JSON object means no quick play", resultOf(RequestTask{body = [1]}).has("mode") == false)
+
+    // --- the version rules (by name, and by the metadata)
+    check("1.21.1 supports quick play by name", launch.launchQuickByVersion("1.21.1") == "yes")
+    check("1.20 supports quick play by name", launch.launchQuickByVersion("1.20") == "yes")
+    check("1.19.4 does not support quick play by name", launch.launchQuickByVersion("1.19.4") == "no")
+    check("1.16.5 does not support quick play by name", launch.launchQuickByVersion("1.16.5") == "no")
+    check("23w14a supports quick play by name", launch.launchQuickByVersion("23w14a") == "yes")
+    check("23w13a does not support quick play by name", launch.launchQuickByVersion("23w13a") == "no")
+    check("22w45a does not support quick play by name", launch.launchQuickByVersion("22w45a") == "no")
+    check("b1.7.3 is left to the metadata", launch.launchQuickByVersion("b1.7.3") == "")
+    check("a missing version name is left to the metadata", launch.launchQuickByVersion(core.none()) == "")
+    check("the metadata of 1.21.1 has the quick play rule", launch.launchMetaQuickPlay(meta121) == true)
+    check("the metadata of 1.16.5 has no quick play rule", launch.launchMetaQuickPlay(meta116) == false)
+
+    // --- 1.21.1: quick play placeholders and feature rules
+    var multi121 = {"mode": "multiplayer", "server": "play.example.net:19132"}
+    var single121 = {"mode": "singleplayer", "world": "My World"}
+    var command121 = resultOf(BuildTask{profile = profile, install = install121, quick = multi121})
+    var joined121 = command121.join(" ")
+    var mpAt = indexOfArg(command121, "--quickPlayMultiplayer")
+    check("1.21.1 multiplayer: --quickPlayMultiplayer carries the server", mpAt >= 0 && command121[mpAt + 1] == "play.example.net:19132")
+    var pathAt = indexOfArg(command121, "--quickPlayPath")
+    check("1.21.1 multiplayer: --quickPlayPath is a file under the game directory", pathAt >= 0 && command121[pathAt + 1].contains("quickPlay") && command121[pathAt + 1].endsWith("quickplay.json"))
+    check("1.21.1 multiplayer: no singleplayer argument", indexOfArg(command121, "--quickPlaySingleplayer") < 0)
+    check("1.21.1 multiplayer: no --server (quick play is native)", indexOfArg(command121, "--server") < 0)
+    check("1.21.1 multiplayer: no realms argument", indexOfArg(command121, "--quickPlayRealms") < 0)
+    check("1.21.1 multiplayer: no literal placeholder is left", hasLiteralPlaceholder(command121) == false)
+    check("1.21.1 multiplayer: the quick play arguments come after the game arguments", mpAt > indexOfArg(command121, "--xuid"))
+    check("1.21.1 multiplayer: the launch log names the server", launch.launchMaskedCommand(command121).contains("--quickPlayMultiplayer play.example.net:19132"))
+    check("1.21.1 multiplayer: the log label", launch.launchQuickLabel(multi121) == "multiplayer play.example.net:19132")
+
+    var command121s = resultOf(BuildTask{profile = profile, install = install121, quick = single121})
+    var spAt = indexOfArg(command121s, "--quickPlaySingleplayer")
+    check("1.21.1 singleplayer: --quickPlaySingleplayer carries the world as one argument", spAt >= 0 && command121s[spAt + 1] == "My World")
+    check("1.21.1 singleplayer: no multiplayer argument", indexOfArg(command121s, "--quickPlayMultiplayer") < 0 && indexOfArg(command121s, "--server") < 0)
+    check("1.21.1 singleplayer: no literal placeholder is left", hasLiteralPlaceholder(command121s) == false)
+    check("1.21.1 singleplayer: the log label", launch.launchQuickLabel(single121) == "singleplayer My World")
+    check("1.21.1 singleplayer: the check of the metadata passes", failureOf(MetaCheckTask{meta = meta121, quick = single121}) == "")
+
+    // --- no quick play: the arguments are the ones before quick play existed
+    var plain121 = resultOf(PlainBuildTask{profile = profile, install = install121})
+    var empty121 = resultOf(BuildTask{profile = profile, install = install121, quick = {}})
+    check("1.21.1 without quick play: no quick play argument", indexOfArg(plain121, "--quickPlayMultiplayer") < 0 && indexOfArg(plain121, "--quickPlaySingleplayer") < 0 && indexOfArg(plain121, "--quickPlayPath") < 0)
+    check("1.21.1 without quick play: no literal placeholder is left", hasLiteralPlaceholder(plain121) == false)
+    check("1.21.1 without quick play: the same as an empty request", json.stringify(plain121) == json.stringify(empty121))
+
+    // --- 1.16.5: --server and --port after the game arguments
+    var command116 = resultOf(BuildTask{profile = profile, install = install116, quick = {"mode": "multiplayer", "server": "mc.example.org"}})
+    var joined116 = command116.join(" ")
+    check("1.16.5 multiplayer: ends with --server and --port 25565", joined116.endsWith("--server mc.example.org --port 25565"))
+    check("1.16.5 multiplayer: the server arguments come after the game arguments", indexOfArg(command116, "--server") > indexOfArg(command116, "--xuid"))
+    check("1.16.5 multiplayer: no quick play argument", indexOfArg(command116, "--quickPlayMultiplayer") < 0 && indexOfArg(command116, "--quickPlayPath") < 0)
+    check("1.16.5 multiplayer: no literal placeholder is left", hasLiteralPlaceholder(command116) == false)
+    var command116p = resultOf(BuildTask{profile = profile, install = install116, quick = {"mode": "multiplayer", "server": "mc.example.org:19132"}})
+    check("1.16.5 multiplayer: a port is taken from the address", command116p.join(" ").endsWith("--server mc.example.org --port 19132"))
+    var command116v6 = resultOf(BuildTask{profile = profile, install = install116, quick = {"mode": "multiplayer", "server": "[::1]:25566"}})
+    check("1.16.5 multiplayer: an IPv6 address keeps its brackets", command116v6.join(" ").endsWith("--server [::1] --port 25566"))
+    var fullscreenProfile = {"id": "a1b2c3d4e5f6", "name": "Quick", "memoryMb": core.none(), "jvmArgs": "", "fullscreen": true}
+    var command116f = resultOf(BuildTask{profile = fullscreenProfile, install = install116, quick = {"mode": "multiplayer", "server": "mc.example.org"}})
+    check("1.16.5 multiplayer: --fullscreen stays last", command116f.join(" ").endsWith("--server mc.example.org --port 25565 --fullscreen"))
+    var plain116 = resultOf(PlainBuildTask{profile = profile, install = install116})
+    check("1.16.5 without quick play: no server arguments", indexOfArg(plain116, "--server") < 0 && indexOfArg(plain116, "--port") < 0)
+    check("1.16.5 multiplayer: the log label", launch.launchQuickLabel({"mode": "multiplayer", "server": "mc.example.org"}) == "multiplayer mc.example.org")
+
+    // --- 1.16.5: singleplayer is refused (422 unsupported), in the job and at the build
+    var refused116 = failureOf(MetaCheckTask{meta = meta116, quick = single121})
+    check("1.16.5 singleplayer: refused with 422 unsupported", refused116 == "422 unsupported")
+    check("1.16.5 singleplayer: the message says so", messageOf(MetaCheckTask{meta = meta116, quick = single121}).contains("cannot open a world from the command line"))
+    check("1.16.5 singleplayer: the build is refused too", failureOf(BuildTask{profile = profile, install = install116, quick = single121}) == "422 unsupported")
+
+    println "quickplay unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures > 0) {
+        return 1
+    }
+    return 0
+}

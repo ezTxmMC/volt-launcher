@@ -1,0 +1,316 @@
+package providers
+
+import core
+
+// Feed the Beast. api.feed-the-beast.com serves the same documents as the
+// old api.modpacks.ch, which no longer knows current releases ("Version id
+// not valid."), plus a hash map (sha1/sha256/sha512) per file. Searches
+// return bare pack ids; documents are looked up at most 8 at a time and
+// cached.
+
+private final FTB_API = "https://api.feed-the-beast.com/v1/modpacks/public"
+private final FTB_LIST_SIZE = 200
+
+method ftbHeaders(): map<string, string> {
+    return {"Accept": "application/json"}
+}
+
+method ftbRequireSuccess(object doc, string what) {
+    if (core.isMap(doc) == false) {
+        core.upstream("FTB returned nothing for " + what)
+    }
+    var status = jstr(doc, "status")
+    if (status != "" && status.toLower() != "success") {
+        var message = jstr(doc, "message")
+        if (message.toLower().contains("not found")) {
+            core.notFound(what + " not found on FTB")
+        }
+        core.upstream(what + " is not available on FTB: " + message)
+    }
+}
+
+method ftbPackId(string value): string {
+    var id = value.trim()
+    var colon = id.indexOf(":")
+    if (colon >= 0) {
+        id = id.substring(0, colon)
+    }
+    if (isDigits(id) == false) {
+        core.badRequest("an FTB pack id is a number")
+    }
+    return id
+}
+
+// The pack document (cached 5 minutes).
+method ftbPack(string value): map<string, object> {
+    var id = ftbPackId(value)
+    var key = "ftb:pack:" + id
+    var cached = cacheGet(key)
+    if (core.isNull(cached) == false) {
+        return cached
+    }
+    var doc = getJson(FTB_API + "/modpack/" + id, ftbHeaders())
+    ftbRequireSuccess(doc, "FTB pack " + id)
+    cachePut(key, doc)
+    return doc
+}
+
+// The release document with its file list.
+method ftbRelease(string packId, string versionId): map<string, object> {
+    var pack = ftbPackId(packId)
+    var ver = versionId.trim()
+    var colon = ver.indexOf(":")
+    if (colon >= 0) {
+        ver = ver.substring(colon + 1, ver.length())
+    }
+    if (isDigits(ver) == false) {
+        core.badRequest("an FTB version id is a number")
+    }
+    var doc = getJson(FTB_API + "/modpack/" + pack + "/" + ver, ftbHeaders())
+    ftbRequireSuccess(doc, "FTB release " + pack + "/" + ver)
+    return doc
+}
+
+// {gameVersions, loaders: [{name, version}]} of a targets block.
+method ftbTargets(object release): map<string, object> {
+    var games = []
+    var loaders = []
+    for (t in jarr(release, "targets")) {
+        var type = jstr(t, "type").toLower()
+        var name = jstr(t, "name").toLower()
+        var version = jstr(t, "version")
+        if (type == "game" || name == "minecraft") {
+            if (version != "") {
+                games.append(version)
+            }
+        } else if (type == "modloader" && name != "") {
+            loaders.append({"name": name, "version": version})
+        }
+    }
+    return {"gameVersions": games, "loaders": loaders}
+}
+
+method ftbArt(object doc): string {
+    var fallback = ""
+    for (image in jarr(doc, "art")) {
+        var u = jstr(image, "url")
+        if (u == "") {
+            continue
+        }
+        if (jstr(image, "type").toLower() == "square") {
+            return u
+        }
+        if (fallback == "") {
+            fallback = u
+        }
+    }
+    return fallback
+}
+
+method ftbSummary(object doc): map<string, object> {
+    var tags = []
+    for (t in jarr(doc, "tags")) {
+        if (jstr(t, "name") != "") {
+            tags.append(jstr(t, "name"))
+        }
+    }
+    var author = ""
+    var authors = jarr(doc, "authors")
+    if (authors.length() > 0) {
+        author = jstr(authors[0], "name")
+    }
+    var gameVersions = []
+    var loaders = []
+    for (v in jarr(doc, "versions")) {
+        var targets = ftbTargets(v)
+        for (g in targets["gameVersions"]) {
+            if (gameVersions.contains(g) == false) {
+                gameVersions.append(g)
+            }
+        }
+        for (l in targets["loaders"]) {
+            if (loaders.contains(l["name"]) == false) {
+                loaders.append(l["name"])
+            }
+        }
+    }
+    var id = jstr(doc, "id")
+    return {
+        "provider": "ftb",
+        "id": id,
+        "slug": jstr(doc, "slug"),
+        "name": jstr(doc, "name"),
+        "summary": jstr(doc, "synopsis"),
+        "iconUrl": ftbArt(doc),
+        "author": author,
+        "downloads": jint(doc, "installs", 0),
+        "follows": jint(doc, "plays", 0),
+        "kind": "modpack",
+        "categories": tags,
+        "loaders": loaders,
+        "gameVersions": gameVersions,
+        "updated": isoFromEpoch(jint(doc, "updated", 0))
+    }
+}
+
+define class FtbPackTask {
+    private string packId: get, set
+
+    method run(): object {
+        return ftbPack(packId)
+    }
+}
+
+// The documents of these ids, in order; packs whose lookup fails (delisted) are left out.
+method ftbPacks(array ids): array {
+    var tasks = []
+    for (id in ids) {
+        tasks.append(FtbPackTask{packId = id})
+    }
+    var outcomes = runParallel(tasks, PV_MAX_PARALLEL, "")
+    var out = []
+    for (outcome in outcomes) {
+        if (outcome.failed() == false) {
+            out.append(outcome.result())
+        }
+    }
+    return out
+}
+
+// Sorts: installs (downloads), plays (follows), updated; relevance (the default) keeps
+// the order of FTB's list or search. FTB's lists are only approximately ordered (the
+// pack documents are the truth), so every sort other than relevance reads the documents
+// of the candidates (cached) and sorts them. The lists choose the candidates: popular
+// installs, popular plays, updated, or the search matches. gameVersion and loader filter
+// on the version targets of each pack.
+method ftbSearch(string q, string kind, string gameVersion, string loader, integer offset, integer limit, string sort): map<string, object> {
+    if (kind != "modpack") {
+        return emptySearch()
+    }
+    var url = ""
+    if (q != "") {
+        url = FTB_API + "/modpack/search/" + FTB_LIST_SIZE + "?term=" + urlEncode(q)
+    } else if (sort == "follows") {
+        url = FTB_API + "/modpack/popular/plays/" + FTB_LIST_SIZE
+    } else if (sort == "updated") {
+        url = FTB_API + "/modpack/updated/" + FTB_LIST_SIZE
+    } else {
+        url = FTB_API + "/modpack/popular/installs/" + FTB_LIST_SIZE
+    }
+    var response = getJson(url, ftbHeaders())
+    var ids = []
+    for (value in jarr(response, "packs")) {
+        var id = "" + value
+        if (typeOf(value) == "float") {
+            id = "" + core.toInteger(value)
+        }
+        if (isDigits(id) && id != "0" && ids.contains(id) == false) {
+            ids.append(id)
+        }
+    }
+    var filtering = gameVersion != "" || loader != ""
+    var ranked = sort != "relevance"
+    if (filtering == false && ranked == false) {
+        // Page the id list; only the packs on the page are looked up.
+        var items = []
+        for (doc in ftbPacks(pageOf(ids, offset, limit))) {
+            items.append(ftbSummary(doc))
+        }
+        return {"total": ids.length(), "items": items}
+    }
+    // Filters need every document (cached), and paging comes after them.
+    var matching = []
+    for (doc in ftbPacks(ids)) {
+        var s = ftbSummary(doc)
+        var gv = s["gameVersions"]
+        var ld = s["loaders"]
+        if ((gameVersion == "" || gv.contains(gameVersion)) && (loader == "" || ld.contains(loader.toLower()))) {
+            matching.append(s)
+        }
+    }
+    if (ranked) {
+        if (sort == "updated") {
+            matching = sortByTextDesc(matching, "updated")
+        } else if (sort == "follows") {
+            matching = sortByNumberDesc(matching, "follows")
+        } else {
+            matching = sortByNumberDesc(matching, "downloads")
+        }
+    }
+    return {"total": matching.length(), "items": pageOf(matching, offset, limit)}
+}
+
+method ftbProject(string id): map<string, object> {
+    var doc = ftbPack(id)
+    var summary = ftbSummary(doc)
+    var gallery = []
+    for (image in jarr(doc, "art")) {
+        var u = jstr(image, "url")
+        if (u != "" && jstr(image, "type").toLower() != "square") {
+            gallery.append(u)
+        }
+    }
+    var links = {}
+    for (link in jarr(doc, "links")) {
+        var u = jstr(link, "link")
+        var name = jstr(link, "name")
+        if (name == "") {
+            name = jstr(link, "type")
+        }
+        if (u != "" && name != "" && links.has(name.toLower()) == false) {
+            links[name.toLower()] = u
+        }
+    }
+    var body = jstr(doc, "description")
+    if (body == "") {
+        body = jstr(doc, "synopsis")
+    }
+    summary["description"] = body
+    summary["gallery"] = gallery
+    summary["links"] = links
+    return summary
+}
+
+method ftbReleaseType(string value): string {
+    var t = value.trim().toLower()
+    if (t == "alpha" || t == "beta") {
+        return t
+    }
+    return "release"
+}
+
+method ftbVersions(string id, string gameVersion, string loader): array {
+    var doc = ftbPack(id)
+    var packId = jstr(doc, "id")
+    var out = []
+    for (v in jarr(doc, "versions")) {
+        var targets = ftbTargets(v)
+        var loaders = []
+        for (l in targets["loaders"]) {
+            loaders.append(l["name"])
+        }
+        var games = targets["gameVersions"]
+        if (gameVersion != "" && games.contains(gameVersion) == false) {
+            continue
+        }
+        if (loader != "" && loaders.contains(loader.toLower()) == false) {
+            continue
+        }
+        var versionId = jstr(v, "id")
+        out.append({
+            "id": versionId,
+            "projectId": packId,
+            "name": jstr(v, "name"),
+            "versionNumber": jstr(v, "name"),
+            "gameVersions": games,
+            "loaders": loaders,
+            "releaseType": ftbReleaseType(jstr(v, "type")),
+            "fileName": "",
+            "downloadUrl": FTB_API + "/modpack/" + packId + "/" + versionId,
+            "sha1": "",
+            "datePublished": isoFromEpoch(jint(v, "updated", 0)),
+            "dependencies": []
+        })
+    }
+    return sortByTextDesc(out, "datePublished")
+}

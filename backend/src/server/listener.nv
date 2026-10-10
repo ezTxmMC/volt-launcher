@@ -1,0 +1,149 @@
+package server
+
+import bytes
+import io
+import math
+import net
+import os
+import core
+
+// The listener: one poll() loop accepts connections, reads requests, runs
+// the (fast) route handlers and writes the answers. Slow work never runs
+// here - routes hand it to a job (core/jobs.nv), which has its own thread.
+
+final IDLE_POLL_MS = 1000
+final PENDING_POLL_MS = 5
+final CONNECTION_TIMEOUT_SECONDS = 30.0
+
+// Listens on 127.0.0.1:<port> and serves until the process is killed.
+method serve(integer port, string token) {
+    var server = net.listen("127.0.0.1", port)
+    if (server < 0) {
+        core.logError("cannot listen on 127.0.0.1:${port}: ${net.error()}")
+        os.exit(1)
+    }
+    core.logInfo("listening on http://127.0.0.1:${port} (data dir ${core.dataDir()})")
+    println "VOLT_BACKEND_READY port=${port}"
+    io.flush()
+
+    var conns = {}
+    while (true) {
+        var sockets = [server]
+        for (key in conns) {
+            sockets.append(conns[key].fd())
+        }
+        var timeout = IDLE_POLL_MS
+        if (hasPendingOutput(conns)) {
+            timeout = PENDING_POLL_MS
+        }
+        for (s in net.poll(sockets, timeout)) {
+            if (s == server) {
+                acceptAll(server, conns)
+            } else if (conns.has("" + s)) {
+                readFrom(conns["" + s], token)
+            }
+        }
+        flush(conns)
+        expire(conns)
+    }
+}
+
+method acceptAll(integer server, map<string, object> conns) {
+    while (true) {
+        var s = net.accept(server)
+        if (s < 0) {
+            return
+        }
+        conns["" + s] = Conn{fd = s, input = "", output = "", answered = false, openedAt = os.clock()}
+    }
+}
+
+method readFrom(Conn conn, string token) {
+    var data = net.recv(conn.fd(), 65536)
+    if (bytes.size(data) == 0) {
+        if (net.again() == false) {
+            // The peer is gone (or the socket failed): drop it on the next flush.
+            conn.output("")
+            conn.answered(true)
+        }
+        return
+    }
+    if (conn.answered()) {
+        return
+    }
+    conn.input(bytes.join([conn.input(), data]))
+    var parsed = parseRequest(conn.input())
+    if (parsed.state() == "incomplete") {
+        return
+    }
+    conn.input("")
+    if (parsed.state() == "error") {
+        answer(conn, parsed.status(), core.errorBody("bad_request", parsed.message()))
+        core.logInfo("- - ${parsed.status()} (${parsed.message()})")
+        return
+    }
+    var request = parsed.request()
+    var started = os.clock()
+    var result = handle(request, token)
+    answer(conn, result["status"], result["body"])
+    var ms = math.round((os.clock() - started) * 1000.0)
+    var status = result["status"]
+    core.logInfo("${request.verb()} ${request.pathname()} ${status} ${ms}ms")
+}
+
+method answer(Conn conn, integer status, object body) {
+    conn.output(jsonResponse(status, body))
+    conn.answered(true)
+}
+
+method hasPendingOutput(map<string, object> conns): bool {
+    for (key in conns) {
+        if (bytes.size(conns[key].output()) > 0) {
+            return true
+        }
+    }
+    return false
+}
+
+// Sends what is pending; closes connections whose answer went out.
+method flush(map<string, object> conns) {
+    var finished = []
+    for (key in conns) {
+        var c = conns[key]
+        var size = bytes.size(c.output())
+        if (size > 0) {
+            var written = net.send(c.fd(), c.output())
+            if (net.failed()) {
+                finished.append(key)
+                continue
+            }
+            if (written >= size) {
+                c.output("")
+            } else if (written > 0) {
+                c.output(bytes.slice(c.output(), written, size))
+            }
+        }
+        if (c.answered() && bytes.size(c.output()) == 0) {
+            finished.append(key)
+        }
+    }
+    for (key in finished) {
+        net.close(conns[key].fd())
+        conns.remove(key)
+    }
+}
+
+// Closes connections that never completed a request.
+method expire(map<string, object> conns) {
+    var now = os.clock()
+    var stale = []
+    for (key in conns) {
+        if (now - conns[key].openedAt() > CONNECTION_TIMEOUT_SECONDS) {
+            stale.append(key)
+        }
+    }
+    for (key in stale) {
+        net.close(conns[key].fd())
+        conns.remove(key)
+    }
+}

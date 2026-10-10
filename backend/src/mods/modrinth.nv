@@ -1,0 +1,217 @@
+package mods
+
+import bytes
+import http
+import json
+import thread
+import core
+
+// The few Modrinth API calls the mods module needs (identification by hash,
+// update lookup, project names, file download).
+
+private final MODRINTH_API = "https://api.modrinth.com/v2"
+final MODRINTH_BATCH = 100
+
+// std/http names its curl temp files with a process wide counter that is not
+// thread safe, so two job threads requesting at the same moment could share
+// them. Requests of this module are serialised; http.request never raises,
+// so holding a sync lock around it is safe.
+var httpLock = thread.mutex()
+
+method userAgent(): string {
+    return "VoltLauncher-next/" + core.version() + " (https://github.com/ezTxmMC/VoltLauncher)"
+}
+
+method rawRequest(string verb, string url, object body): map<string, object> {
+    var headers = {"User-Agent": userAgent(), "Accept": "application/json"}
+    var response = {}
+    sync (httpLock) {
+        response = http.request(verb, url, body, headers)
+    }
+    if (response["status"] == 0) {
+        core.upstream("Modrinth is not reachable: " + response["error"])
+    }
+    return response
+}
+
+method shorten(string text, integer limit): string {
+    if (text.length() <= limit) {
+        return text
+    }
+    return text.substring(0, limit) + "..."
+}
+
+// A Modrinth API call; the parsed JSON answer or a 502 upstream failure.
+method modrinthJson(string verb, string apiPath, object body): object {
+    var response = rawRequest(verb, MODRINTH_API + apiPath, body)
+    var text = response["body"]
+    if (response["ok"] == false) {
+        core.upstream("Modrinth answered " + response["status"] + " for " + verb + " " + apiPath + ": " + shorten(text.trim(), 200))
+    }
+    var parsed = json.tryParse(text)
+    if (core.isNull(parsed) && text.trim() != "null") {
+        core.upstream("Modrinth sent no valid JSON for " + verb + " " + apiPath)
+    }
+    return parsed
+}
+
+// Downloads a file (the raw bytes) or fails with 502.
+method modrinthDownload(string url): string {
+    var response = rawRequest("GET", escapeUrl(url), core.none())
+    if (response["ok"] == false) {
+        core.upstream("download failed with HTTP " + response["status"] + ": " + url)
+    }
+    return response["body"]
+}
+
+// Percent-encodes what curl would read as a glob ([ ] { }) or what cannot
+// stand in a command line URL (space, quotes, control bytes, non-ASCII).
+method escapeUrl(string url): string {
+    var out = []
+    var n = bytes.size(url)
+    var i = 0
+    while (i < n) {
+        var b = bytes.u8(url, i)
+        if (b <= 0x20 || b >= 0x7f || b == 0x22 || b == 0x27 || b == 0x5b || b == 0x5d || b == 0x7b || b == 0x7d || b == 0x3c || b == 0x3e || b == 0x5c || b == 0x5e || b == 0x60 || b == 0x7c) {
+            out.append("%" + bytes.hex(bytes.putU8(b)).toUpper())
+        } else {
+            out.append(bytes.slice(url, i, i + 1))
+        }
+        i = i + 1
+    }
+    return bytes.join(out)
+}
+
+// Percent-encodes a query value (everything but unreserved characters).
+method encodeQueryValue(string text): string {
+    var out = []
+    var n = bytes.size(text)
+    var i = 0
+    while (i < n) {
+        var c = bytes.slice(text, i, i + 1)
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~".contains(c)) {
+            out.append(c)
+        } else {
+            out.append("%" + bytes.hex(c).toUpper())
+        }
+        i = i + 1
+    }
+    return bytes.join(out)
+}
+
+// POST /version_files: sha1 -> version object for the hashes Modrinth knows.
+method versionsByHash(array hashes): map<string, object> {
+    var answer = modrinthJson("POST", "/version_files", {"hashes": hashes, "algorithm": "sha1"})
+    if (core.isMap(answer) == false) {
+        core.upstream("Modrinth sent an unexpected answer for /version_files")
+    }
+    return answer
+}
+
+// POST /version_files/update: sha1 -> latest version matching loaders and
+// game versions.
+method latestVersionsByHash(array hashes, array loaders, array gameVersions): map<string, object> {
+    var body = {"hashes": hashes, "algorithm": "sha1", "loaders": loaders, "game_versions": gameVersions}
+    var answer = modrinthJson("POST", "/version_files/update", body)
+    if (core.isMap(answer) == false) {
+        core.upstream("Modrinth sent an unexpected answer for /version_files/update")
+    }
+    return answer
+}
+
+// GET /version/{id}: the raw version object.
+method modrinthVersionDoc(string versionId): object {
+    return modrinthJson("GET", "/version/" + encodeQueryValue(versionId), core.none())
+}
+
+// GET /versions?ids=[...]: the raw version objects of up to MODRINTH_BATCH ids (an array).
+method modrinthVersionsByIds(array ids): array {
+    var answer = modrinthJson("GET", "/versions?ids=" + encodeQueryValue(json.stringify(ids)), core.none())
+    if (core.isArray(answer) == false) {
+        core.upstream("Modrinth sent an unexpected answer for /versions")
+    }
+    return answer
+}
+
+// GET /project/{id}/version filtered by game versions and loaders (both optional, [] = no filter).
+method modrinthProjectVersions(string projectId, array gameVersions, array loaders): array {
+    var apiPath = "/project/" + encodeQueryValue(projectId) + "/version"
+    var filters = []
+    if (gameVersions.length() > 0) {
+        filters.append("game_versions=" + encodeQueryValue(json.stringify(gameVersions)))
+    }
+    if (loaders.length() > 0) {
+        filters.append("loaders=" + encodeQueryValue(json.stringify(loaders)))
+    }
+    if (filters.length() > 0) {
+        apiPath = apiPath + "?" + filters.join("&")
+    }
+    var answer = modrinthJson("GET", apiPath, core.none())
+    if (core.isArray(answer) == false) {
+        core.upstream("Modrinth sent an unexpected answer for " + apiPath)
+    }
+    return answer
+}
+
+// project id -> title, for up to 100 ids.
+method projectTitles(array ids): map<string, object> {
+    var titles = {}
+    if (ids.length() == 0) {
+        return titles
+    }
+    var answer = modrinthJson("GET", "/projects?ids=" + encodeQueryValue(json.stringify(ids)), core.none())
+    if (core.isArray(answer)) {
+        for (project in answer) {
+            var id = field(project, "id")
+            var title = textField(project, "title")
+            if (core.isString(id) && core.isString(title)) {
+                titles[id] = title
+            }
+        }
+    }
+    return titles
+}
+
+define class TitlesTask {
+    private array ids: get, set
+
+    method run(): object {
+        return projectTitles(ids)
+    }
+}
+
+// projectTitles(), but an empty map instead of a failure (names are optional).
+method projectTitlesOrEmpty(array ids): map<string, object> {
+    var outcome = core.runTrapped(TitlesTask{ids = ids})
+    if (outcome.failed()) {
+        core.logWarn("mods: cannot load Modrinth project names: " + outcome.error())
+        return {}
+    }
+    return outcome.result()
+}
+
+// The primary file of a version object ({url, filename, hashes, primary}),
+// else its first file, else null.
+method primaryFile(object version): object {
+    var files = field(version, "files")
+    if (core.isArray(files) == false || files.length() == 0) {
+        return core.none()
+    }
+    for (f in files) {
+        if (core.isMap(f) && field(f, "primary") == true) {
+            return f
+        }
+    }
+    if (core.isMap(files[0])) {
+        return files[0]
+    }
+    return core.none()
+}
+
+// Modrinth's loader filter for a profile loader. Quilt runs Fabric mods.
+method modrinthLoaders(string loader): array {
+    if (loader == "quilt") {
+        return ["quilt", "fabric"]
+    }
+    return [loader]
+}

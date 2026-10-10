@@ -1,0 +1,463 @@
+package main
+
+import base64
+import bytes
+import core
+import crypto
+import json
+import os
+import path
+import accounts
+import launch
+
+// Unit tests of src/accounts (and launch.launchMaskedCommand). Run through run.sh,
+// which compiles this file against src/core, src/accounts and src/launch in a temporary tree
+// and passes the data directory and a directory with PNG fixtures.
+//
+// Some checks call the real Microsoft, Xbox and Minecraft endpoints with fake tokens
+// (they answer invalid_grant / 401). Those checks need network access.
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+// Runs a task with errors trapped; the error text (VOLT-FAIL encoded) is kept for checks.
+define class TrapOpen {
+    private string master: get, set
+    private string iv: get, set
+    private string data: get, set
+    private string mac: get, set
+
+    method run(): object {
+        return accounts.acOpen(master, iv, data, mac)
+    }
+}
+
+define class TrapSignIn {
+    private string token: get, set
+
+    method run(): object {
+        return accounts.acSignIn(token, "", 0)
+    }
+}
+
+define class TrapProfile {
+    private string token: get, set
+
+    method run(): object {
+        return accounts.acMinecraftProfile(token)
+    }
+}
+
+define class TrapUpload {
+    private string token: get, set
+    private string png: get, set
+
+    method run(): object {
+        var copy = accounts.acTempFile(".png")
+        os.writeFile(copy, png)
+        accounts.acUploadSkin(token, false, copy)
+        return true
+    }
+}
+
+define class TrapPng {
+    private string png: get, set
+
+    method run(): object {
+        accounts.acRequireSkinPng(png)
+        return true
+    }
+}
+
+define class TrapLaunchSession {
+    method run(): object {
+        return accounts.accountsLaunchSession()
+    }
+}
+
+define class TrapTexture {
+    private string url: get, set
+
+    method run(): object {
+        return accounts.acTextureDownload(url)
+    }
+}
+
+define class TrapStore {
+    private string op: get, set
+    private map<string, object> data: get, set
+
+    method run(): object {
+        return accounts.acChange(op, data)
+    }
+}
+
+define class TrapRoute {
+    private string verb: get, set
+    private array<string> segments: get, set
+    private map<string, object> body: get, set
+
+    method run(): object {
+        return accounts.route(verb, segments, {}, body)
+    }
+}
+
+define class TrapBuild {
+    private map<string, object> profile: get, set
+    private map<string, object> install: get, set
+
+    method run(): object {
+        return launch.launchBuildCommand(profile, install, "/usr/bin/java")
+    }
+}
+
+// The HTTP code of a trapped failure, or "" when the task succeeded.
+method codeOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["code"]
+}
+
+// The message of a trapped failure, or "" when the task succeeded.
+method failureOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["message"]
+}
+
+method resultOf(object task): object {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed()) {
+        return core.none()
+    }
+    return outcome.result()
+}
+
+// The launch placeholder ${name}, built without a string interpolation.
+method placeholder(string name): string {
+    return "$" + "{" + name + "}"
+}
+
+// `count` copies of the byte `value`.
+method repeatByte(integer value, integer count): string {
+    var out = ""
+    var i = 0
+    while (i < count) {
+        out = out + bytes.putU8(value)
+        i = i + 1
+    }
+    return out
+}
+
+// The account with this id in a listed account array (an empty map when it is not there).
+method listedAccount(array list, string id): map<string, object> {
+    for (entry in list) {
+        if (entry["id"] == id) {
+            return entry
+        }
+    }
+    return {}
+}
+
+// The raw bytes of a fixture file (the fixture directory is passed in).
+method fixture(string dir, string name): string {
+    return os.readFile(path.join(dir, name))
+}
+
+// A Microsoft store entry with tokens that only exist in this test.
+method fakeMicrosoft(string id, string name, integer expiresIn, string refresh): map<string, object> {
+    var now = os.time()
+    return {
+        "type": "microsoft",
+        "id": id,
+        "name": name,
+        "xuid": "2535000000000001",
+        "userHash": "FAKEUHS",
+        "minecraftToken": "FAKEMCTOKEN-" + name,
+        "minecraftExpiresAt": now + expiresIn,
+        "microsoftToken": "FAKEMSTOKEN-" + name,
+        "microsoftExpiresAt": now + expiresIn,
+        "microsoftRefresh": refresh
+    }
+}
+
+method main(array<string> arguments) {
+    var fixtures = arguments[0]
+    var dataDir = arguments[1]
+
+    // --- crypto primitives: known answers
+    var hmac1 = accounts.acHmac(repeatByte(11, 20), "Hi There")
+    check("HMAC-SHA256 RFC 4231 case 1", crypto.hex(hmac1) == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+    var hmac2 = accounts.acHmac("Jefe", "what do ya want for nothing?")
+    check("HMAC-SHA256 RFC 4231 case 2", crypto.hex(hmac2) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    var challenge = accounts.acBase64Url(crypto.sha256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
+    check("PKCE S256 challenge RFC 7636 appendix B", challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+    check("offline UUID of Player (Java nameUUIDFromBytes)", accounts.acOfflineId("Player") == "a01e3843-e521-3998-958a-f459800e4d11")
+    check("dashed id to dashless", accounts.acDashless("a01e3843-e521-3998-958a-f459800e4d11") == "a01e3843e5213998958af459800e4d11")
+    check("uuid format check accepts a dashed UUID", accounts.acIsUuid("a01e3843-e521-3998-958a-f459800e4d11"))
+    check("uuid format check rejects a short id", accounts.acIsUuid("a01e3843") == false)
+
+    // --- names
+    check("offline name: 3 letters ok", accounts.acValidOfflineName("Ab_"))
+    check("offline name: 2 letters rejected", accounts.acValidOfflineName("ab") == false)
+    check("offline name: 17 letters rejected", accounts.acValidOfflineName("abcdefghijklmnopq") == false)
+    check("offline name: space rejected", accounts.acValidOfflineName("bad name") == false)
+    check("skin name normalised", accounts.acNormalizeName("  Night   Knight ") == "Night Knight")
+
+    // --- encrypted seal round trip, tamper and wrong key
+    var master = crypto.random(32)
+    var plain = "{\"minecraftToken\":\"SECRET-TOKEN-123\"}"
+    var sealed = accounts.acSeal(master, plain)
+    check("sealed payload does not contain the plain text", json.stringify(sealed).contains("SECRET-TOKEN") == false)
+    var opened = accounts.acOpen(master, sealed["iv"], sealed["data"], sealed["mac"])
+    check("seal/open round trip", opened == plain)
+    var damaged = base64.decode(sealed["data"])
+    damaged = bytes.slice(damaged, 0, 1) + bytes.putU8(bytes.u8(damaged, 1) ^ 1) + bytes.slice(damaged, 2, bytes.size(damaged))
+    var tampered = failureOf(TrapOpen{master = master, iv = sealed["iv"], data = base64.encode(damaged), mac = sealed["mac"]})
+    check("tampered ciphertext fails the MAC", tampered.contains("integrity check"))
+    var wrong = failureOf(TrapOpen{master = crypto.random(32), iv = sealed["iv"], data = sealed["data"], mac = sealed["mac"]})
+    check("wrong key fails the MAC", wrong.contains("integrity check"))
+
+    // --- the account store (real files under dataDir)
+    core.init(dataDir, false)
+    var initial = accounts.acChange("list", {})
+    check("empty store lists the default offline account", initial["accounts"].length() == 1 && initial["accounts"][0]["default"] == true)
+    check("default is selected when nothing was chosen", initial["selectedId"] == "a01e3843-e521-3998-958a-f459800e4d11")
+    check("default offline account is listed as unusable", initial["accounts"][0]["usable"] == false && initial["offlineMode"] == true)
+
+    var fakeId = "0123abcd-0000-4000-8000-00000000f00d"
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "FakeOne", 7200, "FAKEREFRESH-One"), "select": true})
+    var afterSave = accounts.acChange("list", {})
+    check("Microsoft account saved and selected", afterSave["selectedId"] == fakeId && afterSave["offlineMode"] == false)
+    var storeText = os.readFile(path.join(dataDir, "accounts", "accounts.enc"))
+    check("store file has no plain tokens", storeText.contains("FAKEMCTOKEN") == false && storeText.contains("FAKEREFRESH") == false && storeText.contains("FakeOne") == false)
+    check("store file is sealed JSON", json.isValid(storeText) && storeText.contains("\"mac\""))
+    var current = accounts.acChange("current", {})
+    check("store round trip gives back the token", current["minecraftToken"] == "FAKEMCTOKEN-FakeOne")
+
+    var copyStore = storeText
+    var copyKey = os.readFile(path.join(dataDir, "accounts", "master.key"))
+    accounts.acChange("offline-mode", {"enabled": true})
+    check("offline mode on selects the default offline", accounts.acChange("list", {})["offlineMode"] == true)
+    accounts.acChange("offline-mode", {"enabled": false})
+    check("offline mode off selects the Microsoft account", accounts.acChange("list", {})["offlineMode"] == false)
+    var offlineAdded = accounts.acChange("add-offline", {"name": "Tester_9"})
+    check("offline account added and selected", offlineAdded["account"]["name"] == "Tester_9" && offlineAdded["offlineMode"] == true)
+    var duplicate = failureOf(TrapStore{op = "add-offline", data = {"name": "Tester_9"}})
+    check("duplicate offline name -> conflict", duplicate == "an account named 'Tester_9' already exists")
+    var removeDefault = failureOf(TrapStore{op = "remove", data = {"id": "a01e3843-e521-3998-958a-f459800e4d11"}})
+    check("the default offline account cannot be removed", removeDefault.contains("cannot be removed"))
+    var accountsBefore = accounts.acChange("list", {})["accounts"].length()
+    var offlineRoute = failureOf(TrapRoute{verb = "POST", segments = ["accounts", "offline"], body = {"name": "Tester_2"}})
+    check("POST /api/accounts/offline -> offline accounts are disabled", offlineRoute == "Offline accounts are disabled. Sign in with a Microsoft account.")
+    check("POST /api/accounts/offline -> code sign_in_required", codeOf(TrapRoute{verb = "POST", segments = ["accounts", "offline"], body = {"name": "Tester_2"}}) == "sign_in_required")
+    var offlineModeRoute = failureOf(TrapRoute{verb = "POST", segments = ["accounts", "offline-mode"], body = {"enabled": true}})
+    check("POST /api/accounts/offline-mode {enabled: true} -> refused", offlineModeRoute == offlineRoute)
+    check("refused offline requests add nothing", accounts.acChange("list", {})["accounts"].length() == accountsBefore)
+    accounts.acChange("logout", {})
+    var afterLogout = accounts.acChange("list", {})
+    check("logout removes Microsoft accounts only", afterLogout["accounts"].length() == 2 && afterLogout["offlineMode"] == true)
+
+    // a damaged store raises and is not overwritten
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "FakeOne", 7200, "FAKEREFRESH-One"), "select": true})
+    var goodStore = os.readFile(path.join(dataDir, "accounts", "accounts.enc"))
+    var brokenStore = goodStore.replace("\"data\": \"", "\"data\": \"A")
+    os.writeFile(path.join(dataDir, "accounts", "accounts.enc"), brokenStore)
+    var brokenList = failureOf(TrapStore{op = "list", data = {}})
+    check("damaged store raises instead of answering empty", brokenList != "")
+    check("damaged store is left untouched", os.readFile(path.join(dataDir, "accounts", "accounts.enc")) == brokenStore)
+    os.writeFile(path.join(dataDir, "accounts", "accounts.enc"), goodStore)
+    check("store readable again after restoring the file", accounts.acChange("list", {})["selectedId"] == fakeId)
+
+    // without the master key nothing can be opened
+    os.remove(path.join(dataDir, "accounts", "master.key"))
+    var noKey = failureOf(TrapStore{op = "list", data = {}})
+    check("missing master key -> error", noKey.contains("account key is missing"))
+    os.writeFile(path.join(dataDir, "accounts", "master.key"), copyKey)
+    check("store opens again with the restored key", accounts.acChange("list", {})["selectedId"] == fakeId)
+    accounts.acChange("logout", {})
+
+    // --- launch session
+    accounts.acChange("select", {"id": "a01e3843-e521-3998-958a-f459800e4d11"})
+    var offlineRefused = failureOf(TrapLaunchSession{})
+    check("launch session: the offline default is refused", offlineRefused == "Sign in with a Microsoft account before you launch.")
+    check("launch session: refusal code is sign_in_required", codeOf(TrapLaunchSession{}) == "sign_in_required")
+    accounts.acChange("select", {"id": accounts.acOfflineId("Tester_9")})
+    check("launch session: a stored offline account is refused too", failureOf(TrapLaunchSession{}) != "")
+
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "Fresh", 7200, "FAKEREFRESH-Fresh"), "select": true})
+    var session = accounts.accountsLaunchSession()
+    check("launch session: fresh Microsoft token used", session["accessToken"] == "FAKEMCTOKEN-Fresh" && session["userType"] == "msa")
+    check("launch session: dashless uuid of the Microsoft account", session["uuid"] == accounts.acDashless(fakeId))
+
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "Expired", 10, "FAKEREFRESH-Expired"), "select": true})
+    var revoked = failureOf(TrapLaunchSession{})
+    check("refresh with a revoked sign-in fails and asks to sign in again", revoked.contains("revoked") && revoked.contains("sign in again"))
+    var microsoftLeft = 0
+    for (entry in accounts.acChange("list", {})["accounts"]) {
+        if (entry["type"] == "microsoft") {
+            microsoftLeft = microsoftLeft + 1
+        }
+    }
+    check("revoked account is removed from the store", microsoftLeft == 0)
+
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "NoRefresh", 10, ""), "select": true})
+    var noRefresh = failureOf(TrapLaunchSession{})
+    check("expired token without refresh token fails", noRefresh.contains("expired"))
+    accounts.acChange("logout", {})
+
+    // --- the sign-in chain against the real endpoints (fake tokens)
+    var xboxFailure = failureOf(TrapSignIn{token = "FAKE"})
+    check("Xbox Live rejects a fake Microsoft token", xboxFailure.contains("Xbox Live"))
+    var profileFailure = failureOf(TrapProfile{token = "FAKE"})
+    check("Minecraft profile rejects a fake token (HTTP 401)", profileFailure.contains("HTTP 401"))
+
+    var upload = failureOf(TrapUpload{token = "FAKE", png = fixture(fixtures, "skin64.png")})
+    check("Mojang skin upload reaches the endpoint (fake token -> HTTP 401)", upload.contains("HTTP 401"))
+
+    // --- skin images
+    var png64 = fixture(fixtures, "skin64.png")
+    var png32 = fixture(fixtures, "skin64x32.png")
+    var png128 = fixture(fixtures, "skin128.png")
+    check("64x64 skin accepted", failureOf(TrapPng{png = png64}) == "")
+    check("64x32 skin accepted", failureOf(TrapPng{png = png32}) == "")
+    check("128x128 skin rejected", failureOf(TrapPng{png = png128}).contains("128x128"))
+    check("non-PNG rejected", failureOf(TrapPng{png = "GIF89a-not-a-png-file-at-all"}).contains("PNG"))
+    var decoded = accounts.acDecodeImage("data:image/png;base64," + base64.encode(png64))
+    check("data URL prefix is stripped before decoding", decoded == png64)
+
+    // --- the launch command takes the selected account
+    var meta = {
+        "mainClass": "net.minecraft.client.main.Main",
+        "arguments": {"jvm": [], "game": ["--username", placeholder("auth_player_name"), "--uuid", placeholder("auth_uuid"), "--accessToken", placeholder("auth_access_token"), "--userType", placeholder("user_type"), "--xuid", placeholder("auth_xuid")]}
+    }
+    var install = {"meta": meta, "classpath": ["lib.jar"], "assetsDir": "/tmp/assets", "assetIndex": "16", "versionId": "1.21.1", "nativesDir": "/tmp/natives", "librariesDir": "/tmp/libs"}
+    var profile = {"id": "a1b2c3d4e5f6", "memoryMb": core.none(), "jvmArgs": ""}
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "Launch", 7200, "FAKEREFRESH-Launch"), "select": true})
+    var launched = launch.launchBuildCommand(profile, install, "/usr/bin/java")
+    var joined = launched.join(" ")
+    check("launch command has the Microsoft name", joined.contains("--username Launch"))
+    check("launch command has the Microsoft token", joined.contains("--accessToken FAKEMCTOKEN-Launch"))
+    check("launch command has user type msa and the dashless uuid", joined.contains("--userType msa") && joined.contains("--uuid " + accounts.acDashless(fakeId)))
+    check("launch log line hides the token", launch.launchMaskedCommand(launched).contains("FAKEMCTOKEN") == false)
+    accounts.acChange("select", {"id": "a01e3843-e521-3998-958a-f459800e4d11"})
+    var offlineLaunch = failureOf(TrapBuild{profile = profile, install = install})
+    check("launch command is refused for the offline default", offlineLaunch == "Sign in with a Microsoft account before you launch.")
+    accounts.acChange("logout", {})
+
+    // --- current skin (GET /api/accounts/skin, current.nv)
+    accounts.acChange("select", {"id": "a01e3843-e521-3998-958a-f459800e4d11"})
+    check("GET /api/accounts/skin without a Microsoft account -> sign_in_required", codeOf(TrapRoute{verb = "GET", segments = ["accounts", "skin"], body = {}}) == "sign_in_required")
+    check("GET /api/accounts/skin refusal message", failureOf(TrapRoute{verb = "GET", segments = ["accounts", "skin"], body = {}}) == "Sign in with a Microsoft account to show your skin.")
+    check("GET /api/accounts/skin: other verbs -> method not allowed", codeOf(TrapRoute{verb = "POST", segments = ["accounts", "skin"], body = {}}) != "")
+
+    accounts.acCurrentForget()
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "Upstream", 7200, "FAKEREFRESH-Upstream"), "select": true})
+    var upstreamCode = codeOf(TrapRoute{verb = "GET", segments = ["accounts", "skin"], body = {}})
+    var upstreamText = failureOf(TrapRoute{verb = "GET", segments = ["accounts", "skin"], body = {}})
+    check("GET /api/accounts/skin with a fake token -> 502 upstream", upstreamCode == "upstream")
+    check("upstream message names the failed step", upstreamText.contains("loading the Minecraft profile"))
+    check("upstream message holds no token", upstreamText.contains("FAKEMCTOKEN") == false)
+    check("failed fetch is not cached", core.isNull(accounts.acCacheGet(fakeId, os.time())))
+
+    var skinPng = fixture(fixtures, "skin64.png")
+    var activeProfile = {
+        "id": "0123abcd000040008000000000f00d",
+        "name": "FakeOne",
+        "skins": [
+            {"id": "s-old", "state": "INACTIVE", "url": "https://textures.minecraft.net/texture/old", "variant": "CLASSIC"},
+            {"id": "s-new", "state": "ACTIVE", "url": "https://textures.minecraft.net/texture/new", "variant": "SLIM"}
+        ],
+        "capes": [{"id": "c1", "state": "ACTIVE", "url": "https://textures.minecraft.net/texture/cape", "alias": "Cape"}]
+    }
+    var answer = accounts.acSkinAnswer("FakeOne", fakeId, activeProfile, "https://textures.minecraft.net/texture/new", skinPng, "")
+    check("skin answer: name and dashed uuid", answer["name"] == "FakeOne" && answer["uuid"] == fakeId)
+    check("skin answer: model of the ACTIVE skin (slim)", answer["model"] == "slim")
+    check("skin answer: skinUrl is the active skin", answer["skinUrl"] == "https://textures.minecraft.net/texture/new")
+    var skinDataUrl = answer["dataUrl"]
+    check("skin answer: dataUrl is a PNG data URL of the texture", skinDataUrl.startsWith("data:image/png;base64,") && base64.decode(skinDataUrl.replace("data:image/png;base64,", "")) == skinPng)
+    check("skin answer: no cape when none was loaded", core.isNull(answer["capeDataUrl"]))
+    var caped = accounts.acSkinAnswer("FakeOne", fakeId, activeProfile, "https://textures.minecraft.net/texture/new", skinPng, fixture(fixtures, "skin128.png"))
+    check("skin answer: capeDataUrl when a cape was loaded", caped["capeDataUrl"].startsWith("data:image/png;base64,"))
+    var idleProfile = {"id": "0123abcd000040008000000000f00d", "name": "FakeOne", "skins": [{"id": "s-old", "state": "INACTIVE", "url": "https://textures.minecraft.net/texture/old", "variant": "SLIM"}], "capes": []}
+    var idle = accounts.acSkinAnswer("FakeOne", fakeId, idleProfile, "", "", "")
+    check("no active skin: skinUrl, dataUrl and capeDataUrl are null", core.isNull(idle["skinUrl"]) && core.isNull(idle["dataUrl"]) && core.isNull(idle["capeDataUrl"]))
+    check("no active skin: model from the listed skin", idle["model"] == "slim")
+    var bare = accounts.acSkinAnswer("FakeOne", fakeId, {"id": "x", "name": "FakeOne", "skins": [], "capes": []}, "", "", "")
+    check("profile without skins: classic model", bare["model"] == "classic")
+    check("texture download: only textures.minecraft.net is fetched", failureOf(TrapTexture{url = "https://example.com/texture/abc"}).contains("unexpected skin address"))
+    check("texture download: plain http is refused", codeOf(TrapTexture{url = "http://textures.minecraft.net/texture/abc"}) == "upstream")
+
+    accounts.acCurrentForget()
+    var now = os.time()
+    accounts.acCachePut(fakeId, answer, now)
+    check("cache: a fresh answer is served for 5 minutes", core.isNull(accounts.acCacheGet(fakeId, now + 299)) == false)
+    check("cache: the answer expires after 5 minutes", core.isNull(accounts.acCacheGet(fakeId, now + 300)))
+    var cachedRoute = resultOf(TrapRoute{verb = "GET", segments = ["accounts", "skin"], body = {}})
+    check("GET /api/accounts/skin serves the cached answer without the network", core.isNull(cachedRoute) == false && cachedRoute["status"] == 200 && cachedRoute["body"]["name"] == "FakeOne")
+    accounts.acCurrentForget()
+    check("cache: forget drops every answer", core.isNull(accounts.acCacheGet(fakeId, now)))
+
+    // --- account list with the skin of each Microsoft account (GET /api/accounts)
+    accounts.acChange("logout", {})
+    var listedOffline = resultOf(TrapRoute{verb = "GET", segments = ["accounts"], body = {}})
+    check("GET /api/accounts answers 200 without Microsoft accounts", core.isNull(listedOffline) == false && listedOffline["status"] == 200)
+    var offlineEntries = listedOffline["body"]["accounts"]
+    var everyShaped = offlineEntries.length() >= 1
+    var offlineNull = true
+    for (entry in offlineEntries) {
+        if (entry.has("skinDataUrl") == false || entry.has("skinError") == false) {
+            everyShaped = false
+        }
+        if (core.isNull(entry["skinDataUrl"]) == false || core.isNull(entry["skinError"]) == false) {
+            offlineNull = false
+        }
+    }
+    check("account list: every entry has skinDataUrl and skinError", everyShaped)
+    check("account list: offline accounts have null skinDataUrl and skinError", offlineNull)
+
+    accounts.acCurrentForget()
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft(fakeId, "Listed", 7200, "FAKEREFRESH-Listed"), "select": true})
+    var failedList = resultOf(TrapRoute{verb = "GET", segments = ["accounts"], body = {}})
+    check("account list: a Microsoft account whose skin fails still lists (200)", core.isNull(failedList) == false && failedList["status"] == 200)
+    var failedEntry = listedAccount(failedList["body"]["accounts"], fakeId)
+    check("account list: failed skin gives skinDataUrl null", core.isNull(failedEntry["skinDataUrl"]))
+    check("account list: failed skin gives a short skinError", ("" + failedEntry["skinError"]).startsWith("Skin unavailable: ") && ("" + failedEntry["skinError"]).length() <= 163)
+    check("account list: failed skin is not cached", core.isNull(accounts.acCacheGet(fakeId, os.time())))
+
+    accounts.acCachePut(fakeId, answer, os.time())
+    accounts.acChange("save-microsoft", {"entry": fakeMicrosoft("1123abcd-0000-4000-8000-00000000f00d", "Unlisted", 7200, "FAKEREFRESH-Unlisted"), "select": false})
+    var mixed = resultOf(TrapRoute{verb = "GET", segments = ["accounts"], body = {}})
+    check("account list: one failing account does not fail the list", core.isNull(mixed) == false && mixed["status"] == 200)
+    var cachedEntry = listedAccount(mixed["body"]["accounts"], fakeId)
+    check("account list: a cached skin is listed as skinDataUrl", cachedEntry["skinDataUrl"] == answer["dataUrl"] && core.isNull(cachedEntry["skinError"]))
+    var otherEntry = listedAccount(mixed["body"]["accounts"], "1123abcd-0000-4000-8000-00000000f00d")
+    check("account list: the other Microsoft account has its own skinError", core.isNull(otherEntry["skinDataUrl"]) && core.isNull(otherEntry["skinError"]) == false)
+    accounts.acCurrentForget()
+    accounts.acChange("logout", {})
+
+    // --- launch log masking
+    var masked = launch.launchMaskedCommand(["java", "-Xmx2G", "--accessToken", "SECRETTOKEN", "--session", "token:SECRETTOKEN:0123abcd000040008000000000f00d", "-Dx=1"])
+    check("launch log hides access token and session", masked.contains("SECRETTOKEN") == false)
+    check("launch log keeps the other arguments", masked == "java -Xmx2G --accessToken *** --session token:***:0123abcd000040008000000000f00d -Dx=1")
+
+    println ""
+    println "accounts unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures != 0) {
+        core.internal("accounts unit tests failed")
+    }
+}

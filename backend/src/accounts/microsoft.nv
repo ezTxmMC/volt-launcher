@@ -1,0 +1,264 @@
+package accounts
+
+import base64
+import core
+import crypto
+import json
+import os
+import thread
+import time
+
+// Microsoft sign-in: OAuth 2.0 authorization code flow with PKCE (S256), then
+// Xbox Live, XSTS, Minecraft services and the profile (the same chain as the Java
+// launcher's MicrosoftAuth / OAuthClient / XboxAuthClient / MinecraftAuthClient).
+//
+// The redirect target is fixed by the Xbox public client: https://login.live.com/
+// oauth20_desktop.srf. The browser ends up there with ?code=...&state=... in its
+// address. Whoever sees that address (the UI, or an Electron window that intercepts
+// the redirect) posts state and code to POST /api/accounts/callback, which starts
+// the exchange as a job.
+
+final AC_CLIENT_ID = "00000000402b5328"
+final AC_REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf"
+final AC_SCOPE = "XboxLive.signin offline_access"
+final AC_AUTHORIZE_URL = "https://login.live.com/oauth20_authorize.srf"
+final AC_TOKEN_URL = "https://login.live.com/oauth20_token.srf"
+final AC_XBL_URL = "https://user.auth.xboxlive.com/user/authenticate"
+final AC_XSTS_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
+final AC_MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
+final AC_MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+final AC_MC_SKIN_URL = "https://api.minecraftservices.com/minecraft/profile/skins"
+
+// A sign-in attempt is valid for this many seconds after it was started.
+final AC_LOGIN_TTL = 600
+// Refresh before a token expires (the Java launcher's 5 minute safety window).
+final AC_REFRESH_WINDOW = 300
+// A token the servers still accept for at least this long may be used even when refreshing failed.
+final AC_MIN_USABLE = 60
+
+// state -> {verifier, at}. In memory only, like the Java launcher: a restart forgets pending attempts.
+var acPendingLock = thread.mutex()
+var acPending = {}
+
+// base64url without padding (RFC 7636).
+method acBase64Url(string raw): string {
+    return base64.encode(raw).replace("+", "-").replace("/", "_").replace("=", "")
+}
+
+// The authorization URL the user opens in the browser.
+method acAuthUrl(string state, string challenge): string {
+    var query = "client_id=" + AC_CLIENT_ID + "&response_type=code&redirect_uri=" + acUrlEncode(AC_REDIRECT_URI)
+    query = query + "&scope=" + acUrlEncode(AC_SCOPE) + "&prompt=select_account&state=" + acUrlEncode(state)
+    query = query + "&code_challenge=" + acUrlEncode(challenge) + "&code_challenge_method=S256"
+    return AC_AUTHORIZE_URL + "?" + query
+}
+
+// Starts a sign-in: remembers the PKCE verifier under a new state and answers the URL.
+method acStartLogin(): map<string, object> {
+    var state = crypto.hex(crypto.random(16))
+    var verifier = acBase64Url(crypto.random(32))
+    var challenge = acBase64Url(crypto.sha256(verifier))
+    var now = os.time()
+    sync (acPendingLock) {
+        var stale = []
+        for (key in acPending) {
+            if (now - acPending[key]["at"] > AC_LOGIN_TTL) {
+                stale.append(key)
+            }
+        }
+        for (key in stale) {
+            acPending.remove(key)
+        }
+        acPending[state] = {"verifier": verifier, "at": now}
+    }
+    return {
+        "state": state,
+        "url": acAuthUrl(state, challenge),
+        "expiresAt": time.iso(now + AC_LOGIN_TTL)
+    }
+}
+
+// Removes a pending attempt and answers its verifier, or "" when there is none (or it expired).
+method acTakePending(string state): string {
+    var verifier = ""
+    var now = os.time()
+    sync (acPendingLock) {
+        if (acPending.has(state)) {
+            var entry = acPending[state]
+            if (now - entry["at"] <= AC_LOGIN_TTL) {
+                verifier = entry["verifier"]
+            }
+            acPending.remove(state)
+        }
+    }
+    return verifier
+}
+
+// The answer of a token request: {accessToken, refreshToken, expiresAt} (unix seconds).
+method acTokensFrom(map<string, object> res, string fallbackRefresh): map<string, object> {
+    acRequireOk(res, "requesting a Microsoft token")
+    var parsed = acJson(res)
+    if (core.isMap(parsed) == false || core.isString(core.getOr(parsed, "access_token", core.none())) == false) {
+        core.upstream("Microsoft answered without an access token")
+    }
+    var refresh = core.getOr(parsed, "refresh_token", "")
+    if (core.isString(refresh) == false || refresh == "") {
+        refresh = fallbackRefresh
+    }
+    var lifetime = core.getOr(parsed, "expires_in", 3600)
+    if (core.isWholeNumber(lifetime) == false) {
+        lifetime = 3600
+    }
+    return {
+        "accessToken": parsed["access_token"],
+        "refreshToken": refresh,
+        "expiresAt": os.time() + core.toInteger(lifetime)
+    }
+}
+
+method acExchangeCode(string code, string verifier): map<string, object> {
+    var body = acForm({
+        "client_id": AC_CLIENT_ID,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": AC_REDIRECT_URI,
+        "scope": AC_SCOPE,
+        "code_verifier": verifier
+    })
+    var res = acSend("POST", AC_TOKEN_URL, {}, body, "application/x-www-form-urlencoded", "")
+    return acTokensFrom(res, "")
+}
+
+method acRefreshMicrosoft(string refreshToken): map<string, object> {
+    var body = acForm({
+        "client_id": AC_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refreshToken,
+        "scope": AC_SCOPE
+    })
+    var res = acSend("POST", AC_TOKEN_URL, {}, body, "application/x-www-form-urlencoded", "")
+    return acTokensFrom(res, refreshToken)
+}
+
+// Xbox Live user token, then the XSTS token for Minecraft: {xsts, userHash, xuid}.
+method acXboxAuthenticate(string microsoftToken): map<string, object> {
+    var xblBody = json.stringify({
+        "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": "d=" + microsoftToken},
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT"
+    })
+    var xbl = acSend("POST", AC_XBL_URL, {"Accept": "application/json"}, xblBody, "application/json", "")
+    acRequireOk(xbl, "signing in to Xbox Live")
+    var xblToken = acJson(xbl)["Token"]
+
+    var xstsBody = json.stringify({
+        "Properties": {"SandboxId": "RETAIL", "UserTokens": [xblToken]},
+        "RelyingParty": "rp://api.minecraftservices.com/",
+        "TokenType": "JWT"
+    })
+    var xsts = acSend("POST", AC_XSTS_URL, {"Accept": "application/json"}, xstsBody, "application/json", "")
+    if (xsts["status"] == 401 || xsts["status"] == 403) {
+        core.upstream("Xbox Live refused the account: " + acXstsReason(acJson(xsts)))
+    }
+    acRequireOk(xsts, "requesting the XSTS token")
+    var answer = acJson(xsts)
+    var xui = answer["DisplayClaims"]["xui"][0]
+    return {
+        "xsts": answer["Token"],
+        "userHash": xui["uhs"],
+        "xuid": core.getOr(xui, "xid", core.getOr(xui, "xuid", ""))
+    }
+}
+
+// The reason Xbox Live gives for XErr codes (ids from the Xbox Live documentation).
+method acXstsReason(object answer): string {
+    if (core.isMap(answer) == false) {
+        return "unknown reason"
+    }
+    var code = core.getOr(answer, "XErr", 0)
+    if (code == 2148916233) {
+        return "this Microsoft account has no Xbox profile yet (create one at xbox.com first)"
+    }
+    if (code == 2148916235) {
+        return "Xbox Live is not available in the account's country"
+    }
+    if (code == 2148916236 || code == 2148916237) {
+        return "the account needs adult verification on xbox.com"
+    }
+    if (code == 2148916238) {
+        return "the account is a child account and must be added to a family"
+    }
+    return "XErr " + code
+}
+
+// Minecraft services login: {accessToken, expiresAt}.
+method acMinecraftLogin(string xsts, string userHash): map<string, object> {
+    var body = json.stringify({"identityToken": "XBL3.0 x=" + userHash + ";" + xsts})
+    var res = acSend("POST", AC_MC_LOGIN_URL, {"Accept": "application/json"}, body, "application/json", "")
+    acRequireOk(res, "signing in to Minecraft services")
+    var answer = acJson(res)
+    var lifetime = core.getOr(answer, "expires_in", 86400)
+    if (core.isWholeNumber(lifetime) == false) {
+        lifetime = 86400
+    }
+    return {"accessToken": answer["access_token"], "expiresAt": os.time() + core.toInteger(lifetime)}
+}
+
+// The Minecraft profile of the token's account: {id (dashed), name}.
+method acMinecraftProfile(string minecraftToken): map<string, object> {
+    var res = acSend("GET", AC_MC_PROFILE_URL, {"Authorization": "Bearer " + minecraftToken, "Accept": "application/json"}, "", "", "")
+    if (res["status"] == 404) {
+        core.badRequest("this Microsoft account does not own Minecraft Java Edition")
+    }
+    acRequireOk(res, "loading the Minecraft profile")
+    var answer = acJson(res)
+    return {"id": acDashed(answer["id"]), "name": answer["name"]}
+}
+
+// The full store entry of a Microsoft account, from a Microsoft token. Raises on any failed step.
+method acSignIn(string microsoftToken, string refreshToken, integer microsoftExpiresAt): map<string, object> {
+    var xbox = acXboxAuthenticate(microsoftToken)
+    var minecraft = acMinecraftLogin(xbox["xsts"], xbox["userHash"])
+    var profile = acMinecraftProfile(minecraft["accessToken"])
+    return {
+        "type": "microsoft",
+        "id": profile["id"],
+        "name": profile["name"],
+        "xuid": xbox["xuid"],
+        "userHash": xbox["userHash"],
+        "minecraftToken": minecraft["accessToken"],
+        "minecraftExpiresAt": minecraft["expiresAt"],
+        "microsoftToken": microsoftToken,
+        "microsoftExpiresAt": microsoftExpiresAt,
+        "microsoftRefresh": refreshToken
+    }
+}
+
+// Runs acSignIn as a trapped task, so a refresh can tell a failure apart without raising.
+define class AcSignInTask {
+    private string microsoftToken: get, set
+    private string refreshToken: get, set
+    private integer microsoftExpiresAt: get, set
+
+    method run(): object {
+        return acSignIn(microsoftToken, refreshToken, microsoftExpiresAt)
+    }
+}
+
+// Sign-in job: exchanges the code of a callback, stores the account and selects it.
+define class AcLoginJob based JobBody {
+    private string code: get, set
+    private string verifier: get, set
+
+    method execute(string jobId): object {
+        core.jobProgress(jobId, 0.1, "Microsoft-Token wird abgerufen")
+        var tokens = acExchangeCode(code, verifier)
+        core.checkCancelled(jobId)
+        core.jobProgress(jobId, 0.4, "Xbox Live und Minecraft werden angemeldet")
+        var entry = acSignIn(tokens["accessToken"], tokens["refreshToken"], tokens["expiresAt"])
+        core.checkCancelled(jobId)
+        core.jobProgress(jobId, 0.9, "Konto wird gespeichert")
+        acChange("save-microsoft", {"entry": entry, "select": true})
+        return {"id": entry["id"], "name": entry["name"]}
+    }
+}

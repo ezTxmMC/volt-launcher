@@ -1,0 +1,185 @@
+package migration
+
+import core
+import path
+import time
+
+// One old instance (<legacy>/instances/instances.json) becomes one new profile
+// through core.createProfile. The game directory stays where the old launcher
+// kept it (<legacy>/instances/<slug>/game): nothing is copied. The old slug is
+// recorded in migration.json, not on the profile.
+
+final LOADER_NAMES = ["fabric", "quilt", "forge", "neoforge"]
+final MAX_NAME_LENGTH = 100
+final MAX_GROUP_LENGTH = 60
+final MAX_COMMAND_LENGTH = 4000
+final MAX_ICON_CHARS = 400000
+final MAX_ENV_VARS = 64
+
+// {ok, minecraftVersion, loader, loaderVersion} from an old versionId:
+// "fabric:26.2:0.19.3" is a loader version, "26.2" or "26.4-snapshot-2" is vanilla.
+method parseVersionId(string versionId): map<string, object> {
+    if (versionId == "") {
+        return {"ok": false, "minecraftVersion": "", "loader": "", "loaderVersion": core.none()}
+    }
+    var parts = versionId.split(":")
+    if (parts.length() == 1) {
+        return {"ok": true, "minecraftVersion": versionId, "loader": "vanilla", "loaderVersion": core.none()}
+    }
+    if (parts.length() == 3 && LOADER_NAMES.contains(parts[0]) && parts[1] != "" && parts[2] != "") {
+        return {"ok": true, "minecraftVersion": parts[1], "loader": parts[0], "loaderVersion": parts[2]}
+    }
+    return {"ok": false, "minecraftVersion": "", "loader": "", "loaderVersion": core.none()}
+}
+
+// ISO-8601 UTC of epoch milliseconds; none when the value is missing or 0.
+method isoOfMillis(object millis): object {
+    if (core.isWholeNumber(millis) == false || core.toInteger(millis) <= 0) {
+        return core.none()
+    }
+    return time.iso(core.toInteger(millis) / 1000)
+}
+
+// The trimmed text of an old value; none when it is not text or blank.
+method textOf(object value): object {
+    if (core.isString(value) == false) {
+        return core.none()
+    }
+    var text = value.trim()
+    if (text == "") {
+        return core.none()
+    }
+    return text
+}
+
+// The env vars the new profile accepts (valid names, string values, at most
+// 64). Anything dropped is reported in `notes`.
+method envVarsOf(object value, array notes): map<string, object> {
+    var kept = {}
+    if (core.isMap(value) == false) {
+        return kept
+    }
+    for (name in value) {
+        if (core.isString(value[name]) == false || core.validEnvName(name) == false) {
+            notes.append("environment variable '" + name + "' is not valid and was not mapped")
+            continue
+        }
+        if (kept.length() >= MAX_ENV_VARS) {
+            notes.append("environment variable '" + name + "' is beyond the 64 the profile takes and was not mapped")
+            continue
+        }
+        kept[name] = value[name]
+    }
+    return kept
+}
+
+// The body for core.createProfile: name, version, loader and the optional
+// fields the old instance sets. Fields that cannot be mapped go to `notes`.
+method profileBody(map<string, object> old, map<string, object> settings, string name, map<string, object> parsedVersion, string gameDir, bool hasGameDir, array notes): map<string, object> {
+    var body = {"name": name, "minecraftVersion": parsedVersion["minecraftVersion"], "loader": parsedVersion["loader"]}
+    if (parsedVersion["loader"] != "vanilla") {
+        body["loaderVersion"] = parsedVersion["loaderVersion"]
+    }
+    var memory = core.getOr(settings, "maxMemoryMb", core.none())
+    if (core.isNull(memory) == false) {
+        if (core.isWholeNumber(memory) && core.toInteger(memory) >= 256) {
+            body["memoryMb"] = core.toInteger(memory)
+        } else {
+            notes.append("maxMemoryMb is below 256 and was not mapped")
+        }
+    }
+    var javaPath = textOf(core.getOr(settings, "javaPath", core.none()))
+    if (core.isNull(javaPath) == false) {
+        body["javaPath"] = javaPath
+    }
+    var jvmArgs = textOf(core.getOr(settings, "jvmArgs", core.none()))
+    if (core.isNull(jvmArgs) == false) {
+        body["jvmArgs"] = jvmArgs
+    }
+    for (key in ["wrapperCommand", "preLaunchCommand", "postExitCommand"]) {
+        var command = textOf(core.getOr(settings, key, core.none()))
+        if (core.isNull(command) == false) {
+            if (command.length() > MAX_COMMAND_LENGTH) {
+                notes.append(key + " is longer than 4000 characters and was not mapped")
+            } else {
+                body[key] = command
+            }
+        }
+    }
+    body["envVars"] = envVarsOf(core.getOr(settings, "envVars", {}), notes)
+    var fullscreen = core.getOr(settings, "fullscreen", core.none())
+    if (core.isBool(fullscreen)) {
+        body["fullscreen"] = fullscreen
+    }
+    var hideLauncher = core.getOr(settings, "hideLauncher", core.none())
+    if (core.isBool(hideLauncher)) {
+        body["hideLauncher"] = hideLauncher
+    }
+    body["favourite"] = (core.getOr(old, "favourite", false) == true)
+    var group = textOf(core.getOr(old, "groupName", core.none()))
+    if (core.isNull(group) == false) {
+        if (group.length() > MAX_GROUP_LENGTH) {
+            notes.append("the group name is longer than 60 characters and was cut")
+            group = group.substring(0, MAX_GROUP_LENGTH)
+        }
+        body["group"] = group
+    }
+    var icon = textOf(core.getOr(old, "iconUrl", core.none()))
+    if (core.isNull(icon) == false) {
+        if (icon.startsWith("data:image/") && icon.length() <= MAX_ICON_CHARS) {
+            body["iconUrl"] = icon
+        } else {
+            notes.append("the icon is not an image of 300 KB or less and was not mapped")
+        }
+    }
+    if (hasGameDir) {
+        body["gameDirectory"] = gameDir
+    }
+    return body
+}
+
+// The fields set after creation: the old timestamps, the playtime and, for a
+// modpack instance, its pack source (none when there is none).
+method profileUpdate(map<string, object> old, object packSource): map<string, object> {
+    var update = {"totalPlaytimeMs": 0}
+    var created = isoOfMillis(core.getOr(old, "createdAt", core.none()))
+    if (core.isNull(created) == false) {
+        update["createdAt"] = created
+    }
+    update["lastPlayed"] = isoOfMillis(core.getOr(old, "lastPlayedAt", core.none()))
+    var playtime = core.getOr(old, "totalPlaytimeMs", 0)
+    if (core.isWholeNumber(playtime) && core.toInteger(playtime) >= 0) {
+        update["totalPlaytimeMs"] = core.toInteger(playtime)
+    }
+    if (core.isNull(packSource) == false) {
+        update["source"] = packSource
+    }
+    return update
+}
+
+// The pack source of a modpack profile ({provider, projectId, versionId, name,
+// kind}) from the old modpack record in content.json, or none when the record
+// is missing or is not a Modrinth or CurseForge pack.
+method modpackSourceOf(object content): object {
+    if (core.isMap(content) == false) {
+        return core.none()
+    }
+    var pack = core.getOr(content, "modpack", core.none())
+    if (core.isMap(pack) == false) {
+        return core.none()
+    }
+    var provider = "" + core.getOr(pack, "provider", "")
+    var projectId = "" + core.getOr(pack, "projectId", "")
+    var versionId = "" + core.getOr(pack, "versionId", "")
+    if ((provider == "modrinth" || provider == "curseforge") == false || projectId == "" || versionId == "") {
+        return core.none()
+    }
+    var name = textOf(core.getOr(pack, "name", core.none()))
+    if (core.isNull(name)) {
+        name = "Modpack"
+    }
+    if (name.length() > MAX_NAME_LENGTH) {
+        name = name.substring(0, MAX_NAME_LENGTH)
+    }
+    return {"provider": provider, "projectId": projectId, "versionId": versionId, "name": name, "kind": "modpack"}
+}

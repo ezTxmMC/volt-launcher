@@ -1,0 +1,228 @@
+package mods
+
+import bytes
+import json
+import toml
+import core
+
+// Mod metadata from inside a jar, in this order:
+//   fabric.mod.json              loader fabric
+//   quilt.mod.json               loader quilt
+//   META-INF/neoforge.mods.toml  loader neoforge
+//   META-INF/mods.toml           loader forge
+//   mcmod.info                   loader forge (legacy)
+// The result is always {"loader", "modId", "name", "version", "description"};
+// missing strings are null, a jar without any of these files is "unknown".
+
+private final METADATA_LIMIT = 4194304    // 4 MiB per metadata file
+
+method emptyMetadata(string loader): map<string, object> {
+    return {
+        "loader": loader,
+        "modId": core.none(),
+        "name": core.none(),
+        "version": core.none(),
+        "description": core.none()
+    }
+}
+
+// The metadata of a jar held in `data`. Raises on a broken archive.
+method readMetadata(string data): map<string, object> {
+    var entries = zipEntries(data)
+    var text = zipReadNamed(data, entries, "fabric.mod.json", METADATA_LIMIT)
+    if (text != "") {
+        return fabricMetadata(text)
+    }
+    text = zipReadNamed(data, entries, "quilt.mod.json", METADATA_LIMIT)
+    if (text != "") {
+        return quiltMetadata(text)
+    }
+    text = zipReadNamed(data, entries, "META-INF/neoforge.mods.toml", METADATA_LIMIT)
+    if (text != "") {
+        return forgeMetadata("neoforge", text, data, entries)
+    }
+    text = zipReadNamed(data, entries, "META-INF/mods.toml", METADATA_LIMIT)
+    if (text != "") {
+        return forgeMetadata("forge", text, data, entries)
+    }
+    text = zipReadNamed(data, entries, "mcmod.info", METADATA_LIMIT)
+    if (text != "") {
+        return legacyForgeMetadata(text)
+    }
+    return emptyMetadata("unknown")
+}
+
+// --- helpers -----------------------------------------------------------------
+
+// A trimmed, non-empty string from `value`, or null.
+method textOrNull(object value): object {
+    if (core.isString(value) == false) {
+        return core.none()
+    }
+    var text = value.trim()
+    if (text == "") {
+        return core.none()
+    }
+    return text
+}
+
+method field(object m, string key): object {
+    if (core.isMap(m) && m.has(key)) {
+        return m[key]
+    }
+    return core.none()
+}
+
+method textField(object m, string key): object {
+    return textOrNull(field(m, key))
+}
+
+method stripBom(string text): string {
+    if (bytes.size(text) >= 3 && bytes.u8(text, 0) == 0xEF && bytes.u8(text, 1) == 0xBB && bytes.u8(text, 2) == 0xBF) {
+        return bytes.slice(text, 3, bytes.size(text))
+    }
+    return text
+}
+
+method parseJsonLenient(string text): object {
+    return json.tryParse(stripBom(text).trim())
+}
+
+// --- fabric / quilt --------------------------------------------------------------
+
+method fabricMetadata(string text): map<string, object> {
+    var m = emptyMetadata("fabric")
+    var parsed = parseJsonLenient(text)
+    if (core.isMap(parsed)) {
+        m["modId"] = textField(parsed, "id")
+        m["name"] = textField(parsed, "name")
+        m["version"] = textField(parsed, "version")
+        m["description"] = textField(parsed, "description")
+    }
+    return m
+}
+
+method quiltMetadata(string text): map<string, object> {
+    var m = emptyMetadata("quilt")
+    var parsed = parseJsonLenient(text)
+    if (core.isMap(parsed)) {
+        var loader = field(parsed, "quilt_loader")
+        var info = field(loader, "metadata")
+        if (core.isMap(info) == false) {
+            info = field(parsed, "metadata")
+        }
+        m["modId"] = textField(loader, "id")
+        m["version"] = textField(loader, "version")
+        m["name"] = textField(info, "name")
+        m["description"] = textField(info, "description")
+    }
+    return m
+}
+
+// --- forge / neoforge ----------------------------------------------------------------
+
+method forgeMetadata(string loader, string text, string data, map<string, object> entries): map<string, object> {
+    var m = emptyMetadata(loader)
+    var source = stripBom(text)
+    var first = core.none()
+    var parsed = toml.parseOr(source, core.none())
+    if (core.isMap(parsed)) {
+        var list = field(parsed, "mods")
+        if (core.isArray(list) && list.length() > 0 && core.isMap(list[0])) {
+            first = list[0]
+        }
+    }
+    if (core.isNull(first)) {
+        // Not valid TOML for std/toml (some jars ship sloppy files): read the
+        // key = "value" lines of the first [[mods]] table by hand.
+        first = scanFirstModsTable(source)
+    }
+    m["modId"] = textField(first, "modId")
+    m["name"] = textField(first, "displayName")
+    m["description"] = textField(first, "description")
+    var version = textField(first, "version")
+    if (core.isString(version) && version.contains("$" + "{")) {
+        // ${file.jarVersion}: the version lives in the manifest.
+        var manifest = zipReadNamed(data, entries, "META-INF/MANIFEST.MF", METADATA_LIMIT)
+        version = textOrNull(manifestValue(manifest, "Implementation-Version"))
+    }
+    m["version"] = version
+    return m
+}
+
+// key -> value of the simple `key = "value"` lines of the first [[mods]]
+// table (single or double quotes; multi-line strings are skipped).
+method scanFirstModsTable(string text): map<string, object> {
+    var out = {}
+    var inMods = false
+    for (rawLine in text.replace("\r", "").split("\n")) {
+        var line = rawLine.trim()
+        if (line.startsWith("[")) {
+            if (inMods) {
+                return out
+            }
+            inMods = line.startsWith("[[mods]]")
+            continue
+        }
+        if (inMods == false) {
+            continue
+        }
+        var eq = line.indexOf("=")
+        if (eq <= 0) {
+            continue
+        }
+        var key = line.substring(0, eq).trim()
+        var value = line.substring(eq + 1, line.length()).trim()
+        if (value.length() >= 2) {
+            var quote = value.charAt(0)
+            if (quote == "\"" || quote == "'") {
+                var rest = value.substring(1, value.length())
+                var close = rest.indexOf(quote)
+                if (close >= 0) {
+                    out[key] = rest.substring(0, close)
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The value of `key` in a jar manifest ("" when missing). Continuation lines
+// (starting with a space) are joined.
+method manifestValue(string manifest, string key): string {
+    var lines = manifest.replace("\r", "").split("\n")
+    var i = 0
+    while (i < lines.length()) {
+        var line = lines[i]
+        if (line.startsWith(key + ":")) {
+            var value = line.substring(key.length() + 1, line.length())
+            i = i + 1
+            while (i < lines.length() && lines[i].startsWith(" ")) {
+                value = value + lines[i].substring(1, lines[i].length())
+                i = i + 1
+            }
+            return value.trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// --- legacy forge (mcmod.info) -----------------------------------------------------------
+
+method legacyForgeMetadata(string text): map<string, object> {
+    var m = emptyMetadata("forge")
+    var parsed = parseJsonLenient(text)
+    var list = parsed
+    if (core.isMap(parsed)) {
+        list = field(parsed, "modList")
+    }
+    if (core.isArray(list) && list.length() > 0 && core.isMap(list[0])) {
+        var first = list[0]
+        m["modId"] = textField(first, "modid")
+        m["name"] = textField(first, "name")
+        m["version"] = textField(first, "version")
+        m["description"] = textField(first, "description")
+    }
+    return m
+}

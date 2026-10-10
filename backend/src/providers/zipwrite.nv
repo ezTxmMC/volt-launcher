@@ -1,0 +1,92 @@
+package providers
+
+import bytes
+import hash
+import os
+import path
+import core
+
+// A small zip writer for exports (stored entries, UTF-8 names, no ZIP64, fixed
+// timestamps). Entries are maps: {"name", "data"} for in-memory text or
+// {"name", "file"} for a file on disk. The archive is written to a temporary
+// name and renamed, so a failed export never leaves a half written file.
+
+private final PV_ZIP_LOCAL_SIG = 0x04034b50
+private final PV_ZIP_CENTRAL_SIG = 0x02014b50
+private final PV_ZIP_END_SIG = 0x06054b50
+private final PV_ZIP_DOS_DATE = 0x21        // 1980-01-01
+
+method zipLe16(integer value): string {
+    return bytes.putU8(value % 256) + bytes.putU8((value / 256) % 256)
+}
+
+method zipLe32(integer value): string {
+    return bytes.putU8(value % 256) + bytes.putU8((value / 256) % 256) + bytes.putU8((value / 65536) % 256) + bytes.putU8((value / 16777216) % 256)
+}
+
+// Writes `entries` into the archive; returns the number of entries.
+method zipWriteEntries(string archive, array entries): integer {
+    var temp = archive + ".tmp"
+    if (os.exists(temp)) {
+        os.remove(temp)
+    }
+    os.writeFile(temp, "")
+    var central = ""
+    var offset = 0
+    var count = 0
+    for (entry in entries) {
+        var name = "" + entry["name"]
+        var data = ""
+        if (entry.has("data") && core.isString(entry["data"])) {
+            data = entry["data"]
+        } else {
+            data = os.readFile(entry["file"])
+        }
+        integer crc = hash.crc32(data)
+        integer size = bytes.size(data)
+        integer nameLength = bytes.size(name)
+        var header = zipLe32(PV_ZIP_LOCAL_SIG) + zipLe16(20) + zipLe16(0x0800) + zipLe16(0) + zipLe16(0)
+            + zipLe16(PV_ZIP_DOS_DATE) + zipLe32(crc) + zipLe32(size) + zipLe32(size) + zipLe16(nameLength) + zipLe16(0) + name
+        os.appendFile(temp, header + data)
+        central = central + zipLe32(PV_ZIP_CENTRAL_SIG) + zipLe16(20) + zipLe16(20) + zipLe16(0x0800) + zipLe16(0)
+            + zipLe16(0) + zipLe16(PV_ZIP_DOS_DATE) + zipLe32(crc) + zipLe32(size) + zipLe32(size) + zipLe16(nameLength)
+            + zipLe16(0) + zipLe16(0) + zipLe16(0) + zipLe16(0) + zipLe32(0) + zipLe32(offset) + name
+        offset = offset + bytes.size(header) + size
+        count = count + 1
+    }
+    var trailer = zipLe32(PV_ZIP_END_SIG) + zipLe16(0) + zipLe16(0) + zipLe16(count) + zipLe16(count)
+        + zipLe32(bytes.size(central)) + zipLe32(offset) + zipLe16(0)
+    os.appendFile(temp, central + trailer)
+    if (os.exists(archive)) {
+        os.remove(archive)
+    }
+    if (os.rename(temp, archive) == false) {
+        os.remove(temp)
+        core.internal("cannot write " + archive)
+    }
+    return count
+}
+
+// Appends the game-relative paths of every regular file below root/rel to out
+// (symbolic links skipped).
+method walkFiles(string root, string rel, array out) {
+    var here = root
+    if (rel != "") {
+        here = path.join(root, rel)
+    }
+    for (name in os.listDir(here)) {
+        var child = name
+        if (rel != "") {
+            child = rel + "/" + name
+        }
+        var full = path.join(root, child)
+        if (os.isSymlink(full)) {
+            continue
+        }
+        if (os.isDir(full)) {
+            walkFiles(root, child, out)
+        } else if (os.isFile(full)) {
+            out.append(child)
+        }
+    }
+}

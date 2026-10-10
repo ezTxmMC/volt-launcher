@@ -1,0 +1,242 @@
+package gamedata
+
+import bytes
+import core
+import launch
+import os
+import path
+import time
+
+// Logs of a profile: the launcher console (the game's stdout, written by the
+// launch module to <gameDir>/logs/launch.log), the game's own logs/ folder and
+// the crash reports.
+//
+//   GET    /api/profiles/:id/logs                       {"logs": [LogSource]}
+//   GET    /api/profiles/:id/logs/latest-crash          {"log": LogSource | null}
+//   GET    /api/profiles/:id/logs/:logId?offset&maxBytes  LogChunk
+//   DELETE /api/profiles/:id/logs/:logId                only "launcher" (empties it)
+//   POST   /api/profiles/:id/logs/:logId/open-folder    {"path"}
+//
+// Log ids: "launcher", "game:<file name>", "crash:<file name>".
+// LogSource: {id, label, kind, sizeBytes, modifiedAt (ISO), live, compressed}.
+// LogChunk: {id, offset, nextOffset, size, text, truncated}. A negative offset
+// means the tail of the file. Reads go through the whole file (there is no
+// seek-read in the runtime); rotated .log.gz files are returned whole.
+
+final LOG_DEFAULT_CHUNK = 131072
+final LOG_MAX_CHUNK = 524288
+final LOG_MAX_GZIP = 4194304
+final LOG_LAUNCHER_ID = "launcher"
+
+method gameLogsDir(string profileId): string {
+    return path.join(core.profileDir(profileId), "logs")
+}
+
+method crashDir(string profileId): string {
+    return path.join(core.profileDir(profileId), "crash-reports")
+}
+
+// The LogSource of one file.
+method logSource(string id, string label, string kind, string file, bool live): map<string, object> {
+    return {
+        "id": id,
+        "label": label,
+        "kind": kind,
+        "sizeBytes": os.fileSize(file),
+        "modifiedAt": time.iso(os.modified(file)),
+        "live": live,
+        "compressed": file.endsWith(".gz")
+    }
+}
+
+// Newest first among the given sources (ISO timestamps sort as text).
+method sortNewestFirst(array<object> sources): array {
+    var sorted = []
+    for (entry in sources) {
+        var at = sorted.length()
+        while (at > 0 && sorted[at - 1]["modifiedAt"] < entry["modifiedAt"]) {
+            at = at - 1
+        }
+        sorted.insert(at, entry)
+    }
+    return sorted
+}
+
+// Every log the profile has: launcher console, game logs, crash reports.
+method listLogs(string profileId): array {
+    var logs = []
+    var launcherFile = launch.launchLogFile(profileId)
+    if (os.isFile(launcherFile)) {
+        logs.append(logSource(LOG_LAUNCHER_ID, "Launcher console", "launcher", launcherFile, true))
+    }
+    var game = []
+    var gameDir = gameLogsDir(profileId)
+    if (os.isDir(gameDir)) {
+        for (name in os.listDir(gameDir)) {
+            var file = path.join(gameDir, name)
+            if (name == "launch.log" || os.isFile(file) == false) {
+                continue
+            }
+            if (name.endsWith(".log") || name.endsWith(".log.gz")) {
+                game.append(logSource("game:" + name, name, "game", file, name == "latest.log"))
+            }
+        }
+    }
+    for (entry in sortNewestFirst(game)) {
+        logs.append(entry)
+    }
+    var crashes = []
+    var crashFolder = crashDir(profileId)
+    if (os.isDir(crashFolder)) {
+        for (name in os.listDir(crashFolder)) {
+            var file = path.join(crashFolder, name)
+            if (os.isFile(file) == false) {
+                continue
+            }
+            if (name.endsWith(".txt") || name.endsWith(".log")) {
+                crashes.append(logSource("crash:" + name, name, "crash", file, false))
+            }
+        }
+    }
+    for (entry in sortNewestFirst(crashes)) {
+        logs.append(entry)
+    }
+    return logs
+}
+
+// The newest crash report, or none.
+method latestCrashReport(string profileId): object {
+    for (entry in listLogs(profileId)) {
+        if (entry["kind"] == "crash") {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// The file behind a log id. The launcher console may not exist yet (then the
+// caller reads nothing). Names are checked like screenshot names.
+method logFile(string profileId, object value): string {
+    if (core.isString(value) == false || value == "") {
+        core.badRequest("a log id is required")
+    }
+    string logId = value
+    if (logId == LOG_LAUNCHER_ID) {
+        return launch.launchLogFile(profileId)
+    }
+    var separator = logId.indexOf(":")
+    if (separator <= 0) {
+        core.badRequest("unknown log: " + logId)
+    }
+    var kind = logId.substring(0, separator)
+    var name = safeName(logId.substring(separator + 1, logId.length()), "log")
+    var dir = ""
+    if (kind == "game") {
+        dir = gameLogsDir(profileId)
+    } else if (kind == "crash") {
+        dir = crashDir(profileId)
+    } else {
+        core.badRequest("unknown log: " + logId)
+    }
+    var file = path.join(dir, name)
+    if (os.isFile(file) == false) {
+        core.notFound("log '" + name + "' not found")
+    }
+    return file
+}
+
+// Moves a byte offset off the middle of a UTF-8 sequence (continuation bytes are 10xxxxxx).
+method utf8Boundary(string content, integer at): integer {
+    var position = at
+    while (position > 0 && position < bytes.size(content) && (bytes.u8(content, position) & 0xC0) == 0x80) {
+        position = position - 1
+    }
+    return position
+}
+
+define class GzipLogTask {
+    private string file: get, set
+
+    method run(): object {
+        return gunzip(os.readFile(file), LOG_MAX_GZIP)
+    }
+}
+
+// A chunk size: the default for 0 or less, never more than LOG_MAX_CHUNK.
+method logChunkLimit(integer maxBytes): integer {
+    if (maxBytes <= 0) {
+        return LOG_DEFAULT_CHUNK
+    }
+    if (maxBytes > LOG_MAX_CHUNK) {
+        return LOG_MAX_CHUNK
+    }
+    return maxBytes
+}
+
+// A slice of a log, see the header comment.
+method readLog(string profileId, object value, integer offset, integer maxBytes): map<string, object> {
+    var file = logFile(profileId, value)
+    string logId = value
+    if (file.endsWith(".gz")) {
+        var text = ""
+        if (os.isFile(file)) {
+            var outcome = core.runTrapped(GzipLogTask{file = file})
+            if (outcome.failed()) {
+                core.internal("cannot read " + logId + ": " + outcome.error())
+            }
+            text = outcome.result()
+        }
+        var size = bytes.size(text)
+        return {"id": logId, "offset": 0, "nextOffset": size, "size": size, "text": text, "truncated": false}
+    }
+    var content = ""
+    if (os.isFile(file)) {
+        content = os.readFile(file)
+    }
+    var total = bytes.size(content)
+    var limit = logChunkLimit(maxBytes)
+    var start = offset
+    var truncated = false
+    if (start < 0) {
+        start = total - limit
+        if (start < 0) {
+            start = 0
+        }
+        truncated = start > 0
+    } else if (start > total) {
+        // The file was replaced or cleared while the caller followed it.
+        start = 0
+        truncated = total > limit
+        if (truncated) {
+            start = total - limit
+        }
+    }
+    var end = start + limit
+    if (end > total) {
+        end = total
+    }
+    start = utf8Boundary(content, start)
+    end = utf8Boundary(content, end)
+    var text = bytes.slice(content, start, end)
+    return {"id": logId, "offset": start, "nextOffset": end, "size": total, "text": text, "truncated": truncated}
+}
+
+// Empties the launcher console. Other logs belong to the game and are not touched.
+method clearLog(string profileId, object value): map<string, object> {
+    if (value != LOG_LAUNCHER_ID) {
+        core.badRequest("Only the launcher console log can be cleared")
+    }
+    var file = launch.launchLogFile(profileId)
+    if (os.isFile(file)) {
+        os.writeFile(file, "")
+    }
+    return {"cleared": LOG_LAUNCHER_ID}
+}
+
+// The folder holding a log, created when missing; the caller hands it to the file manager.
+method openLogFolder(string profileId, object value): map<string, object> {
+    var file = logFile(profileId, value)
+    var folder = path.dirname(file)
+    ensureDirectory(folder)
+    return {"path": folder}
+}

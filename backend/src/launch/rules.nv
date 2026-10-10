@@ -1,0 +1,71 @@
+package launch
+
+import core
+
+// Mojang's "rules" blocks, which gate libraries and arguments on the OS and
+// on launcher features. Rules are evaluated in order and the last matching
+// one wins; a missing or empty list allows; a list where nothing matches
+// disallows.
+//
+//   os.name     windows | osx | linux, compared exactly
+//   os.arch     a substring of the architecture in Java's os.arch spelling
+//   os.version  a regular expression on the OS version. Novus has no regex
+//               engine; such rules only target ancient OS X releases, so a
+//               rule with os.version is treated as not matching.
+//   features    every listed feature must have the listed value (a feature
+//               not in `features` counts as false)
+
+method launchRulesAllow(object rules, map<string, object> features): bool {
+    if (core.isArray(rules) == false || rules.length() == 0) {
+        return true
+    }
+    var allowed = false
+    for (rule in rules) {
+        if (core.isMap(rule) && launchRuleMatches(rule, features)) {
+            allowed = core.getOr(rule, "action", "allow") == "allow"
+        }
+    }
+    return allowed
+}
+
+method launchRuleMatches(map<string, object> rule, map<string, object> features): bool {
+    var wanted = core.getOr(rule, "features", core.none())
+    if (core.isMap(wanted)) {
+        for (feature in wanted) {
+            var required = wanted[feature] != false
+            var actual = core.getOr(features, feature, false) == true
+            if (required != actual) {
+                return false
+            }
+        }
+    }
+    var osRule = core.getOr(rule, "os", core.none())
+    if (core.isMap(osRule) == false) {
+        return true
+    }
+    var name = core.getOr(osRule, "name", "")
+    if (core.isString(name) && name != "" && name != launchOsName()) {
+        return false
+    }
+    var arch = core.getOr(osRule, "arch", "")
+    if (core.isString(arch) && arch != "" && launchArch().contains(arch.toLower()) == false) {
+        return false
+    }
+    var version = core.getOr(osRule, "version", "")
+    if (core.isString(version) && version != "") {
+        return false
+    }
+    return true
+}
+
+// The legacy native classifier of a library for this OS ("" when none).
+method launchNativeClassifier(object natives): string {
+    if (core.isMap(natives) == false) {
+        return ""
+    }
+    var classifier = core.getOr(natives, launchOsName(), "")
+    if (core.isString(classifier) == false || classifier == "") {
+        return ""
+    }
+    return classifier.replace("$" + "{arch}", launchArchBits())
+}

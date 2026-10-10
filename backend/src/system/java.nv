@@ -1,0 +1,126 @@
+package system
+
+import core
+import launch
+import strings
+import thread
+
+// Java runtimes for the settings page. Detection and the Temurin download are
+// the launch module's (launch/java.nv); this module only lists and starts them.
+//
+//   GET  /api/java/runtimes                    {detected, managed, installable, configured, installing}
+//   POST /api/java/runtimes/:major/install     Job (202) -> result {majorVersion, javaPath}
+//
+// One install per major version runs at a time; asking again returns the running job.
+
+var systemJavaLock = thread.mutex()
+var systemJavaJobs = {}   // "21" -> job id of the latest install of Java 21
+
+// The major versions offered for installation (the ones Minecraft has shipped against).
+method systemJavaOffered(): array {
+    return [8, 11, 16, 17, 21, 25]
+}
+
+define class SystemJavaInstall based JobBody {
+    private integer majorVersion: get, set
+
+    method execute(string jobId): object {
+        var javaPath = launch.launchDownloadTemurin(majorVersion, jobId)
+        return {"majorVersion": majorVersion, "javaPath": javaPath}
+    }
+}
+
+// Jobs of the installs that are still running: [{majorVersion, jobId}].
+method systemJavaRunning(): array {
+    var keys = []
+    var jobIds = {}
+    sync (systemJavaLock) {
+        for (key in systemJavaJobs) {
+            keys.append(key)
+            jobIds[key] = systemJavaJobs[key]
+        }
+    }
+    var running = []
+    for (key in keys) {
+        var id = "" + jobIds[key]
+        var job = core.findJob(id)
+        if (core.isMap(job) && job["state"] == "running") {
+            running.append({"majorVersion": parseInt("" + key), "jobId": id})
+        }
+    }
+    return running
+}
+
+method systemJavaRuntimes(): map<string, object> {
+    var managedDir = launch.launchRuntimesDir()
+    var detected = []
+    var managed = []
+    var found = launch.launchDetectJava()
+    var i = 0
+    while (i < found.length()) {
+        var runtime = found[i]
+        i = i + 1
+        var where = "" + core.getOr(runtime, "path", "")
+        var entry = {
+            "majorVersion": core.getOr(runtime, "majorVersion", 0),
+            "version": core.getOr(runtime, "version", ""),
+            "path": where,
+            "managed": where.startsWith(managedDir)
+        }
+        detected.append(entry)
+        if (where.startsWith(managedDir)) {
+            managed.append(entry)
+        }
+    }
+    return {
+        "detected": detected,
+        "managed": managed,
+        "installable": systemJavaOffered(),
+        "configured": core.setting("javaRuntimes"),
+        "installing": systemJavaRunning()
+    }
+}
+
+// Starts the Temurin download of `majorText` as a job, or answers the running one.
+method systemJavaInstall(string majorText): map<string, object> {
+    if (strings.isNumeric(majorText) == false || majorText.contains(".")) {
+        core.badRequest("Java major version must be a number")
+    }
+    var major = parseInt(majorText)
+    if (systemJavaOffered().contains(major) == false) {
+        core.badRequest("Java " + major + " cannot be installed by the launcher")
+    }
+    var key = "" + major
+    var job = {}
+    sync (systemJavaLock) {
+        var running = ""
+        if (systemJavaJobs.has(key)) {
+            running = "" + systemJavaJobs[key]
+        }
+        var current = core.findJob(running)
+        if (core.isMap(current) && current["state"] == "running") {
+            job = current
+        } else {
+            job = core.startJob("java-install", "Installiere Java " + major, SystemJavaInstall{majorVersion = major})
+            systemJavaJobs[key] = job["id"]
+        }
+    }
+    return job
+}
+
+method systemJavaRoute(string verb, array<string> segments): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "runtimes") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(systemJavaRuntimes())
+    }
+    if (segments.length() == 4 && segments[1] == "runtimes" && segments[3] == "install") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.respond(202, systemJavaInstall(segments[2]))
+    }
+    core.notFound("no such endpoint")
+    return {}
+}

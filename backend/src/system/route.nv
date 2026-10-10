@@ -1,0 +1,78 @@
+package system
+
+import core
+import launch
+import strings
+
+// The system module (P4 of docs/FEATURE-PORT.md): settings directories, launcher
+// updates, Discord rich presence, Java runtimes and the platform list.
+//
+//   GET  /api/settings/directories                  [{id, label, path}]
+//   POST /api/settings/directories/:id/open         {path}  (the renderer opens it, window.volt.openPath)
+//   GET  /api/updates[?force=1]                     UpdateInfo (cached 10 min unless forced)
+//   POST /api/updates/download                      Job -> result {path, fileName, directory, verified}
+//   POST /api/updates/open-release                  {url}   (the renderer opens it)
+//   GET  /api/integrations/discord                  {state, message, transport, configured, enabled}
+//   GET  /api/java/runtimes                         {detected, managed, installable, configured, installing}
+//   POST /api/java/runtimes/:major/install          Job -> result {majorVersion, javaPath}
+//   GET  /api/platforms                             [{id, displayName}]
+//
+// Settings reset (POST /api/settings/reset) lives in core/settings.nv.
+// segments are the path segments after /api (segments[0] is the module's first segment).
+
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    var first = segments[0]
+    if (first == "settings") {
+        return systemDirectoriesRoute(verb, segments)
+    }
+    if (first == "updates") {
+        return systemUpdatesRoute(verb, segments, query)
+    }
+    if (first == "integrations") {
+        return systemIntegrationsRoute(verb, segments)
+    }
+    if (first == "java") {
+        return systemJavaRoute(verb, segments)
+    }
+    if (first == "platforms") {
+        if (segments.length() != 1) {
+            core.notFound("no such endpoint")
+        }
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(systemPlatforms())
+    }
+    core.notFound("no such endpoint")
+    return {}
+}
+
+// The loader platforms the launcher supports (the old PlatformRegistry, same ids).
+method systemPlatforms(): array {
+    return [
+        {"id": "vanilla", "displayName": "Vanilla"},
+        {"id": "fabric", "displayName": "Fabric"},
+        {"id": "quilt", "displayName": "Quilt"},
+        {"id": "forge", "displayName": "Forge"},
+        {"id": "neoforge", "displayName": "NeoForge"}
+    ]
+}
+
+method systemIntegrationsRoute(string verb, array<string> segments): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "discord") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(systemDiscordStatus())
+    }
+    core.notFound("no such endpoint")
+    return {}
+}
+
+// Shared by the routes: a segment that must be a whole number.
+method systemMajorVersion(string text): integer {
+    if (strings.isNumeric(text) == false || text.contains(".")) {
+        core.badRequest("Java major version must be a number")
+    }
+    return parseInt(text)
+}

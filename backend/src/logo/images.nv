@@ -1,0 +1,63 @@
+package logo
+
+import base64
+import bytes
+import core
+import os
+import path
+
+// Image helpers of the logo module: the logo cache directory, the image type
+// of raw bytes (magic numbers, not file names) and the data URL of an image.
+//
+// The cache lives in <dataDir>/cache/logos:
+//   <provider>-<projectId>.png|jpg|webp   a modpack icon, written once it passed logoImageType
+//   vanilla-grass.png, vanilla-dirt.png   the Minecraft texture read from the client jar
+
+final LOGO_MAX_BYTES = 2097152
+
+method logoCacheDir(): string {
+    return path.join(core.dataDir(), "cache", "logos")
+}
+
+// Creates <dataDir>/cache and the logo cache directory; returns the latter.
+method logoEnsureCacheDir(): string {
+    core.ensureDir(path.join(core.dataDir(), "cache"))
+    return core.ensureDir(logoCacheDir())
+}
+
+// "png", "jpg", "webp" for the bytes of those image formats, "" for anything else.
+method logoImageType(string data): string {
+    var n = bytes.size(data)
+    if (n >= 8 && bytes.u8(data, 0) == 0x89 && bytes.u8(data, 1) == 0x50 && bytes.u8(data, 2) == 0x4e && bytes.u8(data, 3) == 0x47) {
+        return "png"
+    }
+    if (n >= 3 && bytes.u8(data, 0) == 0xff && bytes.u8(data, 1) == 0xd8 && bytes.u8(data, 2) == 0xff) {
+        return "jpg"
+    }
+    if (n >= 12 && bytes.slice(data, 0, 4) == "RIFF" && bytes.slice(data, 8, 12) == "WEBP") {
+        return "webp"
+    }
+    return ""
+}
+
+// The data URL of an image of the given type ("png", "jpg", "webp").
+method logoDataUrl(string type, string data): string {
+    var mime = "image/" + type
+    if (type == "jpg") {
+        mime = "image/jpeg"
+    }
+    return "data:" + mime + ";base64," + base64.encode(data)
+}
+
+// True for text made of letters, digits, dot, dash and underscore only: safe as a file name part.
+method logoPlainName(string text): bool {
+    if (text == "" || text.length() > 100) {
+        return false
+    }
+    for (ch in text) {
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}

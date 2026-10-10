@@ -1,0 +1,328 @@
+package gamedata
+
+import base64
+import core
+import os
+import path
+import time
+
+// Single player worlds of a profile: <gameDir>/saves/<folder>/. A world's real
+// name lives in its level.dat (gzip NBT), not in its folder name, so listing
+// reads level.dat. Anything unreadable still shows up, named after its folder.
+// Renaming rewrites level.dat and keeps the folder, as the game does.
+//
+//   GET    /api/profiles/:id/worlds                      {"worlds": [World]}
+//   PATCH  /api/profiles/:id/worlds/:folder              {"name"} -> {"world"}
+//   DELETE /api/profiles/:id/worlds/:folder              -> {"deleted": folder}
+//   GET    /api/profiles/:id/worlds/:folder/icon         {"dataUrl": string | null}
+//   POST   /api/profiles/:id/worlds/:folder/duplicate    {"name"?} -> Job (result {"world"})
+//   POST   /api/profiles/:id/worlds/:folder/copy         {"targetProfileId"} -> Job (result {"world", "profileId"})
+//
+// World: {folderName, name, lastPlayed (ISO), sizeBytes, gameMode, hardcore,
+// versionName, hasIcon, readable, problem}.
+
+final WORLD_NAME_LIMIT = 64
+
+method savesDir(string profileId): string {
+    return path.join(core.profileDir(profileId), "saves")
+}
+
+// The directory of a world; 404 when it does not exist.
+method worldDir(string profileId, object folder): string {
+    var name = safeName(folder, "world")
+    var dir = path.join(savesDir(profileId), name)
+    if (os.isDir(dir) == false) {
+        core.notFound("world '" + name + "' not found")
+    }
+    return dir
+}
+
+// The value of tag `name` in a compound, or `fallback`.
+method tagValue(map<string, object> compound, string name, object fallback): object {
+    if (compound.has(name) == false) {
+        return fallback
+    }
+    var tag = compound[name]
+    return tag["v"]
+}
+
+// The game mode names the world list shows (GameType of level.dat).
+method gameModeName(integer gameType): string {
+    if (gameType == 0) {
+        return "survival"
+    }
+    if (gameType == 1) {
+        return "creative"
+    }
+    if (gameType == 2) {
+        return "adventure"
+    }
+    if (gameType == 3) {
+        return "spectator"
+    }
+    return ""
+}
+
+// The fields of level.dat the list needs. Raises on broken data; the caller traps it.
+method readLevelFields(string file): map<string, object> {
+    var document = nbtReadFile(file)
+    var root = document["root"]
+    if (root.has("Data") == false) {
+        core.raise("level.dat has no Data tag")
+    }
+    var dataTag = root["Data"]
+    if (core.isMap(dataTag["v"]) == false) {
+        core.raise("level.dat has no Data tag")
+    }
+    var data = dataTag["v"]
+    string levelName = tagValue(data, "LevelName", "")
+    integer lastPlayed = tagValue(data, "LastPlayed", 0)
+    integer gameType = tagValue(data, "GameType", -1)
+    integer hardcore = tagValue(data, "hardcore", 0)
+    var versionName = ""
+    if (data.has("Version")) {
+        var version = data["Version"]
+        if (core.isMap(version["v"])) {
+            string name = tagValue(version["v"], "Name", "")
+            versionName = name
+        }
+    }
+    return {
+        "levelName": levelName,
+        "lastPlayedMs": lastPlayed,
+        "gameMode": gameModeName(gameType),
+        "hardcore": hardcore != 0,
+        "versionName": versionName
+    }
+}
+
+define class LevelTask {
+    private string file: get, set
+
+    method run(): object {
+        return readLevelFields(file)
+    }
+}
+
+// The list entry of one folder under saves/. Never raises.
+method readWorld(string dir): map<string, object> {
+    var folder = path.basename(dir)
+    var modified = time.iso(os.modified(dir))
+    var size = treeSize(dir)
+    var hasIcon = os.isFile(path.join(dir, "icon.png"))
+    var levelFile = path.join(dir, "level.dat")
+    if (os.isFile(levelFile) == false) {
+        return worldJson(folder, folder, modified, size, "", false, "", hasIcon, false,
+            "No level.dat - this folder is not a world")
+    }
+    var outcome = core.runTrapped(LevelTask{file = levelFile})
+    if (outcome.failed()) {
+        return worldJson(folder, folder, modified, size, "", false, "", hasIcon, false,
+            "level.dat could not be read: " + outcome.error())
+    }
+    var fields = outcome.result()
+    string levelName = fields["levelName"]
+    integer lastPlayedMs = fields["lastPlayedMs"]
+    string played = modified
+    if (lastPlayedMs > 0) {
+        played = time.iso(lastPlayedMs / 1000)
+    }
+    string gameMode = fields["gameMode"]
+    bool hardcore = fields["hardcore"]
+    string versionName = fields["versionName"]
+    var title = levelName
+    if (title.trim() == "") {
+        title = folder
+    }
+    return worldJson(folder, title, played, size, gameMode, hardcore, versionName, hasIcon, true, "")
+}
+
+method worldJson(string folder, string name, string played, integer size, string gameMode, bool hardcore,
+        string versionName, bool hasIcon, bool readable, string problem): map<string, object> {
+    return {
+        "folderName": folder,
+        "name": name,
+        "lastPlayed": played,
+        "sizeBytes": size,
+        "gameMode": gameMode,
+        "hardcore": hardcore,
+        "versionName": versionName,
+        "hasIcon": hasIcon,
+        "readable": readable,
+        "problem": problem
+    }
+}
+
+// Newest played first, then by name (ISO timestamps sort as text).
+method worldBefore(map<string, object> a, map<string, object> b): bool {
+    string playedA = a["lastPlayed"]
+    string playedB = b["lastPlayed"]
+    if (playedA != playedB) {
+        return playedA > playedB
+    }
+    string nameA = a["name"]
+    string nameB = b["name"]
+    return nameA.toLower() < nameB.toLower()
+}
+
+// All worlds of the profile, newest first. An empty list when there is no saves folder.
+method listWorlds(string profileId): array {
+    var saves = savesDir(profileId)
+    var sorted = []
+    if (os.isDir(saves) == false) {
+        return sorted
+    }
+    for (name in os.listDir(saves)) {
+        var dir = path.join(saves, name)
+        if (os.isDir(dir)) {
+            var entry = readWorld(dir)
+            var at = sorted.length()
+            while (at > 0 && worldBefore(entry, sorted[at - 1])) {
+                at = at - 1
+            }
+            sorted.insert(at, entry)
+        }
+    }
+    return sorted
+}
+
+// The icon as a data URL, or null when the world has none.
+method worldIconDataUrl(string profileId, object folder): object {
+    var dir = worldDir(profileId, folder)
+    var icon = path.join(dir, "icon.png")
+    if (os.isFile(icon) == false) {
+        return core.none()
+    }
+    return "data:image/png;base64," + base64.encode(os.readFile(icon))
+}
+
+// Sets LevelName in level.dat. The world must have one.
+method setLevelName(string dir, string title) {
+    var file = path.join(dir, "level.dat")
+    if (os.isFile(file) == false) {
+        core.conflict("This world has no level.dat and cannot be renamed")
+    }
+    var document = nbtReadFile(file)
+    var root = document["root"]
+    if (root.has("Data") == false || core.isMap(root["Data"]["v"]) == false) {
+        core.internal("level.dat has no Data tag")
+    }
+    var data = root["Data"]["v"]
+    data["LevelName"] = {"t": 8, "v": title}
+    nbtSaveFile(file, document)
+}
+
+// A world title from a request: required, at most 64 characters.
+method worldTitle(object value): string {
+    if (core.isString(value) == false) {
+        core.badRequest("'name' is required and must be a string")
+    }
+    string title = value
+    title = title.trim()
+    if (title == "") {
+        core.badRequest("A world name is required")
+    }
+    if (title.length() > WORLD_NAME_LIMIT) {
+        core.badRequest("World names must be 64 characters or shorter")
+    }
+    return title
+}
+
+method renameWorld(string profileId, object folder, object newName): map<string, object> {
+    var title = worldTitle(newName)
+    var dir = worldDir(profileId, folder)
+    setLevelName(dir, title)
+    return readWorld(dir)
+}
+
+method deleteWorld(string profileId, object folder): string {
+    var dir = worldDir(profileId, folder)
+    if (os.removeAll(dir) == false && os.isDir(dir)) {
+        core.internal("cannot delete the world folder " + dir)
+    }
+    return path.basename(dir)
+}
+
+// Duplicates a world inside its profile (a job). The copy gets a free folder
+// and the new title, the way the game names copies.
+method duplicateWorld(string jobId, string profileId, object folder, string requestedName): map<string, object> {
+    var source = worldDir(profileId, folder)
+    var original = readWorld(source)
+    string originalName = original["name"]
+    var title = requestedName.trim()
+    if (title == "") {
+        title = originalName + " (copy)"
+    }
+    if (title.length() > WORLD_NAME_LIMIT) {
+        core.badRequest("World names must be 64 characters or shorter")
+    }
+    var saves = savesDir(profileId)
+    var target = path.join(saves, freeFolder(saves, title))
+    copyTree(source, target, jobId)
+    reportStep(jobId, 0.98, "Schreibe den neuen Namen")
+    if (os.isFile(path.join(target, "level.dat"))) {
+        setLevelName(target, title)
+    }
+    return readWorld(target)
+}
+
+// Copies a world into another profile (a job); the name stays, the folder is free.
+method copyWorld(string jobId, string profileId, object folder, string targetId): map<string, object> {
+    var source = worldDir(profileId, folder)
+    core.requireProfile(targetId)
+    var original = readWorld(source)
+    string originalName = original["name"]
+    var targetSaves = savesDir(targetId)
+    ensureDirectory(targetSaves)
+    var target = path.join(targetSaves, freeFolder(targetSaves, originalName))
+    copyTree(source, target, jobId)
+    return {"world": readWorld(target), "profileId": targetId}
+}
+
+// Progress of a job step outside a copy loop (empty job id: no job).
+method reportStep(string jobId, float progress, string message) {
+    if (jobId != "") {
+        core.jobProgress(jobId, progress, message)
+    }
+}
+
+// --- work objects (see jobs.nv) ----------------------------------------------------
+
+define class RenameWorldWork based GameDataWork {
+    private string profileId: get, set
+    private string folder: get, set
+    private string title: get, set
+
+    method work(string jobId): object {
+        return renameWorld(profileId, folder, title)
+    }
+}
+
+define class DeleteWorldWork based GameDataWork {
+    private string profileId: get, set
+    private string folder: get, set
+
+    method work(string jobId): object {
+        return {"deleted": deleteWorld(profileId, folder)}
+    }
+}
+
+define class DuplicateWorldWork based GameDataWork {
+    private string profileId: get, set
+    private string folder: get, set
+    private string title: get, set
+
+    method work(string jobId): object {
+        return {"world": duplicateWorld(jobId, profileId, folder, title)}
+    }
+}
+
+define class CopyWorldWork based GameDataWork {
+    private string profileId: get, set
+    private string folder: get, set
+    private string targetId: get, set
+
+    method work(string jobId): object {
+        return copyWorld(jobId, profileId, folder, targetId)
+    }
+}

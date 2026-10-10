@@ -1,0 +1,143 @@
+package core
+
+import crypto
+import json
+import os
+import path
+import time
+
+// Small helpers shared by the core and the feature modules.
+
+// --- ids and time -------------------------------------------------------------
+
+// A 12 character lower case hex id (6 random bytes), as the contract wants
+// for profiles and jobs.
+method newId(): string {
+    return crypto.hex(crypto.random(6))
+}
+
+method isId(string text): bool {
+    if (text.length() != 12) {
+        return false
+    }
+    for (ch in text) {
+        if ("0123456789abcdef".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// ISO-8601 in UTC: 2026-10-10T12:00:00Z.
+method nowIso(): string {
+    return time.iso(time.now())
+}
+
+// --- JSON values -----------------------------------------------------------------
+
+// typeOf() answers "unknown" for null; these keep the checks readable.
+method isString(object value): bool {
+    return typeOf(value) == "string"
+}
+
+method isBool(object value): bool {
+    return typeOf(value) == "bool"
+}
+
+method isMap(object value): bool {
+    return typeOf(value) == "map"
+}
+
+method isArray(object value): bool {
+    return typeOf(value) == "array"
+}
+
+// An integer, or a float without a fractional part (JSON has one number type).
+method isWholeNumber(object value): bool {
+    if (typeOf(value) == "integer") {
+        return true
+    }
+    if (typeOf(value) == "float") {
+        integer truncated = value
+        return truncated == value
+    }
+    return false
+}
+
+method toInteger(object value): integer {
+    integer number = value
+    return number
+}
+
+// A deep copy of plain JSON data (maps, arrays, scalars). Values handed out of
+// a lock-guarded store are copies, so another thread never sees them change.
+method copyJson(object value): object {
+    return json.parse(json.stringify(value))
+}
+
+// The value of `key`, or `fallback` when the map lacks it. Plain m[key]
+// aborts on a missing key.
+method getOr(map<string, object> m, string key, object fallback): object {
+    if (m.has(key)) {
+        return m[key]
+    }
+    return fallback
+}
+
+// --- files --------------------------------------------------------------------------
+
+define class WriteTask {
+    private string target: get, set
+    private string content: get, set
+
+    method run(): object {
+        os.writeFile(target, content)
+        return true
+    }
+}
+
+// Writes `content` to `file` atomically (temporary file, then rename) and
+// returns "" on success or the error text. Never raises, so it may be called
+// while a lock is held.
+method writeFileAtomic(string file, string content): string {
+    var dir = path.dirname(file)
+    if (dir != "" && os.isDir(dir) == false) {
+        os.mkdir(dir)
+    }
+    var temp = file + ".tmp"
+    var outcome = runTrapped(WriteTask{target = temp, content = content})
+    if (outcome.failed()) {
+        return outcome.error()
+    }
+    if (os.rename(temp, file) == false) {
+        os.remove(temp)
+        return "cannot rename '" + temp + "' to '" + file + "'"
+    }
+    return ""
+}
+
+define class ReadJsonTask {
+    private string source: get, set
+
+    method run(): object {
+        var text = os.readFile(source)
+        if (json.isValid(text) == false) {
+            return raise("not valid JSON")
+        }
+        return json.parse(text)
+    }
+}
+
+// The parsed JSON content of `file`, or `fallback` when it is missing or
+// broken (a broken file is reported on stderr).
+method readJsonFile(string file, object fallback): object {
+    if (os.isFile(file) == false) {
+        return fallback
+    }
+    var outcome = runTrapped(ReadJsonTask{source = file})
+    if (outcome.failed()) {
+        logWarn("cannot read ${file}: ${outcome.error()} - using defaults")
+        return fallback
+    }
+    return outcome.result()
+}

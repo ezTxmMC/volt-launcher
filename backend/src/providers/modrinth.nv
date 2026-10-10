@@ -1,0 +1,354 @@
+package providers
+
+import core
+import json
+
+// Modrinth (Labrinth API v2): public, no key, but a descriptive User-Agent.
+
+private final MR_API = "https://api.modrinth.com/v2"
+
+// Mod loaders only. The Discover loader filter offers these; plugin servers (bukkit, paper, …),
+// datapacks and java agents are Modrinth tags too, but they are not mod loaders.
+private final MR_MODLOADERS = ["fabric", "forge", "neoforge", "quilt", "legacy-fabric", "liteloader",
+    "rift", "nilloader", "ornithe", "modloader", "babric", "bta-babric"]
+
+// Loaders that Modrinth folds into the "categories" of a search hit.
+private final MR_LOADERS = ["fabric", "forge", "neoforge", "quilt", "liteloader", "rift", "modloader",
+    "bukkit", "spigot", "paper", "purpur", "sponge", "bungeecord", "velocity", "waterfall", "folia",
+    "iris", "optifine", "canvas", "vanilla", "datapack", "minecraft", "babric", "bta-babric",
+    "java-agent", "legacy-fabric", "nilloader", "ornithe"]
+
+method mrHeaders(): map<string, string> {
+    return {"Accept": "application/json"}
+}
+
+method mrGet(string apiPath): object {
+    return getJson(MR_API + apiPath, mrHeaders())
+}
+
+method mrSort(string sort): string {
+    var s = sort.toLower()
+    if (s == "downloads") {
+        return "downloads"
+    }
+    if (s == "follows" || s == "followers") {
+        return "follows"
+    }
+    if (s == "newest" || s == "created") {
+        return "newest"
+    }
+    if (s == "updated") {
+        return "updated"
+    }
+    return "relevance"
+}
+
+method mrKind(string projectType): string {
+    if (["mod", "modpack", "resourcepack", "shader", "datapack"].contains(projectType)) {
+        return projectType
+    }
+    return "mod"
+}
+
+// ProjectSummary of a search hit or a project document.
+method mrSummary(object m, string fallbackKind): map<string, object> {
+    var categories = stringList(jarr(m, "categories"))
+    var display = stringList(jarr(m, "display_categories"))
+    var loaders = stringList(jarr(m, "loaders"))
+    if (loaders.length() == 0) {
+        for (c in categories) {
+            if (MR_LOADERS.contains(c.toLower())) {
+                loaders.append(c)
+            }
+        }
+    }
+    var source = display
+    if (source.length() == 0) {
+        source = categories
+    }
+    var plain = []
+    for (c in source) {
+        if (MR_LOADERS.contains(c.toLower()) == false) {
+            plain.append(c)
+        }
+    }
+    var id = jstr(m, "project_id")
+    if (id == "") {
+        id = jstr(m, "id")
+    }
+    var gameVersions = stringList(jarr(m, "game_versions"))
+    if (gameVersions.length() == 0) {
+        gameVersions = stringList(jarr(m, "versions"))
+    }
+    var kind = fallbackKind
+    if (jstr(m, "project_type") != "") {
+        kind = mrKind(jstr(m, "project_type"))
+    }
+    var updated = jstr(m, "date_modified")
+    if (updated == "") {
+        updated = jstr(m, "updated")
+    }
+    var follows = jint(m, "follows", jint(m, "followers", 0))
+    return {
+        "provider": "modrinth",
+        "id": id,
+        "slug": jstr(m, "slug"),
+        "name": jstr(m, "title"),
+        "summary": jstr(m, "description"),
+        "iconUrl": jstr(m, "icon_url"),
+        "author": jstr(m, "author"),
+        "downloads": jint(m, "downloads", 0),
+        "follows": follows,
+        "kind": kind,
+        "categories": plain,
+        "loaders": loaders,
+        "gameVersions": gameVersions,
+        "updated": updated
+    }
+}
+
+// The facets of the environment filter: "client" and "server", comma separated. A side counts as
+// supported when Modrinth marks it required or optional (the unsupported value is left out). Each
+// selected side is its own facet, so "client,server" keeps mods that support both, as the categories do.
+method mrEnvironmentFacets(string environment): array {
+    var out = []
+    for (part in environment.split(",")) {
+        var side = part.trim().toLower()
+        if (side == "client") {
+            out.append(["client_side:required", "client_side:optional"])
+        } else if (side == "server") {
+            out.append(["server_side:required", "server_side:optional"])
+        }
+    }
+    return out
+}
+
+// categories: comma separated tag names; every one must match (one facet each, AND).
+// environment: "client", "server" or both (see mrEnvironmentFacets). openSource: only projects with an open-source license.
+method mrSearch(string q, string kind, string gameVersion, string loader, integer offset, integer limit, string sort, string categories, string environment, bool openSource): map<string, object> {
+    var facets = [["project_type:" + kind]]
+    if (gameVersion != "") {
+        facets.append(["versions:" + gameVersion])
+    }
+    if (loader != "") {
+        facets.append(["categories:" + loader.toLower()])
+    }
+    for (part in categories.split(",")) {
+        var tag = part.trim().toLower()
+        if (tag != "") {
+            facets.append(["categories:" + tag])
+        }
+    }
+    for (group in mrEnvironmentFacets(environment)) {
+        facets.append(group)
+    }
+    if (openSource) {
+        facets.append(["open_source:true"])
+    }
+    var url = "/search?index=" + mrSort(sort) + "&offset=" + offset + "&limit=" + limit
+    if (q != "") {
+        url = url + "&query=" + urlEncode(q)
+    }
+    url = url + "&facets=" + urlEncode(json.stringify(facets))
+    var response = mrGet(url)
+    var items = []
+    for (hit in jarr(response, "hits")) {
+        items.append(mrSummary(hit, kind))
+    }
+    return {"total": jint(response, "total_hits", items.length()), "items": items}
+}
+
+// The category names Modrinth offers for a content kind (GET /v2/tag/category, header "categories").
+method mrCategories(string kind): array {
+    var out = []
+    var list = mrGet("/tag/category")
+    if (core.isArray(list)) {
+        for (c in list) {
+            if (jstr(c, "project_type") == kind && jstr(c, "header") == "categories") {
+                out.append(jstr(c, "name"))
+            }
+        }
+    }
+    return out
+}
+
+// The lists the Discover filters offer for a kind: categories ({id, label}), release game versions
+// (newest first, as Modrinth orders them) and the loaders the kind supports (GET /v2/tag/*).
+method mrFilterLists(string kind): map<string, object> {
+    var categories = []
+    for (name in mrCategories(kind)) {
+        categories.append({"id": name, "label": name})
+    }
+    var gameVersions = []
+    var versions = mrGet("/tag/game_version")
+    if (core.isArray(versions)) {
+        for (v in versions) {
+            if (jstr(v, "version_type") == "release" && jstr(v, "version") != "") {
+                gameVersions.append(jstr(v, "version"))
+            }
+        }
+    }
+    var loaders = []
+    var loaderTags = mrGet("/tag/loader")
+    if (core.isArray(loaderTags)) {
+        for (l in loaderTags) {
+            var name = jstr(l, "name")
+            if (name != "" && MR_MODLOADERS.contains(name) && stringList(jarr(l, "supported_project_types")).contains(kind)) {
+                loaders.append(name)
+            }
+        }
+    }
+    return {"categories": categories, "gameVersions": gameVersions, "loaders": loaders}
+}
+
+method mrProject(string id): map<string, object> {
+    var doc = mrGet("/project/" + urlEncode(id))
+    var summary = mrSummary(doc, mrKind(jstr(doc, "project_type")))
+    // A project document has no author; the owner comes from the team.
+    var members = core.runTrapped(MrMembersTask{projectId = summary["id"]})
+    if (members.failed() == false && core.isArray(members.result())) {
+        var owner = ""
+        for (member in members.result()) {
+            var name = jstr(jobj(member, "user"), "username")
+            if (owner == "" && name != "") {
+                owner = name
+            }
+            if (jstr(member, "role") == "Owner" && name != "") {
+                owner = name
+                break
+            }
+        }
+        summary["author"] = owner
+    }
+    var gallery = []
+    for (image in jarr(doc, "gallery")) {
+        var u = jstr(image, "url")
+        if (u != "") {
+            gallery.append(u)
+        }
+    }
+    var links = {}
+    for (pair in [["issues", "issues_url"], ["source", "source_url"], ["wiki", "wiki_url"], ["discord", "discord_url"]]) {
+        if (jstr(doc, pair[1]) != "") {
+            links[pair[0]] = jstr(doc, pair[1])
+        }
+    }
+    var license = jobj(doc, "license")
+    var licenseName = jstr(license, "name")
+    if (licenseName == "") {
+        licenseName = jstr(license, "id")
+    }
+    summary["description"] = jstr(doc, "body")
+    summary["gallery"] = gallery
+    summary["links"] = links
+    summary["license"] = licenseName
+    return summary
+}
+
+define class MrMembersTask {
+    private string projectId: get, set
+
+    method run(): object {
+        return mrGet("/project/" + urlEncode(projectId) + "/members")
+    }
+}
+
+method mrPrimaryFile(object version): map<string, object> {
+    var files = jarr(version, "files")
+    for (f in files) {
+        if (jbool(f, "primary")) {
+            return f
+        }
+    }
+    if (files.length() > 0 && core.isMap(files[0])) {
+        return files[0]
+    }
+    return {}
+}
+
+method mrVersion(object v): map<string, object> {
+    var file = mrPrimaryFile(v)
+    var hashes = jobj(file, "hashes")
+    var deps = []
+    for (d in jarr(v, "dependencies")) {
+        deps.append({
+            "projectId": jstr(d, "project_id"),
+            "versionId": jstr(d, "version_id"),
+            "fileName": jstr(d, "file_name"),
+            "dependencyType": jstr(d, "dependency_type")
+        })
+    }
+    var releaseType = jstr(v, "version_type")
+    if (releaseType == "") {
+        releaseType = "release"
+    }
+    return {
+        "id": jstr(v, "id"),
+        "projectId": jstr(v, "project_id"),
+        "name": jstr(v, "name"),
+        "versionNumber": jstr(v, "version_number"),
+        "gameVersions": stringList(jarr(v, "game_versions")),
+        "loaders": stringList(jarr(v, "loaders")),
+        "releaseType": releaseType,
+        "fileName": jstr(file, "filename"),
+        "downloadUrl": jstr(file, "url"),
+        "sha1": jstr(hashes, "sha1"),
+        "sha512": jstr(hashes, "sha512"),
+        "size": jint(file, "size", 0),
+        "datePublished": jstr(v, "date_published"),
+        "dependencies": deps
+    }
+}
+
+method mrVersions(string projectId, string gameVersion, string loader): array {
+    var url = "/project/" + urlEncode(projectId) + "/version"
+    var filters = []
+    if (gameVersion != "") {
+        filters.append("game_versions=" + urlEncode(json.stringify([gameVersion])))
+    }
+    if (loader != "") {
+        filters.append("loaders=" + urlEncode(json.stringify([loader.toLower()])))
+    }
+    if (filters.length() > 0) {
+        url = url + "?" + filters.join("&")
+    }
+    var out = []
+    var list = mrGet(url)
+    if (core.isArray(list)) {
+        for (v in list) {
+            out.append(mrVersion(v))
+        }
+    }
+    return out
+}
+
+method mrVersionById(string versionId): map<string, object> {
+    return mrVersion(mrGet("/version/" + urlEncode(versionId)))
+}
+
+// The raw version document (pack installs need the whole file list).
+method mrVersionDoc(string versionId): map<string, object> {
+    var doc = mrGet("/version/" + urlEncode(versionId))
+    if (core.isMap(doc) == false) {
+        core.upstream("Modrinth returned no version '" + versionId + "'")
+    }
+    return doc
+}
+
+// project id per SHA-1 for files Modrinth knows ({"<sha1>": "<projectId>"}).
+method mrProjectsByHash(array hashes): map<string, object> {
+    var out = {}
+    if (hashes.length() == 0) {
+        return out
+    }
+    var response = postJson(MR_API + "/version_files", mrHeaders(), {"hashes": hashes, "algorithm": "sha1"})
+    if (core.isMap(response)) {
+        for (h in response) {
+            var pid = jstr(response[h], "project_id")
+            if (pid != "") {
+                out[h] = pid
+            }
+        }
+    }
+    return out
+}

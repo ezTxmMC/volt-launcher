@@ -1,0 +1,154 @@
+package imports
+
+import core
+import os
+import path
+
+// Prism Launcher and MultiMC 5 (docs/IMPORT-FORMATS.md sections 1 and 2): every folder
+// with an instance.cfg under <data>/instances is an instance. Its mmc-pack.json lists the
+// components (Minecraft, the loader); instance.cfg has the name, Java and JVM overrides.
+// MultiMC's format has no Fabric, Quilt or NeoForge component in the documented snapshot,
+// so those are refused for it.
+
+// A flat INI file (Qt settings): key=value lines; sections and comments are skipped and
+// surrounding double quotes are removed.
+method parseIni(string text): map<string, object> {
+    var out = {}
+    for (line in text.split("\n")) {
+        var trimmed = line.trim()
+        if (trimmed == "" || trimmed.startsWith("[") || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+            continue
+        }
+        var eq = trimmed.indexOf("=")
+        if (eq <= 0) {
+            continue
+        }
+        var key = trimmed.substring(0, eq).trim()
+        var value = trimmed.substring(eq + 1, trimmed.length()).trim()
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length() - 1)
+        }
+        out[key] = value
+    }
+    return out
+}
+
+// The loader of a Prism component uid ("" when the uid is not a loader component).
+method prismLoaderOf(string uid): string {
+    if (uid == "net.minecraftforge") {
+        return "forge"
+    }
+    if (uid == "net.neoforged") {
+        return "neoforge"
+    }
+    if (uid == "net.fabricmc.fabric-loader") {
+        return "fabric"
+    }
+    if (uid == "org.quiltmc.quilt-loader") {
+        return "quilt"
+    }
+    return ""
+}
+
+// The game folder of an instance: <instance>/minecraft, else <instance>/.minecraft
+// (IMPORT-FORMATS.md 1.2), or "" when neither exists. A link counts, so it is refused later.
+method prismGameFolder(string folder): string {
+    var first = path.join(folder, "minecraft")
+    if (os.isDir(first) || os.isSymlink(first)) {
+        return first
+    }
+    var second = path.join(folder, ".minecraft")
+    if (os.isDir(second) || os.isSymlink(second)) {
+        return second
+    }
+    return ""
+}
+
+// The profiles of Prism or MultiMC. `bases` are the data folders, `allowedLoaders` the
+// loader ids this launcher's format supports (vanilla is always listed in it).
+method detectPrism(string launcher, array bases, array allowedLoaders): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var dir = path.join(base, "instances")
+        checked.append(dir)
+        for (entry in instanceFolders(dir, "instance.cfg")) {
+            if (entry["link"] == true) {
+                records.append(linkRecord(launcher, entry["folder"], entry["name"]))
+            } else {
+                records.append(readPrismInstance(launcher, entry["folder"], entry["name"], allowedLoaders))
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readPrismInstance(string launcher, string folder, string entry, array allowedLoaders): map<string, object> {
+    var rec = newRecord(launcher, folder, folder, entry)
+    var cfg = parseIni(os.readFile(path.join(folder, "instance.cfg")))
+    var name = textOf(cfg, "name")
+    if (name != "") {
+        rec["name"] = name
+    }
+    if (textOf(cfg, "OverrideJavaLocation") == "true" && textOf(cfg, "JavaPath") != "") {
+        rec["javaPath"] = textOf(cfg, "JavaPath")
+    }
+    if (textOf(cfg, "OverrideJavaArgs") == "true") {
+        rec["jvmArgs"] = textOf(cfg, "JvmArgs")
+    }
+    if (cfg.has("MinMemAlloc") || cfg.has("MaxMemAlloc")) {
+        addNote(rec, "memory is not imported: the unit of MinMemAlloc and MaxMemAlloc is not verified")
+    }
+
+    var pack = core.readJsonFile(path.join(folder, "mmc-pack.json"), {})
+    var minecraft = ""
+    var loaders = []
+    var loaderVersion = ""
+    var liteloader = false
+    var unmapped = []
+    for (component in arrayAt(pack, "components")) {
+        var uid = textOf(component, "uid")
+        var version = textOf(component, "version")
+        var loader = prismLoaderOf(uid)
+        if (uid == "net.minecraft") {
+            minecraft = version
+        } else if (loader != "") {
+            loaders.append(loader)
+            loaderVersion = version
+        } else if (uid == "com.mumfrey.liteloader") {
+            liteloader = true
+        } else {
+            unmapped.append(uid)
+        }
+    }
+    rec["minecraftVersion"] = minecraft
+    if (minecraft == "") {
+        refuse(rec, "mmc-pack.json has no net.minecraft component")
+    }
+    if (liteloader) {
+        refuse(rec, "LiteLoader is not supported")
+    }
+    if (loaders.length() > 1) {
+        refuse(rec, "more than one loader component")
+    } else if (loaders.length() == 1) {
+        var loader = loaders[0]
+        if (allowedLoaders.contains(loader) == false) {
+            refuse(rec, loader + " is not supported by this launcher's format (IMPORT-FORMATS.md)")
+        }
+        rec["loader"] = loader
+        if (loaderVersion != "") {
+            rec["loaderVersion"] = loaderVersion
+        }
+    } else {
+        rec["loader"] = "vanilla"
+    }
+    if (unmapped.length() > 0) {
+        addNote(rec, "components not imported: " + unmapped.join(", "))
+    }
+    rec["gameDir"] = prismGameFolder(folder)
+    if (rec["gameDir"] == "") {
+        addNote(rec, "no minecraft or .minecraft folder: nothing to copy")
+    }
+    finishRecord(rec)
+    return rec
+}

@@ -1,0 +1,158 @@
+package providers
+
+import core
+import json
+import os
+import thread
+
+// The response cache and the worker pool of the providers module.
+
+// --- cache -------------------------------------------------------------------------
+
+// Search and detail answers are kept for 5 minutes. Values are stored as JSON
+// text (every reader gets its own copy); the lock is held only for the map
+// operations, never during I/O or JSON work that could raise.
+private final PV_CACHE_SECONDS = 300
+private final PV_CACHE_LIMIT = 2000
+
+var pvCacheLock = thread.mutex()
+var pvCache = {}
+
+// The cached value of key, or null.
+method cacheGet(string key): object {
+    var text = ""
+    var now = os.time()
+    sync (pvCacheLock) {
+        if (pvCache.has(key)) {
+            var entry = pvCache[key]
+            if (now - entry["at"] < PV_CACHE_SECONDS) {
+                text = entry["text"]
+            } else {
+                pvCache.remove(key)
+            }
+        }
+    }
+    if (text == "") {
+        return core.none()
+    }
+    return json.parse(text)
+}
+
+method cachePut(string key, object value) {
+    var text = json.stringify(value)
+    var now = os.time()
+    sync (pvCacheLock) {
+        if (pvCache.length() >= PV_CACHE_LIMIT) {
+            var expired = []
+            for (k in pvCache) {
+                if (now - pvCache[k]["at"] >= PV_CACHE_SECONDS) {
+                    expired.append(k)
+                }
+            }
+            for (k in expired) {
+                pvCache.remove(k)
+            }
+            if (pvCache.length() >= PV_CACHE_LIMIT) {
+                pvCache = {}
+            }
+        }
+        pvCache[key] = {"at": now, "text": text}
+    }
+}
+
+// --- worker pool -----------------------------------------------------------------
+
+// At most this many requests (lookups or downloads) run at the same time.
+final PV_MAX_PARALLEL = 8
+
+// Runs task.run() for every task on up to `limit` operating system threads
+// (os.run blocks its thread, so virtual threads would stall their carrier)
+// and returns one core.Trapped per task, in order. A failing task never
+// stops the others. When `jobId` is not "", a cancel request makes the
+// remaining tasks fail with the cancel mark instead of running.
+method runParallel(array tasks, integer limit, string jobId): array {
+    var results = []
+    for (t in tasks) {
+        results.append(core.none())
+    }
+    if (tasks.length() == 0) {
+        return results
+    }
+    var workers = limit
+    if (workers > tasks.length()) {
+        workers = tasks.length()
+    }
+    if (workers < 1) {
+        workers = 1
+    }
+    var next = thread.counter(0)
+    var lock = thread.mutex()
+    var handles = []
+    var i = 0
+    while (i < workers) {
+        handles.append(thread pvWorker(tasks, results, next, lock, jobId))
+        i = i + 1
+    }
+    thread.joinAll(handles)
+    return results
+}
+
+define class PvCancelledTask {
+    method run(): object {
+        return core.raiseCancelled()
+    }
+}
+
+method pvWorker(array tasks, array results, integer next, integer lock, string jobId) {
+    while (true) {
+        var index = thread.add(next, 1) - 1
+        if (index >= tasks.length()) {
+            return
+        }
+        var outcome = core.none()
+        if (jobId != "" && core.cancelRequested(jobId)) {
+            outcome = core.runTrapped(PvCancelledTask{})
+        } else {
+            outcome = core.runTrapped(tasks[index])
+        }
+        sync (lock) {
+            results[index] = outcome
+        }
+    }
+}
+
+// The first failure among runParallel() results is raised again (a cancel
+// wins over other errors, so a cancelled job ends cancelled).
+method raiseFirstFailure(array outcomes) {
+    var first = ""
+    for (outcome in outcomes) {
+        if (outcome.failed()) {
+            if (core.isCancelFailure(outcome.error())) {
+                core.raiseCancelled()
+            }
+            if (first == "") {
+                first = outcome.error()
+            }
+        }
+    }
+    if (first != "") {
+        core.raise(first)
+    }
+}
+
+// How many runParallel() results failed.
+method countFailures(array outcomes): integer {
+    var failed = 0
+    for (outcome in outcomes) {
+        if (outcome.failed()) {
+            failed = failed + 1
+        }
+    }
+    return failed
+}
+
+// The message of a trapped error, without the encoding of core.fail().
+method failureMessage(string error): string {
+    var decoded = core.decodeFailure(error)
+    return "" + decoded["message"]
+}

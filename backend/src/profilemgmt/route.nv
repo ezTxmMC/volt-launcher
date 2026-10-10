@@ -1,0 +1,185 @@
+package profilemgmt
+
+import core
+import launch
+
+// Profile management beyond the CRUD in core/profiles.nv (see docs/ARCHITECTURE.md):
+//
+//   GET    /api/profiles                      core's list, each profile with running and phase
+//   GET    /api/profiles/groups               ["Modpacks", ...] distinct group names
+//   POST   /api/profiles/:id/duplicate        {name?} -> 202 job; result {profileId}
+//   POST   /api/profiles/:id/icon             {dataUrl} -> profile; iconUrl set (PATCH {"iconUrl": null} clears it)
+//   POST   /api/profiles/:id/verify           {repair?} -> 202 job; result = report
+//   GET    /api/profiles/:id/verify           {report} of the last check, null when there is none
+//   GET    /api/versions?includeSnapshots=&includeBetas=&includeAlphas=
+//                                             [{id, type, releaseTime}] from Mojang's manifest
+//   GET    /api/loader-versions?platformId=&minecraftVersionId=
+//                                             [{id, stable}] newest first (empty for vanilla)
+//
+// Everything else under /api/profiles (create, read, patch, delete) stays in core.
+// segments are the path segments after /api.
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    var first = segments[0]
+    if (first == "versions") {
+        if (verb != "GET" || segments.length() != 1) {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(versionList(query))
+    }
+    if (first == "loader-versions") {
+        if (verb != "GET" || segments.length() != 1) {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(loaderVersionList(query))
+    }
+    if (first != "profiles") {
+        core.notFound("no such endpoint")
+    }
+
+    if (segments.length() == 1) {
+        if (verb == "GET") {
+            return core.ok(profileList())
+        }
+        return core.profilesRoute(verb, segments, query, body)
+    }
+    if (segments.length() == 2 && segments[1] == "groups") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(core.profileGroups())
+    }
+    if (segments.length() == 2) {
+        return core.profilesRoute(verb, segments, query, body)
+    }
+
+    var id = segments[1]
+    if (core.isId(id) == false) {
+        core.notFound("profile '" + id + "' not found")
+    }
+    var section = segments[2]
+    if (segments.length() != 3) {
+        core.notFound("no such endpoint")
+    }
+    if (section == "duplicate") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.respond(202, startDuplicate(id, body))
+    }
+    if (section == "icon") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        if (core.isMap(body) == false || core.isString(core.getOr(body, "dataUrl", core.none())) == false) {
+            core.badRequest("expected {\"dataUrl\": \"data:image/png;base64,...\"}")
+        }
+        return core.ok(core.patchProfile(id, {"iconUrl": body["dataUrl"]}))
+    }
+    if (section == "verify") {
+        if (verb == "GET") {
+            return core.ok({"report": verifyReport(id)})
+        }
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var repair = false
+        if (core.isMap(body)) {
+            repair = core.getOr(body, "repair", false) == true
+        }
+        return core.respond(202, startVerify(id, repair))
+    }
+    core.notFound("no such endpoint")
+    return {}
+}
+
+// True for "true" or "1" in the query.
+method queryFlag(map<string, string> query, string key): bool {
+    if (query.has(key) == false) {
+        return false
+    }
+    return query[key] == "true" || query[key] == "1"
+}
+
+method requireQuery(map<string, string> query, string key): string {
+    if (query.has(key) == false || query[key].trim() == "") {
+        core.badRequest("the query parameter '" + key + "' is required")
+    }
+    return query[key].trim()
+}
+
+// Mojang's version list: releases, plus snapshots and old betas/alphas on request.
+method versionList(map<string, string> query): array {
+    var manifest = launch.launchManifestOrNull()
+    if (core.isMap(manifest) == false || core.isArray(core.getOr(manifest, "versions", 0)) == false) {
+        core.upstream("the Minecraft version list cannot be loaded (no network?)")
+    }
+    var snapshots = queryFlag(query, "includeSnapshots")
+    var betas = queryFlag(query, "includeBetas")
+    var alphas = queryFlag(query, "includeAlphas")
+    var out = []
+    for (entry in manifest["versions"]) {
+        var kind = core.getOr(entry, "type", "")
+        var wanted = kind == "release"
+        if (kind == "snapshot" && snapshots) {
+            wanted = true
+        }
+        if (kind == "old_beta" && betas) {
+            wanted = true
+        }
+        if (kind == "old_alpha" && alphas) {
+            wanted = true
+        }
+        if (wanted) {
+            out.append({"id": core.getOr(entry, "id", ""), "type": kind, "releaseTime": core.getOr(entry, "releaseTime", "")})
+        }
+    }
+    return out
+}
+
+// The loader versions for one Minecraft version, newest first.
+method loaderVersionList(map<string, string> query): array {
+    var platform = requireQuery(query, "platformId")
+    var mc = requireQuery(query, "minecraftVersionId")
+    if (platform == "vanilla") {
+        return []
+    }
+    var out = []
+    if (platform == "fabric" || platform == "quilt") {
+        var list = launch.launchFetchJson(launch.launchMetaBase(platform) + mc)
+        if (core.isArray(list) == false) {
+            core.upstream("no loader list for " + platform + " " + mc)
+        }
+        for (entry in list) {
+            var info = core.getOr(entry, "loader", core.none())
+            if (core.isMap(info) && core.isString(core.getOr(info, "version", core.none()))) {
+                out.append({"id": info["version"], "stable": core.getOr(info, "stable", true) == true})
+            }
+        }
+        return out
+    }
+    if (platform == "forge" || platform == "neoforge") {
+        var published = launch.launchMavenLoaderVersions(platform, mc)
+        var i = published.length() - 1
+        while (i >= 0) {
+            var version = published[i]
+            var beta = version.contains("beta") || version.contains("alpha")
+            out.append({"id": version, "stable": beta == false})
+            i = i - 1
+        }
+        return out
+    }
+    core.badRequest("unknown platformId '" + platform + "'")
+    return out
+}
+
+// GET /api/profiles: core's profiles with the running state of each.
+method profileList(): array {
+    var list = []
+    for (p in core.profiles()) {
+        var status = launch.launchGameStatus(p["id"])
+        p["running"] = status["running"]
+        p["phase"] = status["phase"]
+        list.append(p)
+    }
+    return list
+}

@@ -1,0 +1,296 @@
+package imports
+
+import arrays
+import core
+import os
+import path
+
+// Launchers whose profile is a JSON file in each instance folder: ATLauncher, GDLauncher,
+// FTB App, the CurseForge app (community format) and HMCL. The instance folder is the
+// game folder for all of them except HMCL, whose version folders are refused for now
+// (see readHmclInstance). Loader names that the documents do not list are refused.
+
+// ATLauncher (section 3): <base>/instances/<folder>/instance.json.
+method detectAtLauncher(array bases): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var dir = path.join(base, "instances")
+        checked.append(dir)
+        for (entry in instanceFolders(dir, "instance.json")) {
+            if (entry["link"] == true) {
+                records.append(linkRecord("atlauncher", entry["folder"], entry["name"]))
+            } else {
+                records.append(readAtInstance(entry["folder"], entry["name"]))
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readAtInstance(string folder, string entry): map<string, object> {
+    var rec = newRecord("atlauncher", folder, folder, entry)
+    var doc = core.readJsonFile(path.join(folder, "instance.json"), {})
+    var launcherInfo = mapAt(doc, "launcher")
+    var name = textOf(launcherInfo, "name")
+    if (name != "") {
+        rec["name"] = name
+    }
+    rec["minecraftVersion"] = textOf(doc, "id")
+    var loaderInfo = core.getOr(launcherInfo, "loaderVersion", core.none())
+    if (core.isMap(loaderInfo) == false) {
+        rec["loader"] = "vanilla"
+        addNote(rec, "loader taken as vanilla: launcher.loaderVersion is absent")
+    } else {
+        var loaderType = textOf(loaderInfo, "type")
+        var loader = loaderByName(loaderType)
+        if (loader == "") {
+            refuse(rec, "loader type '" + loaderType + "' is not mapped (the values of LoaderVersion.type are not verified)")
+        } else {
+            rec["loader"] = loader
+            if (textOf(loaderInfo, "version") != "") {
+                rec["loaderVersion"] = textOf(loaderInfo, "version")
+            }
+        }
+    }
+    if (textOf(launcherInfo, "javaPath") != "") {
+        rec["javaPath"] = textOf(launcherInfo, "javaPath")
+    }
+    rec["jvmArgs"] = textOf(launcherInfo, "javaArguments")
+    if (launcherInfo.has("maximumMemory")) {
+        addNote(rec, "memory is not imported: the unit of maximumMemory is not verified")
+    }
+    rec["gameDir"] = folder
+    finishRecord(rec)
+    return rec
+}
+
+// GDLauncher (section 4): <userData>/instances/<name>/config.json. The name is the folder name.
+method detectGdLauncher(array bases): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var dir = path.join(base, "instances")
+        checked.append(dir)
+        for (entry in instanceFolders(dir, "config.json")) {
+            if (entry["link"] == true) {
+                records.append(linkRecord("gdlauncher", entry["folder"], entry["name"]))
+            } else {
+                records.append(readGdInstance(entry["folder"], entry["name"]))
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readGdInstance(string folder, string entry): map<string, object> {
+    var rec = newRecord("gdlauncher", folder, folder, entry)
+    var doc = core.readJsonFile(path.join(folder, "config.json"), {})
+    var loader = mapAt(doc, "loader")
+    var loaderType = textOf(loader, "loaderType")
+    var minecraft = textOf(loader, "mcVersion")
+    var loaderVersion = textOf(loader, "loaderVersion")
+    var legacy = arrayAt(doc, "modloader")
+    if (loader.length() == 0 && legacy.length() >= 2) {
+        // The old format: [loaderType, mcVersion, loaderVersion, ...] (section 4.2).
+        loaderType = textValue(legacy[0])
+        minecraft = textValue(legacy[1])
+        if (legacy.length() >= 3) {
+            loaderVersion = textValue(legacy[2])
+        }
+    }
+    rec["minecraftVersion"] = minecraft
+    var loaderId = loaderByName(loaderType)
+    if (loaderType == "") {
+        refuse(rec, "the loader is not recorded in config.json")
+    } else if (loaderId == "") {
+        refuse(rec, "loader type '" + loaderType + "' is not mapped (the values of loaderType are not verified)")
+    } else {
+        rec["loader"] = loaderId
+        if (loaderId != "vanilla" && loaderVersion != "") {
+            rec["loaderVersion"] = loaderVersion
+        }
+    }
+    rec["jvmArgs"] = textOf(doc, "javaArgs")
+    if (textOf(doc, "customJavaPath") != "") {
+        rec["javaPath"] = textOf(doc, "customJavaPath")
+    }
+    if (doc.has("javaMemory")) {
+        addNote(rec, "memory is not imported: the unit of javaMemory is not verified")
+    }
+    rec["gameDir"] = folder
+    finishRecord(rec)
+    return rec
+}
+
+// FTB App (section 8): <home>/instances/<folder>/instance.json.
+method detectFtb(array bases): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var dir = path.join(base, "instances")
+        checked.append(dir)
+        for (entry in instanceFolders(dir, "instance.json")) {
+            if (entry["link"] == true) {
+                records.append(linkRecord("ftb", entry["folder"], entry["name"]))
+            } else {
+                records.append(readFtbInstance(entry["folder"], entry["name"]))
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+// The loader of FTB's modLoader text. Only neoforge, forge and fabric are mapped
+// (resolveBasicModLoader in pack/Instance.java); the value's source is not traced.
+method ftbLoaderOf(string modLoader): string {
+    if (modLoader.contains("neoforge")) {
+        return "neoforge"
+    }
+    if (modLoader.contains("forge")) {
+        return "forge"
+    }
+    if (modLoader.contains("fabric")) {
+        return "fabric"
+    }
+    return ""
+}
+
+method readFtbInstance(string folder, string entry): map<string, object> {
+    var rec = newRecord("ftb", folder, folder, entry)
+    var doc = core.readJsonFile(path.join(folder, "instance.json"), {})
+    var name = textOf(doc, "name")
+    if (name != "") {
+        rec["name"] = name
+    }
+    rec["minecraftVersion"] = textOf(doc, "mcVersion")
+    var modLoader = textOf(doc, "modLoader").toLower()
+    var loader = ftbLoaderOf(modLoader)
+    if (loader == "") {
+        refuse(rec, "modLoader '" + modLoader + "' is not mapped (IMPORT-FORMATS.md section 8)")
+    } else {
+        rec["loader"] = loader
+    }
+    rec["jvmArgs"] = textOf(doc, "jvmArgs")
+    if (boolOf(doc, "embeddedJre", true) == false && textOf(doc, "jrePath") != "") {
+        rec["javaPath"] = textOf(doc, "jrePath")
+    }
+    if (doc.has("memory")) {
+        addNote(rec, "memory is not imported: the unit of memory is not verified")
+    }
+    rec["gameDir"] = folder
+    finishRecord(rec)
+    return rec
+}
+
+// The CurseForge app, community format (section 6): <root>/Instances|instances/<folder>/
+// minecraftinstance.json. The loader comes from baseModLoader.name, such as "forge-47.2.0".
+method detectCurseForge(): map<string, object> {
+    var records = []
+    var checked = []
+    var roots = launcherRoots("curseforge")
+    for (root in roots) {
+        for (sub in ["Instances", "instances"]) {
+            var dir = path.join(root, sub)
+            checked.append(dir)
+            for (entry in instanceFolders(dir, "minecraftinstance.json")) {
+                if (entry["link"] == true) {
+                    records.append(linkRecord("curseforge", entry["folder"], entry["name"]))
+                } else {
+                    records.append(readCfInstance(entry["folder"], entry["name"]))
+                }
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readCfInstance(string folder, string entry): map<string, object> {
+    var rec = newRecord("curseforge", folder, folder, entry)
+    var doc = core.readJsonFile(path.join(folder, "minecraftinstance.json"), {})
+    var name = textOf(doc, "name")
+    if (name != "") {
+        rec["name"] = name
+    }
+    var baseLoader = mapAt(doc, "baseModLoader")
+    rec["minecraftVersion"] = textOf(doc, "gameVersion")
+    if (rec["minecraftVersion"] == "") {
+        rec["minecraftVersion"] = textOf(baseLoader, "minecraftVersion")
+    }
+    var combined = textOf(baseLoader, "name")
+    if (combined == "") {
+        rec["loader"] = "vanilla"
+    } else {
+        var dash = combined.indexOf("-")
+        var loaderName = combined
+        var version = ""
+        if (dash > 0) {
+            loaderName = combined.substring(0, dash)
+            version = combined.substring(dash + 1, combined.length())
+        }
+        var loader = loaderByName(loaderName)
+        if (loader == "") {
+            refuse(rec, "loader '" + loaderName + "' is not mapped")
+        } else {
+            rec["loader"] = loader
+            if (loader != "vanilla" && version != "") {
+                rec["loaderVersion"] = version
+            }
+        }
+    }
+    rec["jvmArgs"] = textOf(doc, "javaArgsOverride")
+    if (doc.has("allocatedMemory")) {
+        addNote(rec, "memory is not imported: the unit of allocatedMemory is not verified")
+    }
+    rec["gameDir"] = folder
+    finishRecord(rec)
+    return rec
+}
+
+// HMCL (section 9): <base>/versions/<id>/<id>.json, with the settings in
+// <id>/.hmcl/config/instance-game-settings.json. The Minecraft version and the loader are
+// in <id>.json, whose format the document did not read, so every HMCL profile is listed
+// but refused: nothing is guessed.
+// The vanilla launcher uses the same versions/<id>/<id>.json layout in the same .minecraft
+// folder, so only a version folder with HMCL's own .hmcl folder counts as HMCL.
+method detectHmcl(array bases): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in bases) {
+        var dir = path.join(base, "versions")
+        checked.append(dir)
+        if (os.isDir(dir) == false) {
+            continue
+        }
+        for (name in arrays.sort(os.listDir(dir))) {
+            var folder = path.join(dir, name)
+            if (os.isSymlink(folder)) {
+                records.append(linkRecord("hmcl", folder, name))
+            } else if (os.isDir(folder) && os.isFile(path.join(folder, name + ".json")) && os.isDir(path.join(folder, ".hmcl"))) {
+                records.append(readHmclInstance(folder, name))
+            }
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readHmclInstance(string folder, string id): map<string, object> {
+    var rec = newRecord("hmcl", folder, folder, id)
+    var settings = core.readJsonFile(path.join(folder, ".hmcl", "config", "instance-game-settings.json"), {})
+    var javaType = textOf(settings, "javaType")
+    if (textOf(settings, "customJavaPath") != "" && javaType != "auto") {
+        rec["javaPath"] = textOf(settings, "customJavaPath")
+    }
+    rec["jvmArgs"] = textOf(settings, "jvmOptions")
+    var running = textOf(settings, "runningDirectory")
+    if (running != "" && path.isAbsolute(running) && os.isDir(running)) {
+        rec["gameDir"] = running
+    } else {
+        rec["gameDir"] = folder
+        addNote(rec, "game folder taken as the version folder (isolated layout, inferred)")
+    }
+    addNote(rec, "memory is not imported: the unit of minMemory and maxMemory is not verified")
+    refuse(rec, "the Minecraft version and the loader are not mapped: the format of " + id + ".json was not read (IMPORT-FORMATS.md section 9)")
+    finishRecord(rec)
+    return rec
+}

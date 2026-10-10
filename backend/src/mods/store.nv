@@ -1,0 +1,211 @@
+package mods
+
+import crypto
+import json
+import os
+import path
+import thread
+import core
+
+// Where one kind of content lives. Every operation of the module works on a
+// ContentLoc, so mods, resource packs, shader packs and data packs share one
+// implementation.
+//
+//   mods          <gameDir>/mods                        store .volt/mods.json
+//   resourcepacks <gameDir>/resourcepacks               store .volt/resourcepacks.json
+//   shaderpacks   <gameDir>/shaderpacks                 store .volt/shaderpacks.json
+//   datapacks     <gameDir>/saves/<world>/datapacks     store .volt/datapacks-<hash of world>.json
+//
+// Data packs live inside a world, so their location carries the world folder.
+define class ContentLoc {
+    private string profileId: get, set
+    private string kind: get, set
+    private string world: get, set
+    private string dir: get, set
+    private string store: get, set
+}
+
+// Two caches:
+//
+// 1. In memory: sha1 and metadata of every file seen, keyed by
+//    (path, size, modified millis, with-metadata flag), so a scan only reads files that changed.
+// 2. On disk: <gameDir>/.volt/<store>.json, what Modrinth said about a file,
+//    keyed by sha1 (a toggle renames the file but keeps its content):
+//      {"mods": {"<sha1>": {"fileName", "sha1", "source", "update"}}}
+//    Only identified files have an entry.
+//
+// CAUTION (see core/errors.nv): nothing inside a sync block may raise. The
+// blocks below only touch plain maps, and file work there goes through the
+// never-raising core.readJsonFile / core.writeFileAtomic.
+
+var modsLock = thread.mutex()
+var fileInfoCache = {}          // cache key -> {"sha1", "metadata"}
+
+private final FILE_CACHE_LIMIT = 8192
+
+// --- in-memory file cache ------------------------------------------------------
+
+define class MetadataTask {
+    private string data: get, set
+
+    method run(): object {
+        return readMetadata(data)
+    }
+}
+
+method sha1Hex(string data): string {
+    return crypto.hex(crypto.sha1(data))
+}
+
+// {"sha1", "metadata"} of the mod file at `file` (size and modified time as the
+// caller saw them). A broken jar gets metadata.loader "unknown".
+method fileInfo(string file, integer size, integer modified): map<string, object> {
+    return fileInfoFor(file, size, modified, true)
+}
+
+// As fileInfo; withMetadata false only hashes the file (metadata is {}), which
+// is what resource packs, shader packs and data packs need.
+method fileInfoFor(string file, integer size, integer modified, bool withMetadata): map<string, object> {
+    var flag = "h"
+    if (withMetadata) {
+        flag = "m"
+    }
+    var key = file + "|" + size + "|" + modified + "|" + flag
+    var text = ""
+    sync (modsLock) {
+        if (fileInfoCache.has(key)) {
+            text = json.stringify(fileInfoCache[key])
+        }
+    }
+    if (text != "") {
+        return json.parse(text)
+    }
+    var data = os.readFile(file)
+    var info = {"sha1": sha1Hex(data), "metadata": {}}
+    if (withMetadata) {
+        info["metadata"] = emptyMetadata("unknown")
+        var outcome = core.runTrapped(MetadataTask{data = data})
+        if (outcome.failed()) {
+            core.logWarn("mods: cannot read metadata of " + file + ": " + outcome.error())
+        } else {
+            info["metadata"] = outcome.result()
+        }
+    }
+    var stored = json.stringify(info)
+    sync (modsLock) {
+        if (fileInfoCache.length() >= FILE_CACHE_LIMIT) {
+            fileInfoCache = {}
+        }
+        fileInfoCache[key] = json.parse(stored)
+    }
+    return info
+}
+
+// --- locations ---------------------------------------------------------------------
+
+// The location of one kind of content of a profile. `world` only matters for
+// data packs (validated by the caller). Creates nothing.
+method contentLoc(string profileId, string kind, string world): ContentLoc {
+    var gameDir = core.profileDir(profileId)
+    var dir = path.join(gameDir, kind)
+    var store = path.join(gameDir, ".volt", kind + ".json")
+    if (kind == "datapacks") {
+        dir = path.join(gameDir, "saves", world, "datapacks")
+        store = path.join(gameDir, ".volt", "datapacks-" + sha1Hex(world).substring(0, 16) + ".json")
+    }
+    return ContentLoc{profileId = profileId, kind = kind, world = world, dir = dir, store = store}
+}
+
+// --- mods.json ----------------------------------------------------------------------
+
+// The "mods" map of a parsed store, repaired when the file is odd. Never raises.
+method storeMods(object stored): map<string, object> {
+    if (core.isMap(stored) && stored.has("mods") && core.isMap(stored["mods"])) {
+        return stored["mods"]
+    }
+    return {}
+}
+
+// sha1 -> entry. A copy; reading never raises.
+method loadStore(ContentLoc loc): map<string, object> {
+    var text = ""
+    sync (modsLock) {
+        text = json.stringify(storeMods(core.readJsonFile(loc.store(), {})))
+    }
+    return json.parse(text)
+}
+
+// Applies changes to the store in one locked read-modify-write:
+// `puts` are partial entries ({"sha1": ..., fields...}) merged into the
+// entry of their sha1, `removes` are sha1 values whose entry goes away.
+method changeStore(ContentLoc loc, array puts, array removes) {
+    var file = loc.store()
+    var writeError = ""
+    sync (modsLock) {
+        var mods = storeMods(core.readJsonFile(file, {}))
+        for (sha in removes) {
+            mods.remove(sha)
+        }
+        for (patch in puts) {
+            if (core.isMap(patch) && patch.has("sha1") && core.isString(patch["sha1"])) {
+                var sha = patch["sha1"]
+                var entry = {"fileName": "", "sha1": sha, "source": core.none(), "update": core.none()}
+                if (mods.has(sha) && core.isMap(mods[sha])) {
+                    entry = mods[sha]
+                }
+                for (key in patch) {
+                    entry[key] = patch[key]
+                }
+                mods[sha] = entry
+            }
+        }
+        writeError = core.writeFileAtomic(file, json.pretty({"mods": mods}) + "\n")
+    }
+    if (writeError != "") {
+        core.internal("cannot save " + file + ": " + writeError)
+    }
+}
+
+// Records where one file of the location came from: `sha1` is the file's
+// sha1 as scanContent reports it (the caller hashes the file on disk),
+// `fileName` its current name. A new source starts without an update.
+method recordSource(ContentLoc loc, string fileName, string sha1, map<string, object> source) {
+    if (sha1 == "" || fileName == "") {
+        core.internal("cannot record the source of '" + fileName + "': no sha1 or file name")
+    }
+    changeStore(loc, [{"sha1": sha1.toLower(), "fileName": fileName, "source": source, "update": core.none()}], [])
+}
+
+// --- busy profiles ----------------------------------------------------------------------
+
+// profile id -> kind of the mods job running for it. One mods job per profile.
+var busyProfiles = {}
+
+// Marks the profile busy; false when another mods job holds it.
+method claimProfile(string profileId, string kind): bool {
+    var claimed = false
+    sync (modsLock) {
+        if (busyProfiles.has(profileId) == false) {
+            busyProfiles[profileId] = kind
+            claimed = true
+        }
+    }
+    return claimed
+}
+
+method releaseProfile(string profileId) {
+    sync (modsLock) {
+        busyProfiles.remove(profileId)
+    }
+}
+
+// The kind of the mods job running for the profile, "" when none.
+method busyKind(string profileId): string {
+    var kind = ""
+    sync (modsLock) {
+        if (busyProfiles.has(profileId)) {
+            kind = busyProfiles[profileId]
+        }
+    }
+    return kind
+}

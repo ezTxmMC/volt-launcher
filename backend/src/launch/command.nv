@@ -1,0 +1,455 @@
+package launch
+
+import accounts
+import strings
+import core
+import path
+
+// The launch command line (from the Java launcher's LaunchCommandBuilder).
+//
+//   <java> -Xmx<max>M -Xms<min>M
+//          arguments.jvm (rules applied)             modern metadata
+//       or -Djava.library.path=<natives> -cp <cp>    legacy (minecraftArguments only)
+//          the profile's jvmArgs (whitespace split; exact duplicates dropped,
+//          -Xmx/-Xms dropped because the heap is set above)
+//          mainClass
+//          arguments.game (rules applied), or minecraftArguments split on spaces
+//
+// Placeholders ${...} are replaced in one pass (a value is never expanded
+// again); unknown ones stay as they are. The session (name, uuid, access token,
+// user type, xuid) is the selected account from the accounts module; without a
+// Microsoft sign-in that is the offline default "Player" (token "0", user type
+// "legacy").
+
+final LAUNCH_DEFAULT_MAX_MB = 2048
+final LAUNCH_DEFAULT_MIN_MB = 512
+
+// The command line for the game log: the access token and the session value
+// that contains it are replaced by "***" (the logs of a profile are readable in the app).
+method launchMaskedCommand(array<string> command): string {
+    var parts = []
+    var maskNext = false
+    for (arg in command) {
+        if (maskNext) {
+            parts.append("***")
+            maskNext = false
+        } else if (arg == "--accessToken") {
+            parts.append(arg)
+            maskNext = true
+        } else if (arg.startsWith("token:") && arg.split(":").length() == 3) {
+            parts.append("token:***:" + arg.split(":")[2])
+        } else {
+            parts.append(arg)
+        }
+    }
+    return parts.join(" ")
+}
+
+method launchSubstitute(string input, map<string, object> vars): string {
+    if (input.contains("$") == false) {
+        return input
+    }
+    var out = ""
+    var rest = input
+    while (true) {
+        var start = rest.indexOf("$" + "{")
+        if (start < 0) {
+            out = out + rest
+            break
+        }
+        var tail = rest.substring(start + 2, rest.length())
+        var end = tail.indexOf("}")
+        if (end < 0) {
+            out = out + rest
+            break
+        }
+        var key = tail.substring(0, end)
+        out = out + rest.substring(0, start)
+        if (vars.has(key)) {
+            out = out + vars[key]
+        } else {
+            out = out + "$" + "{" + key + "}"
+        }
+        rest = tail.substring(end + 1, tail.length())
+    }
+    return out
+}
+
+// The raw (unsubstituted) arguments of one kind ("jvm" or "game").
+method launchCollectArgs(map<string, object> meta, string kind, map<string, object> features): array {
+    var args = []
+    var arguments = core.getOr(meta, "arguments", core.none())
+    if (core.isMap(arguments)) {
+        var list = core.getOr(arguments, kind, [])
+        if (core.isArray(list) == false) {
+            return args
+        }
+        for (entry in list) {
+            if (core.isString(entry)) {
+                args.append(entry)
+                continue
+            }
+            if (core.isMap(entry) == false) {
+                continue
+            }
+            if (launchRulesAllow(core.getOr(entry, "rules", core.none()), features) == false) {
+                continue
+            }
+            var value = core.getOr(entry, "value", core.none())
+            if (core.isString(value)) {
+                args.append(value)
+            } else if (core.isArray(value)) {
+                for (part in value) {
+                    if (core.isString(part)) {
+                        args.append(part)
+                    }
+                }
+            }
+        }
+        return args
+    }
+    if (kind == "game") {
+        for (part in launchText(core.getOr(meta, "minecraftArguments", "")).split(" ")) {
+            if (part.trim() != "") {
+                args.append(part.trim())
+            }
+        }
+    }
+    return args
+}
+
+method launchIsHeapArg(string arg): bool {
+    return arg.startsWith("-Xmx") || arg.startsWith("-Xms")
+}
+
+method launchPositive(object value): integer {
+    if (core.isWholeNumber(value) && core.toInteger(value) > 0) {
+        return core.toInteger(value)
+    }
+    return 0
+}
+
+// --- quick play ----------------------------------------------------------------------------
+//
+// A launch body may carry quickPlay (checked in route.nv): {"mode": "multiplayer", "server":
+// "host" or "host:port"} or {"mode": "singleplayer", "world": "<folder>"}. The quick play map
+// here is that checked request, or {} when the launch has none. A version whose metadata has
+// the has_quick_plays_support rule (1.20 and newer) gets the game's own --quickPlayMultiplayer /
+// --quickPlaySingleplayer through the placeholders; an older one gets "--server <host> --port
+// <port>" after the game arguments (multiplayer) or is refused (singleplayer, 422 in the job).
+
+final QUICK_HOST_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-_"
+final QUICK_IPV6_CHARS = "0123456789abcdefABCDEF:."
+final QUICK_DIGITS = "0123456789"
+final QUICK_DEFAULT_PORT = "25565"
+final QUICK_UNSUPPORTED_MESSAGE = "This Minecraft version cannot open a world from the command line."
+
+// The first run of digits of `text` ("" when it does not start with one).
+method launchLeadingDigits(string text): string {
+    var out = ""
+    for (ch in text) {
+        if (QUICK_DIGITS.contains(ch) == false) {
+            break
+        }
+        out = out + ch
+    }
+    return out
+}
+
+// A port: one to five digits, 1 to 65535.
+method launchValidPort(string text): bool {
+    if (text.length() < 1 || text.length() > 5) {
+        return false
+    }
+    var digits = launchLeadingDigits(text)
+    if (digits.length() != text.length()) {
+        return false
+    }
+    var number = parseInt(text)
+    return number >= 1 && number <= 65535
+}
+
+// A quick play server address split into {"host", "port", "hasPort"}, or {} when the text is not
+// one. Forms: "host", "host:port", "[ipv6]" and "[ipv6]:port" (hex digits, colons and dots inside
+// the brackets). Spaces, "/" and other characters are not allowed; the length is 1 to 255.
+method launchParseServer(string server): map<string, object> {
+    if (server.length() < 1 || server.length() > 255) {
+        return {}
+    }
+    var host = ""
+    var port = ""
+    var hasPort = false
+    if (server.startsWith("[")) {
+        var close = server.indexOf("]")
+        if (close < 2) {
+            return {}
+        }
+        host = server.substring(0, close + 1)
+        for (ch in host.substring(1, close)) {
+            if (QUICK_IPV6_CHARS.contains(ch) == false) {
+                return {}
+            }
+        }
+        var rest = server.substring(close + 1, server.length())
+        if (rest != "") {
+            if (rest.startsWith(":") == false) {
+                return {}
+            }
+            hasPort = true
+            port = rest.substring(1, rest.length())
+        }
+    } else {
+        host = server
+        var colon = server.indexOf(":")
+        if (colon >= 0) {
+            host = server.substring(0, colon)
+            hasPort = true
+            port = server.substring(colon + 1, server.length())
+        }
+        if (host == "") {
+            return {}
+        }
+        for (ch in host) {
+            if (QUICK_HOST_CHARS.contains(ch) == false) {
+                return {}
+            }
+        }
+    }
+    if (hasPort && (launchValidPort(port) == false)) {
+        return {}
+    }
+    return {"host": host, "port": port, "hasPort": hasPort}
+}
+
+// The mode of a checked quick play request: "multiplayer", "singleplayer" or "" (none).
+method launchQuickMode(map<string, object> quick): string {
+    if (quick.has("mode") == false) {
+        return ""
+    }
+    string mode = quick["mode"]
+    return mode
+}
+
+// The server of a multiplayer request ("" for other modes).
+method launchQuickServer(map<string, object> quick): string {
+    if (launchQuickMode(quick) != "multiplayer") {
+        return ""
+    }
+    string server = quick["server"]
+    return server
+}
+
+// The world folder of a singleplayer request ("" for other modes).
+method launchQuickWorld(map<string, object> quick): string {
+    if (launchQuickMode(quick) != "singleplayer") {
+        return ""
+    }
+    string world = quick["world"]
+    return world
+}
+
+// The request as the launch log names it, e.g. "multiplayer example.org:25565".
+method launchQuickLabel(map<string, object> quick): string {
+    if (launchQuickMode(quick) == "multiplayer") {
+        return "multiplayer " + launchQuickServer(quick)
+    }
+    return "singleplayer " + launchQuickWorld(quick)
+}
+
+// The file the game writes its quick play log to (the placeholder quickPlayPath).
+method launchQuickPlayPath(string gameDir): string {
+    return path.join(gameDir, "quickPlay", "java", "quickplay.json")
+}
+
+// Whether version metadata supports quick play: one of its game argument rules names
+// has_quick_plays_support.
+method launchMetaQuickPlay(map<string, object> meta): bool {
+    var arguments = core.getOr(meta, "arguments", core.none())
+    if (core.isMap(arguments) == false) {
+        return false
+    }
+    var list = core.getOr(arguments, "game", core.none())
+    if (core.isArray(list) == false) {
+        return false
+    }
+    for (entry in list) {
+        if (core.isMap(entry) == false) {
+            continue
+        }
+        var rules = core.getOr(entry, "rules", core.none())
+        if (core.isArray(rules) == false) {
+            continue
+        }
+        for (rule in rules) {
+            if (core.isMap(rule) == false) {
+                continue
+            }
+            var wanted = core.getOr(rule, "features", core.none())
+            if (core.isMap(wanted) && core.getOr(wanted, "has_quick_plays_support", false) == true) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// The 422 of a singleplayer request that the version cannot open.
+method launchQuickRefused(): object {
+    return core.fail(422, "unsupported", QUICK_UNSUPPORTED_MESSAGE)
+}
+
+// The job's check against the metadata of the version (before any download). Singleplayer
+// needs quick play support; multiplayer falls back to --server/--port.
+method launchQuickCheckMeta(map<string, object> meta, map<string, object> quick) {
+    if (launchQuickMode(quick) == "singleplayer" && launchMetaQuickPlay(meta) == false) {
+        launchQuickRefused()
+    }
+}
+
+// The command as an argument list (no quick play).
+method launchBuildCommand(map<string, object> profile, map<string, object> install, string javaPath): array {
+    return launchBuildCommandQuick(profile, install, javaPath, {})
+}
+
+// The command as an argument list; `quick` is the checked quick play request or {}.
+method launchBuildCommandQuick(map<string, object> profile, map<string, object> install, string javaPath, map<string, object> quick): array {
+    var meta = install["meta"]
+    var gameDir = core.profileDir(profile["id"])
+    var separator = launchClasspathSeparator()
+    var classpath = install["classpath"].join(separator)
+    var session = accounts.accountsLaunchSession()
+    var assetsDir = install["assetsDir"]
+    var vars = {
+        "auth_player_name": session["name"],
+        "version_name": install["versionId"],
+        "game_directory": gameDir,
+        "assets_root": assetsDir,
+        "game_assets": assetsDir + "/virtual/" + install["assetIndex"],
+        "assets_index_name": install["assetIndex"],
+        "auth_uuid": session["uuid"],
+        "auth_access_token": session["accessToken"],
+        "auth_session": "token:" + session["accessToken"] + ":" + session["uuid"],
+        "auth_xuid": session["xuid"],
+        "clientid": "",
+        "user_type": session["userType"],
+        "user_properties": "{}",
+        "version_type": launchText(core.getOr(meta, "type", "release")),
+        "natives_directory": install["nativesDir"],
+        "launcher_name": "VoltLauncher",
+        "launcher_version": core.version(),
+        "classpath": classpath,
+        "classpath_separator": separator,
+        "library_directory": install["librariesDir"],
+        "resolution_width": "1280",
+        "resolution_height": "720"
+    }
+    var features = {
+        "has_custom_resolution": false,
+        "is_demo_user": false,
+        "has_quick_plays_support": false,
+        "is_quick_play_singleplayer": false,
+        "is_quick_play_multiplayer": false,
+        "is_quick_play_realms": false
+    }
+
+    // Quick play: without a request nothing here changes the arguments.
+    var quickMode = launchQuickMode(quick)
+    var quickNative = false
+    if (quickMode != "") {
+        launchQuickCheckMeta(meta, quick)
+        quickNative = launchMetaQuickPlay(meta)
+    }
+    if (quickNative) {
+        features["has_quick_plays_support"] = true
+        if (quickMode == "multiplayer") {
+            features["is_quick_play_multiplayer"] = true
+        } else {
+            features["is_quick_play_singleplayer"] = true
+        }
+        vars["quickPlayPath"] = launchQuickPlayPath(gameDir)
+        vars["quickPlayMultiplayer"] = launchQuickServer(quick)
+        vars["quickPlaySingleplayer"] = launchQuickWorld(quick)
+        vars["quickPlayRealms"] = ""
+    }
+
+    var maxMb = launchPositive(core.getOr(profile, "memoryMb", core.none()))
+    if (maxMb == 0) {
+        maxMb = launchPositive(core.setting("memoryMb"))
+    }
+    if (maxMb == 0) {
+        maxMb = LAUNCH_DEFAULT_MAX_MB
+    }
+    var minMb = LAUNCH_DEFAULT_MIN_MB
+    if (minMb > maxMb) {
+        minMb = maxMb
+    }
+
+    // A wrapper (for example gamemoderun, or "env A=1 nice") runs in front of java.
+    var command = []
+    var wrapper = core.getOr(profile, "wrapperCommand", core.none())
+    if (core.isString(wrapper)) {
+        for (part in strings.words(wrapper)) {
+            command.append(part)
+        }
+    }
+    command.append(javaPath)
+    command.append("-Xmx" + maxMb + "M")
+    command.append("-Xms" + minMb + "M")
+    var legacy = core.isMap(core.getOr(meta, "arguments", core.none())) == false && meta.has("minecraftArguments")
+    if (legacy) {
+        command.append("-Djava.library.path=" + install["nativesDir"])
+        command.append("-Dminecraft.launcher.brand=VoltLauncher")
+        command.append("-Dminecraft.launcher.version=" + core.version())
+        command.append("-cp")
+        command.append(classpath)
+    } else {
+        for (arg in launchCollectArgs(meta, "jvm", features)) {
+            if (launchIsHeapArg(arg) == false) {
+                command.append(launchSubstitute(arg, vars))
+            }
+        }
+    }
+
+    // Extra JVM arguments: a global "jvmArgs" setting (none exists in the
+    // settings contract yet) then the profile's. Exact duplicates are dropped.
+    var extra = []
+    for (source in [core.setting("jvmArgs"), core.getOr(profile, "jvmArgs", "")]) {
+        if (core.isString(source)) {
+            for (part in strings.words(source)) {
+                if (part != "" && extra.contains(part) == false) {
+                    extra.append(part)
+                }
+            }
+        }
+    }
+    for (arg in extra) {
+        if (launchIsHeapArg(arg) == false) {
+            command.append(launchSubstitute(arg, vars))
+        }
+    }
+
+    var mainClass = core.getOr(meta, "mainClass", "")
+    if (core.isString(mainClass) == false || mainClass == "") {
+        core.internal("the metadata of " + install["versionId"] + " has no mainClass")
+    }
+    command.append(mainClass)
+    for (arg in launchCollectArgs(meta, "game", features)) {
+        command.append(launchSubstitute(arg, vars))
+    }
+    if (quickMode == "multiplayer" && quickNative == false) {
+        // Before quick play existed: the game's own server arguments, after the game arguments.
+        var address = launchParseServer(launchQuickServer(quick))
+        string port = address["port"]
+        if (address["hasPort"] == false) {
+            port = QUICK_DEFAULT_PORT
+        }
+        command.append("--server")
+        command.append(address["host"])
+        command.append("--port")
+        command.append(port)
+    }
+    if (core.getOr(profile, "fullscreen", false) == true) {
+        command.append("--fullscreen")
+    }
+    return command
+}

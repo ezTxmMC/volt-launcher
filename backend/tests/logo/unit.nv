@@ -1,0 +1,105 @@
+package main
+
+import core
+import json
+import os
+import path
+import logo
+
+// Unit tests of the logo module. Run through run.sh, which writes the fixtures into a
+// temporary data dir and passes: <dataDir> <expect.json>.
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+method equal(string name, object actual, object expected) {
+    var same = json.stringify(actual) == json.stringify(expected)
+    if (same == false) {
+        println "      got " + json.stringify(actual) + ", expected " + json.stringify(expected)
+    }
+    check(name, same)
+}
+
+define class AnswerTask {
+    private string id: get, set
+
+    method run(): object {
+        return logo.logoAnswer(id)
+    }
+}
+
+// The answer for a profile id, or {} when it raised (the error is printed).
+method answerOf(string name, string id): map<string, object> {
+    var outcome = core.runTrapped(AnswerTask{id = id})
+    if (outcome.failed()) {
+        check(name + " (no error)", false)
+        println "      " + outcome.error()
+        return {}
+    }
+    return outcome.result()
+}
+
+method main(array<string> args) {
+    var dataDir = args[0]
+    var expect = json.parse(os.readFile(args[1]))
+    core.init(dataDir, false)
+
+    // --- version classification: release = two or three numeric parts
+    var cases = [
+        ["1.21.1", true], ["26.1", true], ["26.1.2", true], ["1.20", true],
+        ["26w14a", false], ["1.21.4-pre1", false], ["1.20-rc1", false], ["24w14a", false],
+        ["1..2", false], ["1.", false], ["", false], ["1.21.1.4", false]
+    ]
+    for (pair in cases) {
+        var kind = "snapshot"
+        if (pair[1]) {
+            kind = "release"
+        }
+        check("classify " + pair[0] + " as " + kind, logo.logoIsRelease(pair[0]) == pair[1])
+    }
+
+    // --- priority: custom, modpack, vanilla (texture by release or snapshot), loader
+    equal("custom profile returns its own icon", answerOf("custom", "aaaaaaaaaaa1"),
+        {"kind": "custom", "loader": "vanilla", "dataUrl": expect["custom"]})
+    equal("linked profile with a cached pack icon returns modpack", answerOf("modpack", "aaaaaaaaaaa2"),
+        {"kind": "modpack", "loader": "fabric", "dataUrl": expect["pack"]})
+    equal("vanilla release profile returns the grass texture", answerOf("vanilla release", "aaaaaaaaaaa3"),
+        {"kind": "vanilla", "loader": "vanilla", "dataUrl": expect["grass"]})
+    equal("vanilla snapshot profile returns the dirt texture", answerOf("vanilla snapshot", "aaaaaaaaaaa4"),
+        {"kind": "vanilla", "loader": "vanilla", "dataUrl": expect["dirt"]})
+    equal("vanilla profile without client jar: vanilla, dataUrl null", answerOf("vanilla no jar", "aaaaaaaaaaa5"),
+        {"kind": "vanilla", "loader": "vanilla", "dataUrl": core.none()})
+    equal("loader profile without client jar returns loader", answerOf("loader no jar", "aaaaaaaaaaa6"),
+        {"kind": "loader", "loader": "fabric", "dataUrl": core.none()})
+    equal("loader profile with a client jar still returns loader", answerOf("loader with jar", "aaaaaaaaaaa7"),
+        {"kind": "loader", "loader": "forge", "dataUrl": core.none()})
+    equal("deleted pack falls through to loader without error", answerOf("deleted pack", "aaaaaaaaaaa8"),
+        {"kind": "loader", "loader": "fabric", "dataUrl": core.none()})
+
+    // --- vanilla texture cache: written after the first read, and read before the jar
+    var grassCache = path.join(dataDir, "cache", "logos", "vanilla-grass.png")
+    check("vanilla grass texture cached after first read", os.isFile(grassCache))
+    os.writeFile(grassCache, os.readFile(path.join(dataDir, "marker.png")))
+    equal("vanilla texture comes from the cache on the second read", answerOf("vanilla release again", "aaaaaaaaaaa3"),
+        {"kind": "vanilla", "loader": "vanilla", "dataUrl": expect["marker"]})
+
+    // --- unknown profile: 404
+    var missing = core.runTrapped(AnswerTask{id = "000000000000"})
+    check("unknown profile is 404", missing.failed() && core.decodeFailure(missing.error())["status"] == 404)
+
+    println "logo unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures > 0) {
+        return 1
+    }
+    return 0
+}

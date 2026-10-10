@@ -1,0 +1,219 @@
+package main
+
+import core
+import json
+import os
+import path
+import launch
+import system
+
+// Unit tests of src/system (updates from the CDN) and of the fixed settings in src/core/settings.nv.
+// Run through run.sh, which compiles this file against src/core, src/launch and src/system in a
+// temporary tree and passes the fixture directory (update.bin, update.sha512, manifest.json) and a
+// scratch data directory. No network access: the manifest is a fixture.
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+define class TrapRoute {
+    private string verb: get, set
+    private array<string> segments: get, set
+    private object body: get, set
+
+    method run(): object {
+        return core.settingsRoute(verb, segments, {}, body)
+    }
+}
+
+define class TrapSystemRoute {
+    private string verb: get, set
+    private array<string> segments: get, set
+
+    method run(): object {
+        return system.route(verb, segments, {}, {})
+    }
+}
+
+// The code of a trapped failure, or "" when the task succeeded.
+method codeOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["code"]
+}
+
+// The message of a trapped failure, or "" when the task succeeded.
+method failureOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["message"]
+}
+
+method repeatChar(string ch, integer count): string {
+    var out = ""
+    var i = 0
+    while (i < count) {
+        out = out + ch
+        i = i + 1
+    }
+    return out
+}
+
+method main(array<string> arguments) {
+    var fixtures = arguments[0]
+    var dataDir = arguments[1]
+    var payloadPath = path.join(fixtures, "update.bin")
+    var expectedHex = os.readFile(path.join(fixtures, "update.sha512")).trim()
+    var manifestText = os.readFile(path.join(fixtures, "manifest.json"))
+    var payloadSize = os.fileSize(payloadPath)
+    var page = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest/"
+    var feed = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest"
+
+    // --- fixed settings: defaults
+    core.init(dataDir, false)
+    var defaults = core.defaultSettings()
+    check("default bridgeUrl is the fixed bridge", defaults["bridgeUrl"] == "https://bridge.volt-launcher.app")
+    check("default discordApplicationId is the fixed id", defaults["discordApplicationId"] == "1490544471962685530")
+    check("updateRepository is not a setting any more", defaults.has("updateRepository") == false)
+    check("GET settings shows the fixed discord id", core.settings()["discordApplicationId"] == "1490544471962685530")
+    check("GET settings shows the fixed bridge", core.setting("bridgeUrl") == "https://bridge.volt-launcher.app")
+
+    // --- fixed settings: PATCH refuses them (400 bad_request, "fixed by the launcher")
+    var patchBridge = failureOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"bridgeUrl": "http://localhost:8787"}})
+    check("PATCH bridgeUrl -> refused as fixed", patchBridge == "'bridgeUrl' is fixed by the launcher")
+    check("PATCH bridgeUrl -> 400 bad_request", codeOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"bridgeUrl": "http://x"}}) == "bad_request")
+    var patchDiscord = failureOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"discordApplicationId": "123456789012345678"}})
+    check("PATCH discordApplicationId -> refused as fixed", patchDiscord == "'discordApplicationId' is fixed by the launcher")
+    check("PATCH discordApplicationId -> 400 bad_request", codeOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"discordApplicationId": "1"}}) == "bad_request")
+    check("PATCH updateRepository -> unknown setting", failureOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"updateRepository": "a/b"}}) == "unknown setting 'updateRepository'")
+    var mixedRefused = failureOf(TrapRoute{verb = "PATCH", segments = ["settings"], body = {"memoryMb": 2048, "bridgeUrl": "http://x"}})
+    check("PATCH with a fixed key changes nothing (whole patch refused)", mixedRefused == "'bridgeUrl' is fixed by the launcher" && core.setting("memoryMb") != 2048)
+    var okPatch = core.settingsRoute("PATCH", ["settings"], {}, {"memoryMb": 2048})
+    check("PATCH of an editable setting still works", okPatch["status"] == 200 && core.setting("memoryMb") == 2048)
+
+    // a stored value of a fixed key in settings.json is ignored on load
+    os.writeFile(path.join(dataDir, "settings.json"), "{\"bridgeUrl\": \"http://evil.example\", \"discordApplicationId\": \"42\", \"memoryMb\": 3072}")
+    core.loadSettings()
+    check("settings.json: a stored bridgeUrl is ignored", core.setting("bridgeUrl") == "https://bridge.volt-launcher.app")
+    check("settings.json: a stored discord id is ignored", core.setting("discordApplicationId") == "1490544471962685530")
+    check("settings.json: other stored values still load", core.setting("memoryMb") == 3072)
+
+    // --- platforms (launch.launchOsName / launchArch -> manifest key)
+    check("platform linux x64 -> linux_amd64", system.systemPlatformFor("linux", "amd64") == "linux_amd64")
+    check("platform linux arm64 -> linux_aarch64", system.systemPlatformFor("linux", "aarch64") == "linux_aarch64")
+    check("platform windows x64 -> windows_x86_64", system.systemPlatformFor("windows", "amd64") == "windows_x86_64")
+    check("platform windows arm64 -> windows_arm64", system.systemPlatformFor("windows", "aarch64") == "windows_arm64")
+    check("platform macOS arm64 -> macos_arm64", system.systemPlatformFor("osx", "aarch64") == "macos_arm64")
+    check("platform macOS x64 has no build", system.systemPlatformFor("osx", "amd64") == "")
+    check("platform unknown OS has no build", system.systemPlatformFor("freebsd", "amd64") == "")
+    check("this machine maps to a manifest key or none", system.systemPlatformKey() == "" || system.systemPlatformKey().contains("_"))
+
+    // --- versions (Lumen's compareVersions)
+    check("1.2.10 is newer than 1.2.9", system.systemCompareVersions("1.2.10", "1.2.9") == 1)
+    check("0.10.0 is newer than 0.9.0", system.systemCompareVersions("0.10.0", "0.9.0") == 1)
+    check("equal versions compare 0", system.systemCompareVersions("1.0.0", "1.0.0") == 0)
+    check("a leading v is ignored", system.systemCompareVersions("v2.0.0", "2.0.0") == 0)
+    check("a pre-release is older than its release", system.systemCompareVersions("1.0.0-beta.1", "1.0.0") == -1)
+    check("a release is newer than its pre-release", system.systemCompareVersions("1.0.0", "1.0.0-beta.1") == 1)
+    check("1.3.0-beta.1 is newer than 1.2.9", system.systemCompareVersions("1.3.0-beta.1", "1.2.9") == 1)
+    check("beta.2 is older than beta.10 (numeric)", system.systemCompareVersions("1.0.0-beta.2", "1.0.0-beta.10") == -1)
+    check("alpha is older than beta", system.systemCompareVersions("1.0.0-alpha", "1.0.0-beta") == -1)
+    check("missing segments count as 0", system.systemCompareVersions("1.0", "1.0.0") == 0)
+
+    // --- manifest parsing (fixture: linux_amd64 has update, windows has a name with a space,
+    //     macos_arm64 has only files and is a pre-release, linux_aarch64 has no sha512)
+    var linux = system.systemUpdateFromManifest(manifestText, "linux_amd64", "0.1.0", false)
+    check("manifest: newer release is available", linux["available"] == true)
+    check("manifest: latestVersion from the platform entry", linux["latestVersion"] == "0.2.0" && linux["currentVersion"] == "0.1.0")
+    check("manifest: name is product and version", linux["name"] == "VoltLauncher 0.2.0")
+    check("manifest: notes when the manifest version matches", linux["notes"] == "Fixture notes")
+    check("manifest: publishedAt is the platform releaseDate", linux["publishedAt"] == "2026-10-01T10:00:00.000Z")
+    check("manifest: assetName and assetSize", linux["assetName"] == "VoltLauncher-0.2.0.AppImage" && linux["assetSize"] == payloadSize)
+    check("manifest: downloadUrl is <feed>/<platform>/<name>", linux["downloadUrl"] == feed + "/linux_amd64/VoltLauncher-0.2.0.AppImage")
+    check("manifest: downloadable with a SHA-512", linux["downloadable"] == true && linux["reason"] == "")
+    check("manifest: checksumSha512 is the hex of the manifest value", linux["checksumSha512"] == expectedHex)
+    check("manifest: releaseUrl is the release page", linux["releaseUrl"] == page)
+    check("manifest: not a pre-release", linux["prerelease"] == false)
+
+    var windows = system.systemUpdateFromManifest(manifestText, "windows_x86_64", "0.1.0", false)
+    check("manifest: file name with a space is percent-encoded in the URL", windows["downloadUrl"] == feed + "/windows_x86_64/VoltLauncher%20Setup%200.2.0.exe")
+    check("manifest: no update entry -> files[0] is the installer", windows["assetName"] == "VoltLauncher Setup 0.2.0.exe" && windows["downloadable"] == true)
+
+    var mac = system.systemUpdateFromManifest(manifestText, "macos_arm64", "0.1.0", false)
+    check("manifest: pre-release is not offered without beta updates", mac["available"] == false && mac["prerelease"] == true)
+    check("manifest: pre-release reason names the setting", mac["reason"].contains("pre-release") && mac["reason"].contains("beta updates"))
+    var macBeta = system.systemUpdateFromManifest(manifestText, "macos_arm64", "0.1.0", true)
+    check("manifest: pre-release is offered with beta updates", macBeta["available"] == true && macBeta["latestVersion"] == "0.3.0-beta.1")
+
+    var same = system.systemUpdateFromManifest(manifestText, "linux_amd64", "0.2.0", false)
+    check("manifest: the same version is not an update", same["available"] == false && same["reason"] == "You already have the latest version.")
+    check("manifest: the same version still reports latestVersion", same["latestVersion"] == "0.2.0")
+    var newerLocal = system.systemUpdateFromManifest(manifestText, "linux_amd64", "0.9.0", false)
+    check("manifest: an older release is not an update", newerLocal["available"] == false)
+
+    var missing = system.systemUpdateFromManifest(manifestText, "freebsd_amd64", "0.1.0", false)
+    check("manifest: no entry for the platform -> not available with a reason", missing["available"] == false && missing["reason"].contains("No update is published for freebsd_amd64"))
+    var noSha = system.systemUpdateFromManifest(manifestText, "linux_aarch64", "0.1.0", false)
+    check("manifest: an installer without sha512 is not downloadable", noSha["available"] == true && noSha["downloadable"] == false && noSha["reason"].contains("SHA-512"))
+    var broken = system.systemUpdateFromManifest("{not json", "linux_amd64", "0.1.0", false)
+    check("manifest: invalid JSON -> not available with a reason", broken["available"] == false && broken["reason"].contains("not valid JSON"))
+    var noPlatforms = system.systemUpdateFromManifest("{\"version\": \"0.2.0\"}", "linux_amd64", "0.1.0", false)
+    check("manifest: no platforms -> not available with a reason", noPlatforms["available"] == false && noPlatforms["reason"].contains("no platforms"))
+
+    // --- SHA-512: base64 of the manifest value and the hex digest of the file
+    check("sha512: manifest base64 decodes to the file digest", system.systemSha512Hex(json.parse(manifestText)["platforms"]["linux_amd64"]["update"]["sha512"]) == expectedHex)
+    check("sha512: the digest tool agrees with hashlib", launch.launchFileDigest(payloadPath, "sha512") == expectedHex)
+    check("sha512: a value of the wrong length is rejected", system.systemSha512Hex("abc") == "")
+    check("sha512: 88 characters without base64 data are rejected", system.systemSha512Hex(repeatChar("!", 88)) == "")
+
+    // --- verification of a download (match, SHA-512 mismatch, size mismatch)
+    var okTemp = path.join(dataDir, "ok.part")
+    var okTarget = path.join(dataDir, "ok.bin")
+    os.copy(payloadPath, okTemp)
+    var okProblem = system.systemCheckDownload(okTemp, okTarget, expectedHex, payloadSize)
+    check("verify: a matching file passes", okProblem == "" && os.isFile(okTemp))
+    os.remove(okTemp)
+
+    var wrong = "1" + expectedHex.substring(1, expectedHex.length())
+    if (expectedHex.startsWith("1")) {
+        wrong = "2" + expectedHex.substring(1, expectedHex.length())
+    }
+    var badTemp = path.join(dataDir, "bad.part")
+    var badTarget = path.join(dataDir, "bad.bin")
+    os.copy(payloadPath, badTemp)
+    os.copy(payloadPath, badTarget)
+    var badProblem = system.systemCheckDownload(badTemp, badTarget, wrong, payloadSize)
+    check("verify: a SHA-512 mismatch is reported", badProblem.contains("SHA-512 does not match"))
+    check("verify: a SHA-512 mismatch deletes the download", os.isFile(badTemp) == false && os.isFile(badTarget) == false)
+
+    var sizeTemp = path.join(dataDir, "size.part")
+    var sizeTarget = path.join(dataDir, "size.bin")
+    os.copy(payloadPath, sizeTemp)
+    var sizeProblem = system.systemCheckDownload(sizeTemp, sizeTarget, expectedHex, payloadSize + 1)
+    check("verify: a size mismatch is reported", sizeProblem.contains("bytes"))
+    check("verify: a size mismatch deletes the download", os.isFile(sizeTemp) == false)
+
+    // --- routes that need no network
+    var page2 = system.route("POST", ["updates", "open-release"], {}, {})
+    check("POST /api/updates/open-release answers the release page", page2["status"] == 200 && page2["body"]["url"] == page)
+    check("GET /api/updates/download -> 405 bad_request", codeOf(TrapSystemRoute{verb = "GET", segments = ["updates", "download"]}) == "bad_request")
+
+    println ""
+    println "system unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures != 0) {
+        core.internal("system unit tests failed")
+    }
+}

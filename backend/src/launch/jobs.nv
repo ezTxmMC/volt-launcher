@@ -1,0 +1,187 @@
+package launch
+
+import accounts
+import path
+import thread
+import core
+
+// The install-game and launch jobs.
+//
+// A profile has at most one of them at a time (claimed in the route, released
+// when the job ends however it ends). Work on shared files is serialised per
+// key - "version:<folder>" for an installation, "jdk-<major>" for the Java
+// selection/download - so two profiles on the same version never write the
+// same files at once. The keys are a set under a mutex, not a held `sync`
+// block, because the work inside can fail (see core/errors.nv).
+
+var launchKeyLock = thread.mutex()
+var launchBusyKeys = {}
+
+method launchAcquireKey(string key, string jobId) {
+    var announced = false
+    while (true) {
+        var got = false
+        sync (launchKeyLock) {
+            if (launchBusyKeys.has(key) == false) {
+                launchBusyKeys[key] = jobId
+                got = true
+            }
+        }
+        if (got) {
+            return
+        }
+        if (announced == false) {
+            core.jobMessage(jobId, "Warte auf eine andere Installation (" + key + ")")
+            announced = true
+        }
+        core.checkCancelled(jobId)
+        thread.sleep(250)
+    }
+}
+
+method launchReleaseKey(string key) {
+    sync (launchKeyLock) {
+        launchBusyKeys.remove(key)
+    }
+}
+
+// Runs task.run() holding `key`; a failure is raised again after the release.
+method launchLocked(string key, string jobId, object task): object {
+    launchAcquireKey(key, jobId)
+    var outcome = core.runTrapped(task)
+    launchReleaseKey(key)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    return outcome.result()
+}
+
+define class LaunchJavaTask {
+    private map<string, object> profile: get, set
+    private integer major: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return launchSelectJava(profile, major, jobId)
+    }
+}
+
+define class LaunchInstallTask {
+    private map<string, object> resolved: get, set
+    private string javaPath: get, set
+    private string gameDir: get, set
+    private string jobId: get, set
+    private bool verify: get, set
+
+    method run(): object {
+        return launchInstall(resolved, javaPath, gameDir, jobId, verify)
+    }
+}
+
+// The whole pipeline; `start` = launch the game at the end.
+define class LaunchPipelineTask {
+    private string profileId: get, set
+    private string jobId: get, set
+    private bool start: get, set
+    private map<string, object> quickPlay: get, set
+
+    method run(): object {
+        return launchPipeline(profileId, jobId, start, quickPlay)
+    }
+}
+
+// `quick` is the checked quick play request of the launch body ({} when there is none).
+method launchPipeline(string profileId, string jobId, bool start, map<string, object> quick): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    if (start) {
+        // Fail before any download when no Microsoft account is signed in (sign_in_required).
+        accounts.accountsLaunchSession()
+    }
+    var gameDir = launchEnsureDir(core.profileDir(profileId))
+    var resolved = launchResolve(profile, jobId)
+    if (start) {
+        // Singleplayer on a version without quick play is refused before any download (422).
+        launchQuickCheckMeta(resolved["meta"], quick)
+    }
+    var pinned = core.getOr(profile, "loaderVersion", core.none())
+    if (core.isNull(resolved["loaderVersion"]) == false && (core.isString(pinned) == false || pinned.trim() == "")) {
+        // "newest" was picked: pin it, so the next launch uses the same build
+        core.updateProfile(profileId, {"loaderVersion": resolved["loaderVersion"]})
+        core.logInfo("launch: profile " + profileId + " pinned to " + resolved["loader"] + " " + resolved["loaderVersion"])
+    }
+    core.checkCancelled(jobId)
+
+    var major = launchRequiredJava(resolved["meta"], resolved["minecraftVersion"])
+    core.jobProgress(jobId, 0.1, "Prüfe Java " + major)
+    var java = launchLocked("jdk-" + major, jobId, LaunchJavaTask{profile = profile, major = major, jobId = jobId})
+    core.checkCancelled(jobId)
+
+    var versionId = resolved["versionId"]
+    var install = launchLocked("version:" + launchFolderName(versionId), jobId, LaunchInstallTask{
+        resolved = resolved, javaPath = java, gameDir = gameDir, jobId = jobId, verify = start == false
+    })
+    if (start == false) {
+        core.logInfo("launch: profile " + profileId + " installed " + versionId + " (java " + java + ")")
+        return {"versionId": versionId, "javaPath": java}
+    }
+
+    core.checkCancelled(jobId)
+    if (launchIsRunning(profileId)) {
+        core.conflict("the game of this profile is already running")
+    }
+    core.jobProgress(jobId, 0.98, "Starte Minecraft")
+    var command = launchBuildCommandQuick(profile, install, java, quick)
+    var logFile = launchLogFile(profileId)
+    launchEnsureDir(path.dirname(logFile))
+    var header = "\n------------------------------------------------------------\n"
+    header = header + "[VoltLauncher] " + core.nowIso() + " launching " + core.getOr(profile, "name", profileId) + " (" + versionId + ")\n"
+    header = header + "[VoltLauncher] java: " + java + "\n"
+    if (launchQuickMode(quick) != "") {
+        // The game's directory for the quick play log is created here, the game does not.
+        launchEnsureDir(path.dirname(launchQuickPlayPath(gameDir)))
+        header = header + "[VoltLauncher] quick play: " + launchQuickLabel(quick) + "\n"
+    }
+    header = header + "[VoltLauncher] " + launchMaskedCommand(command) + "\n"
+    header = header + "------------------------------------------------------------\n"
+    launchAppendLog(logFile, header)
+
+    // The pre-launch command runs in the game directory with the profile's environment;
+    // a non-zero exit code aborts the launch.
+    var preCommand = core.getOr(profile, "preLaunchCommand", core.none())
+    if (core.isString(preCommand) && preCommand != "") {
+        launchAppendLog(logFile, "[VoltLauncher] pre-launch command: " + preCommand + "\n")
+        var preCode = launchRunHook(preCommand, gameDir, logFile, launchEnvEntries(profile))
+        if (preCode != 0) {
+            launchAppendLog(logFile, "[VoltLauncher] pre-launch command exited with code " + preCode + "\n")
+            core.internal("the pre-launch command exited with code " + preCode + " - the game was not started")
+        }
+    }
+    var started = launchSpawnEnv(command, launchEnvEntries(profile), gameDir, logFile)
+    var pid = started["pid"]
+    if (pid <= 0) {
+        launchAppendLog(logFile, "[VoltLauncher] could not start java: " + started["error"] + "\n")
+        core.internal("cannot start " + java + ": " + started["error"])
+    }
+    var startedAt = core.nowIso()
+    launchRegisterGame(profileId, pid, startedAt)
+    thread launchWatch(profileId, pid, logFile)
+    core.logInfo("launch: profile " + profileId + " started " + versionId + " as pid " + pid + " (log " + logFile + ")")
+    core.updateProfile(profileId, {"lastPlayed": startedAt})
+    core.jobProgress(jobId, 1.0, "Minecraft läuft (PID " + pid + ")")
+    return {"pid": pid, "versionId": versionId, "javaPath": java, "logFile": logFile}
+}
+
+define class LaunchJob based JobBody {
+    private string profileId: get, set
+    private bool start: get, set
+    private map<string, object> quickPlay: get, set
+
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(LaunchPipelineTask{profileId = profileId, jobId = jobId, start = start, quickPlay = quickPlay})
+        launchReleaseProfile(profileId)
+        if (outcome.failed()) {
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}

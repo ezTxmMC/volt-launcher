@@ -1,0 +1,132 @@
+package core
+
+import strings
+
+// Errors and the values Novus has no literal for.
+//
+// Novus (0.1.0-pre.alpha.8) has no exceptions in the language. What it has is
+// the runtime trap behind std/web: `tryRun(task)` calls `task.run()` and turns
+// any runtime error raised inside into tryFailed()/tryError() instead of
+// ending the process; `raise(text)` raises such an error on purpose. The trap
+// is per thread, so job threads can use it too.
+//
+// core.fail() encodes the HTTP status, the error code and the message into
+// the raised text; the server (and the job runner) decode it again with
+// decodeFailure(). Any other runtime error (an index out of range, a missing
+// map key) decodes as 500 "internal".
+//
+// CAUTION: a raise unwinds with longjmp, which does NOT release a lock taken
+// by `sync (m) { ... }` (see README). Never call anything that can raise
+// inside a sync block; core.runTrapped() exists for the cases that must.
+
+method tryRun(object task): object native "nv_try_run"
+method tryFailed(): bool native "nv_try_failed"
+method tryError(): string native "nv_try_error"
+method raise(string message): object native "nv_try_raise"
+
+private final FAIL_MARK = "VOLT-FAIL"
+private final CANCEL_MARK = "VOLT-CANCELLED"
+
+// Aborts the current request (or job) with an HTTP error. Never returns.
+method fail(integer status, string code, string message): object {
+    return raise(FAIL_MARK + "|" + status + "|" + code + "|" + message)
+}
+
+method badRequest(string message): object {
+    return fail(400, "bad_request", message)
+}
+
+method notFound(string message): object {
+    return fail(404, "not_found", message)
+}
+
+method conflict(string message): object {
+    return fail(409, "conflict", message)
+}
+
+method upstream(string message): object {
+    return fail(502, "upstream", message)
+}
+
+method internal(string message): object {
+    return fail(500, "internal", message)
+}
+
+// Raised by checkCancelled() inside a job body; the runner marks the job
+// cancelled instead of failed.
+method raiseCancelled(): object {
+    return raise(CANCEL_MARK)
+}
+
+method isCancelFailure(string text): bool {
+    return text == CANCEL_MARK
+}
+
+// {"status": integer, "code": string, "message": string} of a trapped error.
+method decodeFailure(string text): map<string, object> {
+    if (text.startsWith(FAIL_MARK + "|")) {
+        var rest = text.substring(FAIL_MARK.length() + 1, text.length())
+        var first = rest.indexOf("|")
+        if (first > 0) {
+            var statusText = rest.substring(0, first)
+            var tail = rest.substring(first + 1, rest.length())
+            var second = tail.indexOf("|")
+            if (second > 0 && strings.isNumeric(statusText)) {
+                return {
+                    "status": parseInt(statusText),
+                    "code": tail.substring(0, second),
+                    "message": tail.substring(second + 1, tail.length())
+                }
+            }
+        }
+    }
+    if (text == CANCEL_MARK) {
+        return {"status": 409, "code": "conflict", "message": "cancelled"}
+    }
+    return {"status": 500, "code": "internal", "message": text}
+}
+
+// The error body of the contract: {"error": {"code": ..., "message": ...}}.
+method errorBody(string code, string message): map<string, object> {
+    return {"error": {"code": code, "message": message}}
+}
+
+// A route result: {"status": ..., "body": ...}.
+method respond(integer status, object body): map<string, object> {
+    return {"status": status, "body": body}
+}
+
+method ok(object body): map<string, object> {
+    return respond(200, body)
+}
+
+// --- null ------------------------------------------------------------------
+
+// There is no `null` literal in this Novus version, but the runtime has the
+// value (json.parse("null") yields it). These two C blocks expose it.
+method none(): object {
+    c { return nv_nil; }
+}
+
+method isNull(object value): bool {
+    c { return nv_bool(nv_type_of($value) == NV_NULL); }
+}
+
+// --- trapped execution ------------------------------------------------------
+
+// The outcome of runTrapped(): failed + error text, or the task's result.
+define class Trapped {
+    private bool failed: get, set
+    private string error: get, set
+    private object result: get, set
+}
+
+// Runs task.run() and returns what happened without unwinding. Safe to call
+// while a lock is held.
+method runTrapped(object task): Trapped {
+    var result = tryRun(task)
+    if (tryFailed()) {
+        return Trapped{failed = true, error = tryError(), result = none()}
+    }
+    return Trapped{failed = false, error = "", result = result}
+}

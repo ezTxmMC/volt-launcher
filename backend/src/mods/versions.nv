@@ -1,0 +1,238 @@
+package mods
+
+import os
+import path
+import core
+
+// Version management of installed content beyond the latest update: the
+// releases of one file's project, switching a file to any of them, and the
+// required dependencies that the enabled mods need (Modrinth only).
+//
+//   GET  .../content/<type>/<file>/versions           [ProjectVersion]
+//   POST .../content/<type>/<file>/version            {"versionId"} -> job
+//   GET  .../content/<type>/dependencies              {"warnings": [...]}
+
+// --- helpers --------------------------------------------------------------------------
+
+method arrayOrEmpty(object value): array {
+    if (core.isArray(value)) {
+        return value
+    }
+    return []
+}
+
+// The text of key in m, or fallback when missing.
+method textOr(object m, string key, string fallback): string {
+    var value = textField(m, key)
+    if (core.isNull(value)) {
+        return fallback
+    }
+    return value
+}
+
+// The loader filter Modrinth needs for a content kind of a profile with `loader`.
+// Mods follow the profile's loader (none for vanilla); the packs have fixed tags.
+method kindLoaders(string kind, string loader): array {
+    if (kind == "mods") {
+        if (loader == "vanilla" || loader == "") {
+            return []
+        }
+        return modrinthLoaders(loader)
+    }
+    if (kind == "resourcepacks") {
+        return ["minecraft"]
+    }
+    if (kind == "shaderpacks") {
+        return ["iris", "optifine", "canvas", "vanilla"]
+    }
+    return ["datapack"]
+}
+
+// The ProjectVersion shape of a raw Modrinth version object (the keys match providers' versions).
+method versionSummary(object v): map<string, object> {
+    var file = primaryFile(v)
+    var hashes = field(file, "hashes")
+    var deps = []
+    for (d in arrayOrEmpty(field(v, "dependencies"))) {
+        if (core.isMap(d)) {
+            deps.append({
+                "projectId": textOr(d, "project_id", ""),
+                "versionId": textOr(d, "version_id", ""),
+                "fileName": textOr(d, "file_name", ""),
+                "dependencyType": textOr(d, "dependency_type", "")
+            })
+        }
+    }
+    return {
+        "id": textOr(v, "id", ""),
+        "projectId": textOr(v, "project_id", ""),
+        "name": textOr(v, "name", ""),
+        "versionNumber": textOr(v, "version_number", ""),
+        "gameVersions": stringArray(field(v, "game_versions")),
+        "loaders": stringArray(field(v, "loaders")),
+        "releaseType": textOr(v, "version_type", "release"),
+        "fileName": textOr(file, "filename", ""),
+        "downloadUrl": textOr(file, "url", ""),
+        "sha1": textOr(hashes, "sha1", "").toLower(),
+        "sha512": textOr(hashes, "sha512", ""),
+        "datePublished": textOr(v, "date_published", ""),
+        "dependencies": deps
+    }
+}
+
+// The Modrinth source of an installed file, or a 409 when the launcher does not know it.
+method trackedSource(ContentLoc loc, string fileName): map<string, object> {
+    requireContentFileName(loc.kind(), fileName)
+    if (os.isFile(path.join(loc.dir(), fileName)) == false) {
+        core.notFound("file '" + fileName + "' not found")
+    }
+    var info = hashOf(loc, path.join(loc.dir(), fileName))
+    var mods = loadStore(loc)
+    var source = core.none()
+    if (mods.has(info["sha1"]) && core.isMap(mods[info["sha1"]])) {
+        source = field(mods[info["sha1"]], "source")
+    }
+    if (core.isMap(source) == false || textOr(source, "provider", "") != "modrinth" || textOr(source, "projectId", "") == "") {
+        core.conflict("the launcher does not know where '" + fileName + "' came from; run identify first")
+    }
+    return source
+}
+
+// --- versions of one file ---------------------------------------------------------------
+
+// The releases of the file's project, newest first, filtered to the profile (game version and loader).
+method versionsOfFile(ContentLoc loc, string fileName, string gameVersion, string loader): array {
+    var source = trackedSource(loc, fileName)
+    var gameVersions = []
+    if (gameVersion != "") {
+        gameVersions = [gameVersion]
+    }
+    var out = []
+    for (v in modrinthProjectVersions(textOr(source, "projectId", ""), gameVersions, kindLoaders(loc.kind(), loader))) {
+        if (core.isMap(v)) {
+            out.append(versionSummary(v))
+        }
+    }
+    return out
+}
+
+// The job body of a version change: installs `versionId` in place of the file.
+method changeVersionContent(string jobId, ContentLoc loc, string fileName, string versionId, float from, float to): map<string, object> {
+    var source = trackedSource(loc, fileName)
+    core.jobProgress(jobId, from, "Lese Version")
+    var doc = modrinthVersionDoc(versionId)
+    if (core.isMap(doc) == false) {
+        core.notFound("Modrinth has no version '" + versionId + "'")
+    }
+    if (textOr(doc, "project_id", "") != textOr(source, "projectId", "")) {
+        core.badRequest("version '" + versionId + "' does not belong to the project of '" + fileName + "'")
+    }
+    if (versionId == textOr(source, "versionId", "")) {
+        core.conflict("'" + fileName + "' already is this version")
+    }
+    var file = primaryFile(doc)
+    if (core.isNull(file) || textOr(file, "url", "") == "") {
+        core.upstream("this version cannot be downloaded automatically (its author disabled third-party downloads)")
+    }
+    var update = {
+        "versionId": textOr(doc, "id", ""),
+        "versionNumber": textOr(doc, "version_number", ""),
+        "fileName": textOr(file, "filename", ""),
+        "sha1": textOr(field(file, "hashes"), "sha1", "").toLower(),
+        "url": textOr(file, "url", ""),
+        "gameVersions": stringArray(field(doc, "game_versions")),
+        "loaders": stringArray(field(doc, "loaders"))
+    }
+    return installUpdate(jobId, loc, fileName, update, from, to)
+}
+
+// --- dependencies ------------------------------------------------------------------------
+
+// Required dependencies of the enabled, identified mods that are missing or only present
+// as disabled files. Returns [{fileName, projectName, dependencyProjectId, state}]
+// with state "missing" or "disabled". Only mods have dependencies.
+method dependencyWarnings(ContentLoc loc): array {
+    var out = []
+    if (loc.kind() != "mods") {
+        return out
+    }
+    var files = scanContent(loc)
+
+    // project id -> "enabled" when an enabled copy exists, else "disabled".
+    var presence = {}
+    var dependantOf = {}
+    var versionIds = []
+    for (f in files) {
+        var source = f["source"]
+        if (core.isMap(source) == false) {
+            continue
+        }
+        var pid = textOr(source, "projectId", "")
+        if (pid == "") {
+            continue
+        }
+        var seen = "disabled"
+        if (f["enabled"] == true) {
+            seen = "enabled"
+        }
+        if (seen == "enabled" || presence.has(pid) == false) {
+            presence[pid] = seen
+        }
+        var vid = textOr(source, "versionId", "")
+        if (f["enabled"] == true && vid != "" && dependantOf.has(vid) == false) {
+            dependantOf[vid] = f["fileName"]
+            versionIds.append(vid)
+        }
+    }
+
+    var missingIds = []
+    var pending = []
+    var done = 0
+    while (done < versionIds.length()) {
+        var chunk = slice(versionIds, done, done + MODRINTH_BATCH)
+        for (v in modrinthVersionsByIds(chunk)) {
+            if (core.isMap(v) == false) {
+                continue
+            }
+            var vid = textOr(v, "id", "")
+            var dependant = ""
+            if (dependantOf.has(vid)) {
+                dependant = dependantOf[vid]
+            }
+            for (d in arrayOrEmpty(field(v, "dependencies"))) {
+                if (core.isMap(d) == false || textOr(d, "dependency_type", "") != "required") {
+                    continue
+                }
+                var depId = textOr(d, "project_id", "")
+                if (depId == "") {
+                    continue
+                }
+                var state = "missing"
+                if (presence.has(depId)) {
+                    state = presence[depId]
+                } else {
+                    missingIds.append(depId)
+                }
+                if (state == "enabled") {
+                    continue
+                }
+                pending.append({"fileName": dependant, "dependencyProjectId": depId, "state": state})
+            }
+        }
+        done = done + chunk.length()
+    }
+    var titles = projectTitlesOrEmpty(uniqueStrings(missingIds))
+    var reported = {}
+    for (p in pending) {
+        var key = p["fileName"] + "|" + p["dependencyProjectId"]
+        if (reported.has(key) == false) {
+            reported[key] = true
+            var name = p["dependencyProjectId"]
+            if (titles.has(p["dependencyProjectId"]) && core.isString(titles[p["dependencyProjectId"]])) {
+                name = titles[p["dependencyProjectId"]]
+            }
+            out.append({"fileName": p["fileName"], "projectName": name, "dependencyProjectId": p["dependencyProjectId"], "state": p["state"]})
+        }
+    }
+    return out
+}

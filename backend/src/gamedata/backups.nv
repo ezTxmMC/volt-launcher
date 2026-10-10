@@ -1,0 +1,260 @@
+package gamedata
+
+import core
+import json
+import os
+import path
+import time
+
+// Snapshots of a profile's game directory, kept outside the profile in
+// <dataDir>/backups/<profileId>/ so they survive the profile they protect.
+// Each snapshot is <stamp>.zip with a sidecar <stamp>.json (label, time, Minecraft
+// version, loader, file count). The number kept is the setting backupsToKeep.
+//
+//   GET    /api/profiles/:id/backups                    {"backups": [Backup]}
+//   POST   /api/profiles/:id/backups                    {"label"?} -> Job (result {"backupId", "backup"})
+//   POST   /api/profiles/:id/backups/:backupId/restore  -> Job (result {"backupId", "fileCount"})
+//   DELETE /api/profiles/:id/backups/:backupId          -> {"deleted": backupId}
+//   POST   /api/profiles/:id/backups/open-folder        {"path"}
+//
+// Backup: {id, label, createdAt (ISO), sizeBytes, minecraftVersion, loader, fileCount}.
+// Create and restore hold the profile (see jobs.nv): the game cannot start meanwhile.
+
+final BACKUP_LABEL_LIMIT = 100
+
+method backupsDir(string profileId): string {
+    return path.join(core.dataDir(), "backups", profileId)
+}
+
+// The archive file name from a request: <stamp>.zip, no separators.
+method backupName(object value): string {
+    var name = safeName(value, "backupId")
+    if (name.endsWith(".zip") == false) {
+        core.badRequest("invalid backupId: " + name)
+    }
+    return name
+}
+
+// The archive of a backup; 404 when it does not exist.
+method backupArchive(string profileId, object value): string {
+    var file = path.join(backupsDir(profileId), backupName(value))
+    if (os.isFile(file) == false) {
+        core.notFound("backup '" + path.basename(file) + "' not found")
+    }
+    return file
+}
+
+// The sidecar path of an archive.
+method backupSidecar(string archive): string {
+    var name = path.basename(archive)
+    return path.join(path.dirname(archive), name.substring(0, name.length() - 4) + ".json")
+}
+
+// The Backup object of one archive: from its sidecar, or from the file alone.
+method backupJson(string archive): map<string, object> {
+    var id = path.basename(archive)
+    var sidecar = backupSidecar(archive)
+    var fallback = {
+        "id": id,
+        "label": "Backup",
+        "createdAt": time.iso(os.modified(archive)),
+        "sizeBytes": os.fileSize(archive),
+        "minecraftVersion": "",
+        "loader": "",
+        "fileCount": 0
+    }
+    var meta = core.readJsonFile(sidecar, core.none())
+    if (core.isMap(meta) == false) {
+        return fallback
+    }
+    return {
+        "id": id,
+        "label": core.getOr(meta, "label", "Backup"),
+        "createdAt": core.getOr(meta, "createdAt", fallback["createdAt"]),
+        "sizeBytes": os.fileSize(archive),
+        "minecraftVersion": core.getOr(meta, "minecraftVersion", ""),
+        "loader": core.getOr(meta, "loader", ""),
+        "fileCount": core.getOr(meta, "fileCount", 0)
+    }
+}
+
+// All backups of the profile, newest first.
+method listBackups(string profileId): array {
+    var dir = backupsDir(profileId)
+    var sorted = []
+    if (os.isDir(dir) == false) {
+        return sorted
+    }
+    for (name in os.listDir(dir)) {
+        var archive = path.join(dir, name)
+        if (name.endsWith(".zip") && os.isFile(archive)) {
+            var entry = backupJson(archive)
+            var at = sorted.length()
+            while (at > 0 && sorted[at - 1]["createdAt"] < entry["createdAt"]) {
+                at = at - 1
+            }
+            sorted.insert(at, entry)
+        }
+    }
+    return sorted
+}
+
+// Removes the oldest backups beyond backupsToKeep (0 keeps everything).
+method pruneBackups(string profileId) {
+    integer keep = core.setting("backupsToKeep")
+    if (keep <= 0) {
+        return
+    }
+    var existing = listBackups(profileId)
+    var i = keep
+    while (i < existing.length()) {
+        var archive = path.join(backupsDir(profileId), existing[i]["id"])
+        os.remove(archive)
+        os.remove(backupSidecar(archive))
+        i = i + 1
+    }
+}
+
+define class ZipTask {
+    private string root: get, set
+    private string archive: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return zipWriteTree(root, archive, jobId)
+    }
+}
+
+// Takes a snapshot of the game directory (a job). A failed or cancelled run
+// leaves no archive behind.
+method createBackup(string jobId, string profileId, string label): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    var source = core.profileDir(profileId)
+    if (os.isDir(source) == false) {
+        core.conflict("This profile has no game directory to back up yet")
+    }
+    var dir = backupsDir(profileId)
+    ensureDirectory(dir)
+
+    var stamp = time.format(time.now(), "%Y%m%d-%H%M%S")
+    var name = stamp + ".zip"
+    var i = 1
+    while (os.exists(path.join(dir, name)) && i < 100) {
+        name = stamp + "-" + i + ".zip"
+        i = i + 1
+    }
+    var archive = path.join(dir, name)
+    var outcome = core.runTrapped(ZipTask{root = source, archive = archive, jobId = jobId})
+    if (outcome.failed()) {
+        os.remove(archive + ".tmp")
+        core.raise(outcome.error())
+    }
+    integer entries = outcome.result()
+
+    var clean = label.trim()
+    if (clean == "") {
+        clean = "Manual backup"
+    }
+    if (clean.length() > BACKUP_LABEL_LIMIT) {
+        clean = clean.substring(0, BACKUP_LABEL_LIMIT)
+    }
+    var meta = {
+        "label": clean,
+        "createdAt": core.nowIso(),
+        "minecraftVersion": profile["minecraftVersion"],
+        "loader": profile["loader"],
+        "fileCount": entries
+    }
+    var sidecar = core.writeFileAtomic(backupSidecar(archive), json.pretty(meta) + "\n")
+    if (sidecar != "") {
+        core.logWarn("backups: could not write the sidecar of " + name + ": " + sidecar)
+    }
+    pruneBackups(profileId)
+    return {"backupId": name, "backup": backupJson(archive)}
+}
+
+define class ExtractTask {
+    private string archive: get, set
+    private string target: get, set
+    private string jobId: get, set
+
+    method run(): object {
+        return zipExtractTo(archive, target, jobId)
+    }
+}
+
+// Puts a snapshot back in place (a job). The game directory is moved aside
+// first and only deleted after the swap worked, so a failure restores it.
+method restoreBackup(string jobId, string profileId, object value): map<string, object> {
+    var archive = backupArchive(profileId, value)
+    var game = core.profileDir(profileId)
+    var staging = game + ".restoring"
+    var previous = game + ".previous"
+    if (os.exists(staging)) {
+        os.removeAll(staging)
+    }
+    if (os.exists(previous)) {
+        os.removeAll(previous)
+    }
+    var outcome = core.runTrapped(ExtractTask{archive = archive, target = staging, jobId = jobId})
+    if (outcome.failed()) {
+        os.removeAll(staging)
+        core.raise(outcome.error())
+    }
+    integer entries = outcome.result()
+
+    reportStep(jobId, 0.95, "Ersetze den Spielordner")
+    var movedAside = false
+    if (os.isDir(game)) {
+        if (os.rename(game, previous) == false) {
+            os.removeAll(staging)
+            core.internal("cannot move the current game folder aside")
+        }
+        movedAside = true
+    }
+    if (os.rename(staging, game) == false) {
+        if (movedAside) {
+            os.rename(previous, game)
+        }
+        os.removeAll(staging)
+        core.internal("cannot put the backup in place")
+    }
+    if (movedAside) {
+        os.removeAll(previous)
+    }
+    return {"backupId": path.basename(archive), "fileCount": entries}
+}
+
+method deleteBackup(string profileId, object value): map<string, object> {
+    var archive = backupArchive(profileId, value)
+    os.remove(archive)
+    os.remove(backupSidecar(archive))
+    return {"deleted": path.basename(archive)}
+}
+
+// The backups folder, created when missing, so the file manager can open it.
+method openBackupsFolder(string profileId): map<string, object> {
+    var dir = backupsDir(profileId)
+    ensureDirectory(dir)
+    return {"path": dir}
+}
+
+// --- work objects (see jobs.nv) ----------------------------------------------------
+
+define class CreateBackupWork based GameDataWork {
+    private string profileId: get, set
+    private string label: get, set
+
+    method work(string jobId): object {
+        return createBackup(jobId, profileId, label)
+    }
+}
+
+define class RestoreBackupWork based GameDataWork {
+    private string profileId: get, set
+    private string backupId: get, set
+
+    method work(string jobId): object {
+        return restoreBackup(jobId, profileId, backupId)
+    }
+}

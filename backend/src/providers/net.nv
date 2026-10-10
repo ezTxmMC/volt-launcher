@@ -1,0 +1,246 @@
+package providers
+
+import core
+import json
+import os
+import path
+import bytes
+
+// HTTP for the providers module, driven by the curl command line tool.
+//
+// std/http is not used: it keeps the whole body in memory (pack archives are
+// hundreds of megabytes), sends no timeout, and names its temporary files
+// with a counter that is not thread safe (two downloads on two threads can
+// get the same file name). Here every request writes to a file whose name
+// carries a random id, redirects are followed (-L, needed for CDN downloads
+// such as edge.forgecdn.net), only http/https are allowed, also after a
+// redirect, and every request has a connect and a total timeout.
+
+private final PV_CONNECT_TIMEOUT = 20
+
+// Modrinth asks API users for a descriptive User-Agent.
+method pvUserAgent(): string {
+    return "VoltLauncher-next/" + core.version() + " (https://github.com/ezTxmMC/VoltLauncher)"
+}
+
+// A file name in the system temp directory that no other request uses.
+method pvTempFile(string suffix): string {
+    return path.join(os.temp(), "volt-providers-" + core.newId() + core.newId() + suffix)
+}
+
+// Percent-encodes everything but the unreserved characters (RFC 3986).
+method urlEncode(string text): string {
+    var out = ""
+    var i = 0
+    var n = bytes.size(text)
+    while (i < n) {
+        var b = bytes.u8(text, i)
+        var isAlnum = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        if (isAlnum || b == 45 || b == 46 || b == 95 || b == 126) {
+            out = out + bytes.slice(text, i, i + 1)
+        } else {
+            out = out + "%" + bytes.hex(bytes.putU8(b)).toUpper()
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// The host part of a URL, for error messages.
+method urlHost(string url): string {
+    var rest = url
+    var scheme = rest.indexOf("://")
+    if (scheme >= 0) {
+        rest = rest.substring(scheme + 3, rest.length())
+    }
+    var slash = rest.indexOf("/")
+    if (slash >= 0) {
+        rest = rest.substring(0, slash)
+    }
+    return rest
+}
+
+// Runs curl. Returns {status: integer (0 = no HTTP answer), error: string}.
+// The body is written to outFile; requestBody (a JSON text, "" for none) is
+// sent with POST.
+method curlFetch(string verb, string url, map<string, string> headers, string requestBody, string outFile, integer maxSeconds): map<string, object> {
+    if (url.startsWith("https://") == false && url.startsWith("http://") == false) {
+        return {"status": 0, "error": "unsupported URL '" + url + "'"}
+    }
+    // -g: URLs are taken literally ([ ] { } appear in CDN file names).
+    var cmd = "curl -sS -g -L --max-redirs 10 --proto =http,https --proto-redir =http,https"
+    cmd = cmd + " --connect-timeout " + PV_CONNECT_TIMEOUT + " --max-time " + maxSeconds
+    cmd = cmd + " --retry 2 --retry-delay 1"
+    cmd = cmd + " -A " + os.shellQuote(pvUserAgent())
+    for (key in headers) {
+        cmd = cmd + " -H " + os.shellQuote(key + ": " + headers[key])
+    }
+    var bodyFile = ""
+    if (verb != "GET") {
+        cmd = cmd + " -X " + os.shellQuote(verb)
+    }
+    if (requestBody != "") {
+        bodyFile = pvTempFile(".json")
+        os.writeFile(bodyFile, requestBody)
+        cmd = cmd + " -H " + os.shellQuote("Content-Type: application/json")
+        cmd = cmd + " --data-binary " + os.shellQuote("@" + bodyFile)
+    }
+    // "\n" is written as backslash-n for curl to expand: a real line break
+    // cannot be quoted for cmd.exe.
+    cmd = cmd + " -o " + os.shellQuote(outFile) + " -w " + os.shellQuote("\\n%{http_code}")
+    cmd = cmd + " " + os.shellQuote(url) + " 2>&1"
+    var result = os.run(cmd)
+    if (bodyFile != "") {
+        os.remove(bodyFile)
+    }
+    var output = ("" + result["output"]).trim()
+    var lines = output.split("\n")
+    var statusText = lines[lines.length() - 1].trim()
+    var status = 0
+    if (statusText.length() == 3 && isDigits(statusText)) {
+        status = parseInt(statusText)
+    }
+    var error = ""
+    if (lines.length() > 1) {
+        var errorLines = []
+        var i = 0
+        while (i < lines.length() - 1) {
+            if (lines[i].trim() != "") {
+                errorLines.append(lines[i].trim())
+            }
+            i = i + 1
+        }
+        error = errorLines.join("; ")
+    }
+    if (status == 0 && error == "") {
+        if (result["code"] != 0) {
+            error = "curl failed with exit code " + result["code"] + " (is curl installed?)"
+        } else {
+            error = "no HTTP answer"
+        }
+    }
+    return {"status": status, "error": error}
+}
+
+method isDigits(string text): bool {
+    if (text == "") {
+        return false
+    }
+    for (ch in text) {
+        if ("0123456789".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// A short, single line excerpt of a response body for an error message.
+method excerpt(string text): string {
+    var flat = text.replace("\r", " ").replace("\n", " ").trim()
+    if (flat.length() > 200) {
+        return flat.substring(0, 200) + "..."
+    }
+    return flat
+}
+
+// The body of a request as text; a transport error or a non-2xx answer is
+// a 502 naming the host. notFoundAs404: a 404 becomes core.notFound.
+method fetchText(string verb, string url, map<string, string> headers, string requestBody, bool notFoundAs404): string {
+    var file = pvTempFile(".body")
+    var res = curlFetch(verb, url, headers, requestBody, file, 60)
+    var text = ""
+    if (os.isFile(file)) {
+        text = os.readFile(file)
+        os.remove(file)
+    }
+    var status = res["status"]
+    if (status == 0) {
+        core.upstream("cannot reach " + urlHost(url) + ": " + res["error"])
+    }
+    if (status == 404 && notFoundAs404) {
+        core.notFound(urlHost(url) + " has no such resource (404)")
+    }
+    if (status < 200 || status >= 300) {
+        var detail = excerpt(text)
+        if (detail != "") {
+            detail = ": " + detail
+        }
+        core.upstream(urlHost(url) + " answered HTTP " + status + detail)
+    }
+    return text
+}
+
+// GET (or POST with a JSON body) that parses the answer as JSON.
+method fetchJson(string verb, string url, map<string, string> headers, object requestBody, bool notFoundAs404): object {
+    var bodyText = ""
+    if (core.isNull(requestBody) == false) {
+        bodyText = json.stringify(requestBody)
+    }
+    var text = fetchText(verb, url, headers, bodyText, notFoundAs404)
+    var parsed = json.tryParse(text)
+    if (core.isNull(parsed) && text.trim() != "null") {
+        core.upstream(urlHost(url) + " did not answer with JSON: " + excerpt(text))
+    }
+    return parsed
+}
+
+method getJson(string url, map<string, string> headers): object {
+    return fetchJson("GET", url, headers, core.none(), true)
+}
+
+method postJson(string url, map<string, string> headers, object body): object {
+    return fetchJson("POST", url, headers, body, false)
+}
+
+// --- downloads ------------------------------------------------------------------
+
+// Downloads url to target and checks it against `hashes` ({"sha1": ..., "md5":
+// ..., "sha256": ..., "sha512": ...}; empty values are ignored).
+//
+// A file that already exists is kept only when a hash is known and matches;
+// otherwise it is downloaded again. The download goes to a fresh temporary
+// name next to the target and replaces it only after the check passed, so a
+// broken download never leaves a half written file under the real name.
+// Returns true when the file was downloaded, false when it was kept.
+method downloadFile(string url, string target, map<string, string> hashes, map<string, string> headers): bool {
+    if (os.isFile(target) && hasKnownHash(hashes) && verifyFile(target, hashes) == "") {
+        return false
+    }
+    var dir = path.dirname(target)
+    if (dir != "" && os.isDir(dir) == false && os.mkdir(dir) == false) {
+        core.internal("cannot create directory '" + dir + "'")
+    }
+    var attempt = 0
+    var problem = ""
+    while (attempt < 2) {
+        var part = target + ".part-" + core.newId()
+        var res = curlFetch("GET", url, headers, "", part, 1800)
+        var status = res["status"]
+        if (status < 200 || status >= 300) {
+            os.remove(part)
+            if (status == 0) {
+                core.upstream("download of " + url + " failed: " + res["error"])
+            }
+            core.upstream("download of " + url + " failed: HTTP " + status)
+        }
+        if (os.isFile(part) == false) {
+            // curl writes no file for an empty body.
+            os.writeFile(part, "")
+        }
+        problem = verifyFile(part, hashes)
+        if (problem == "") {
+            if (os.isFile(target)) {
+                os.remove(target)
+            }
+            if (os.rename(part, target) == false) {
+                os.remove(part)
+                core.internal("cannot move the download to '" + target + "'")
+            }
+            return true
+        }
+        os.remove(part)
+        attempt = attempt + 1
+    }
+    core.upstream("download of " + url + " is corrupt: " + problem)
+    return false
+}

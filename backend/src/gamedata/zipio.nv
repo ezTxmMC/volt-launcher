@@ -1,0 +1,171 @@
+package gamedata
+
+import bytes
+import core
+import hash
+import mods
+import os
+import path
+import time
+import zlib
+
+// ZIP for backups. Writing: every entry is stored or deflated (raw deflate taken
+// from zlib.compress), names are UTF-8 (flag 0x0800), there is no zip64, so an
+// archive is limited to 4 GiB and 65535 entries. Reading goes through the jar
+// reader in mods/zip.nv (zipEntries, zipRead).
+//
+// The archive is written to "<name>.tmp" and renamed when complete, so an
+// interrupted backup never leaves a half written .zip behind.
+
+final ZIP_LOCAL = 0x04034b50
+final ZIP_CENTRAL = 0x02014b50
+final ZIP_END = 0x06054b50
+final ZIP_MAX_ENTRIES = 65535
+final ZIP_MAX_BYTES = 4294967295
+final ZIP_MAX_ENTRY_READ = 2147483647
+
+// The MS-DOS time and date of "now", as zip headers store them: {"time", "date"}.
+method zipDosStamp(): map<string, object> {
+    var parts = time.parts(time.now())
+    integer year = parts["year"]
+    integer month = parts["month"]
+    integer day = parts["day"]
+    integer hour = parts["hour"]
+    integer minute = parts["minute"]
+    integer second = parts["second"]
+    var years = year - 1980
+    if (years < 0) {
+        years = 0
+    }
+    return {
+        "time": (hour << 11) | (minute << 5) | (second / 2),
+        "date": (years << 9) | (month << 5) | day
+    }
+}
+
+// Writes the tree below `root` to the archive `archive`, replacing it. Returns
+// the number of entries. Working files are left out (treeOf with working true).
+method zipWriteTree(string root, string archive, string jobId): integer {
+    var tree = treeOf(root, true)
+    var dirs = tree["dirs"]
+    var files = tree["files"]
+    var names = []
+    for (dir in dirs) {
+        names.append(dir + "/")
+    }
+    for (file in files) {
+        names.append(file)
+    }
+    if (names.length() > ZIP_MAX_ENTRIES) {
+        core.internal("too many files for one backup (" + names.length() + ")")
+    }
+
+    var temp = archive + ".tmp"
+    if (os.exists(temp)) {
+        os.remove(temp)
+    }
+    os.writeFile(temp, "")
+    var stamp = zipDosStamp()
+    integer dosTime = stamp["time"]
+    integer dosDate = stamp["date"]
+
+    var central = ""
+    var offset = 0
+    var i = 0
+    while (i < names.length()) {
+        var name = names[i]
+        if (jobId != "") {
+            core.checkCancelled(jobId)
+            core.jobProgress(jobId, fraction(i, names.length()), "Packe " + name)
+        }
+        var isDirectory = name.endsWith("/")
+        var data = ""
+        if (isDirectory == false) {
+            data = os.readFile(path.join(root, name))
+        }
+        if (offset > ZIP_MAX_BYTES) {
+            core.internal("backup is larger than 4 GiB, which the zip format cannot hold")
+        }
+        integer crc = hash.crc32(data)
+        integer compression = 0
+        var payload = data
+        if (bytes.size(data) > 0) {
+            var wrapped = zlib.compress(data)
+            var deflated = bytes.slice(wrapped, 2, bytes.size(wrapped) - 4)
+            if (bytes.size(deflated) < bytes.size(data)) {
+                compression = 8
+                payload = deflated
+            }
+        }
+        integer packed = bytes.size(payload)
+        integer size = bytes.size(data)
+        var nameBytes = name
+        integer nameLength = bytes.size(nameBytes)
+        var attributes = 0x81A40000
+        if (isDirectory) {
+            attributes = 0x41ED0010
+        }
+
+        var header = leBytes32(ZIP_LOCAL) + leBytes16(20) + leBytes16(0x0800) + leBytes16(compression)
+            + leBytes16(dosTime) + leBytes16(dosDate) + leBytes32(crc) + leBytes32(packed) + leBytes32(size)
+            + leBytes16(nameLength) + leBytes16(0) + nameBytes
+        os.appendFile(temp, header + payload)
+
+        central = central + leBytes32(ZIP_CENTRAL) + leBytes16(788) + leBytes16(20) + leBytes16(0x0800)
+            + leBytes16(compression) + leBytes16(dosTime) + leBytes16(dosDate) + leBytes32(crc) + leBytes32(packed)
+            + leBytes32(size) + leBytes16(nameLength) + leBytes16(0) + leBytes16(0) + leBytes16(0) + leBytes16(0)
+            + leBytes32(attributes) + leBytes32(offset) + nameBytes
+        offset = offset + bytes.size(header) + packed
+        i = i + 1
+    }
+
+    var trailer = leBytes32(ZIP_END) + leBytes16(0) + leBytes16(0) + leBytes16(names.length()) + leBytes16(names.length())
+        + leBytes32(bytes.size(central)) + leBytes32(offset) + leBytes16(0)
+    os.appendFile(temp, central + trailer)
+
+    if (os.exists(archive)) {
+        os.remove(archive)
+    }
+    if (os.rename(temp, archive) == false) {
+        os.remove(temp)
+        core.internal("cannot write the backup file " + archive)
+    }
+    return names.length()
+}
+
+// Unpacks the archive into `target`, which must not exist yet. Names that would
+// leave the target directory are refused. Progress goes to `jobId`. Returns the
+// number of entries.
+method zipExtractTo(string archive, string target, string jobId): integer {
+    var data = os.readFile(archive)
+    var entries = mods.zipEntries(data)
+    var names = []
+    for (name in entries) {
+        if (plainEntryName(name) == false) {
+            core.raise("the backup contains an unsafe path: " + name)
+        }
+        names.append(name)
+    }
+    ensureDirectory(target)
+    var i = 0
+    while (i < names.length()) {
+        var name = names[i]
+        if (jobId != "") {
+            core.checkCancelled(jobId)
+            core.jobProgress(jobId, fraction(i, names.length()), "Entpacke " + name)
+        }
+        var full = path.join(target, name)
+        if (name.endsWith("/")) {
+            ensureDirectory(full)
+        } else {
+            ensureDirectory(path.dirname(full))
+            var content = mods.zipRead(data, entries[name], ZIP_MAX_ENTRY_READ)
+            os.writeFile(full, content)
+            if (os.isFile(full) == false) {
+                core.internal("cannot write '" + name + "'")
+            }
+        }
+        i = i + 1
+    }
+    return names.length()
+}

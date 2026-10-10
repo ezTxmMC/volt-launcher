@@ -1,0 +1,173 @@
+package migration
+
+import core
+import mods
+import os
+import path
+
+// Mod sources: what the old launcher recorded about each file (instances/<slug>/content.json)
+// become the new <gameDir>/.volt/<kind>.json caches, written through mods.recordSource.
+// A file is only mapped when its sha1 on disk equals the recorded one, so a jar
+// replaced or edited since the old launcher saw it keeps no source. Anything
+// else is counted as skipped with the reason.
+
+final SOURCE_KINDS = ["mods", "resourcepacks", "shaderpacks"]
+
+define class HashTask {
+    private string file: get, set
+
+    method run(): object {
+        return mods.fileInfoFor(file, os.fileSize(file), os.modifiedMillis(file), false)
+    }
+}
+
+define class RecordTask {
+    private object loc: get, set
+    private string fileName: get, set
+    private string sha1: get, set
+    private object source: get, set
+
+    method run(): object {
+        mods.recordSource(loc, fileName, sha1, source)
+        return true
+    }
+}
+
+// The file name of an old entry as it is on disk (a disabled file carries ".disabled"), or "".
+method onDiskName(string gameDir, string folder, string fileName): string {
+    if (os.isFile(path.join(gameDir, folder, fileName))) {
+        return fileName
+    }
+    if (os.isFile(path.join(gameDir, folder, fileName + ".disabled"))) {
+        return fileName + ".disabled"
+    }
+    return ""
+}
+
+// The planned record of one old content entry:
+// {"ok": true, "folder", "fileName", "sha1", "source"} or {"ok": false, "reason"}.
+method planEntry(object item, string gameDir): map<string, object> {
+    if (core.isMap(item) == false) {
+        return {"ok": false, "reason": "an entry that is not an object"}
+    }
+    var folder = "" + core.getOr(item, "contentType", "")
+    if (folder == "datapacks") {
+        return {"ok": false, "reason": "a datapack (bound to a world): not migrated"}
+    }
+    if (SOURCE_KINDS.contains(folder) == false) {
+        return {"ok": false, "reason": "content type '" + folder + "' is not known"}
+    }
+    var provider = "" + core.getOr(item, "provider", "")
+    if (provider == "") {
+        return {"ok": false, "reason": "added by hand (no provider)"}
+    }
+    if (provider != "modrinth" && provider != "curseforge") {
+        return {"ok": false, "reason": "provider '" + provider + "' is not supported"}
+    }
+    var projectId = "" + core.getOr(item, "projectId", "")
+    var versionId = "" + core.getOr(item, "versionId", "")
+    if (projectId == "" || versionId == "") {
+        return {"ok": false, "reason": "no project or version id recorded"}
+    }
+    var fileName = "" + core.getOr(item, "fileName", "")
+    if (fileName == "" || fileName.contains("/") || fileName.contains("\\") || fileName == "." || fileName == "..") {
+        return {"ok": false, "reason": "the recorded file name '" + fileName + "' is not usable"}
+    }
+    var onDisk = onDiskName(gameDir, folder, fileName)
+    if (onDisk == "") {
+        return {"ok": false, "reason": "'" + fileName + "' is not in " + folder + "/ any more"}
+    }
+    var recorded = ("" + core.getOr(item, "sha1", "")).toLower()
+    if (recorded == "") {
+        return {"ok": false, "reason": "'" + fileName + "' has no recorded sha1, so it cannot be checked"}
+    }
+    var hashed = core.runTrapped(HashTask{file = path.join(gameDir, folder, onDisk)})
+    if (hashed.failed()) {
+        return {"ok": false, "reason": "'" + fileName + "' cannot be read"}
+    }
+    var actual = hashed.result()["sha1"]
+    if (actual != recorded) {
+        return {"ok": false, "reason": "'" + fileName + "' changed since the old launcher recorded it"}
+    }
+    var projectName = "" + core.getOr(item, "projectName", "")
+    if (projectName == "") {
+        projectName = fileName
+    }
+    var source = {
+        "provider": provider,
+        "projectId": projectId,
+        "versionId": versionId,
+        "versionNumber": "" + core.getOr(item, "versionNumber", ""),
+        "name": projectName
+    }
+    return {"ok": true, "folder": folder, "fileName": onDisk, "sha1": actual, "source": source}
+}
+
+// Records the sources of one instance. `input`: {"profileId", "gameDir",
+// "content" (the content.json map or null), "dry"}. In a dry run nothing is
+// written and the planned records are counted. Returns {"mapped", "skipped", "reasons"}.
+method recordSources(map<string, object> input): map<string, object> {
+    var reasons = []
+    var planned = {}
+    var mapped = 0
+    var skipped = 0
+    var content = input["content"]
+    var gameDir = "" + input["gameDir"]
+    var dry = (input["dry"] == true)
+    if (core.isMap(content) == false || core.isArray(core.getOr(content, "content", core.none())) == false) {
+        return {"mapped": 0, "skipped": 0, "reasons": reasons}
+    }
+    for (item in content["content"]) {
+        var plan = planEntry(item, gameDir)
+        if (plan["ok"] == false) {
+            skipped = skipped + 1
+            reasons.append(plan["reason"])
+            continue
+        }
+        var folder = "" + plan["folder"]
+        var list = []
+        if (planned.has(folder)) {
+            list = planned[folder]
+        }
+        list.append(plan)
+        planned[folder] = list
+    }
+    for (folder in planned) {
+        var list = planned[folder]
+        var loc = mods.contentLoc("" + input["profileId"], folder, "")
+        if (os.isFile(loc.store())) {
+            skipped = skipped + list.length()
+            reasons.append(folder + ": .volt/" + folder + ".json already exists, so " + list.length() + " entries were not written")
+            continue
+        }
+        for (plan in list) {
+            if (dry) {
+                mapped = mapped + 1
+                continue
+            }
+            var outcome = core.runTrapped(RecordTask{loc = loc, fileName = plan["fileName"], sha1 = plan["sha1"], source = plan["source"]})
+            if (outcome.failed()) {
+                skipped = skipped + 1
+                reasons.append(plan["fileName"] + ": " + core.decodeFailure(outcome.error())["message"])
+            } else {
+                mapped = mapped + 1
+            }
+        }
+    }
+    return {"mapped": mapped, "skipped": skipped, "reasons": reasons}
+}
+
+// The number of backup archives (.zip) the old launcher kept for an instance.
+method legacyBackupCount(string legacyDir, string slug): integer {
+    var dir = path.join(legacyDir, "backups", slug)
+    if (os.isDir(dir) == false) {
+        return 0
+    }
+    var count = 0
+    for (name in os.listDir(dir)) {
+        if (name.endsWith(".zip")) {
+            count = count + 1
+        }
+    }
+    return count
+}

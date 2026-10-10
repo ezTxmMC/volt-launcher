@@ -1,0 +1,121 @@
+package accounts
+
+import core
+import os
+
+// The session a game is launched with, and the refresh of Microsoft tokens.
+//
+// accountsLaunchSession() answers the selected account as the launch placeholders need
+// them: name, uuid (no dashes), accessToken, userType and xuid. Only a Microsoft account
+// can launch: without a selected Microsoft account (none selected, the default "Player",
+// an offline entry, or a selection that no longer exists) it fails with 403
+// sign_in_required. A Microsoft account gets its Minecraft token, refreshed first when it
+// is close to expiry: Microsoft token -> Xbox Live -> XSTS -> Minecraft.
+//
+// Refresh failures:
+//   - the network is down: the cached Minecraft token is used while it is still good
+//     for at least a minute; otherwise the launch fails with a clear message,
+//   - Microsoft says invalid_grant (the sign-in was revoked): the account is removed
+//     from the store and the launch fails with "sign in again",
+//   - any other failure: the cached token is used while it is still good, otherwise
+//     the launch fails.
+
+// The session of the selected Microsoft account; 403 sign_in_required otherwise.
+method accountsLaunchSession(): map<string, object> {
+    var entry = acSelectedMicrosoft()
+    if (core.isNull(entry)) {
+        core.fail(403, "sign_in_required", "Sign in with a Microsoft account before you launch.")
+    }
+    return acSessionOf(entry)
+}
+
+// The session of the selected Microsoft account for the skin upload; 400 when none is
+// selected (the skin answers and job keep their own message).
+method acSkinSession(): map<string, object> {
+    var entry = acSelectedMicrosoft()
+    if (core.isNull(entry)) {
+        core.badRequest("skins can only be applied to a Microsoft account, sign in first")
+    }
+    return acSessionOf(entry)
+}
+
+// The selected account when it is a Microsoft account, otherwise none.
+method acSelectedMicrosoft(): object {
+    var entry = acChange("current", {})
+    if (core.isNull(entry)) {
+        return core.none()
+    }
+    if (core.getOr(entry, "type", "") != "microsoft") {
+        return core.none()
+    }
+    return entry
+}
+
+// The launch session of a Microsoft account entry (refreshed when needed).
+method acSessionOf(map<string, object> entry): map<string, object> {
+    var fresh = acFreshEntry(entry)
+    return {
+        "name": fresh["name"],
+        "uuid": acDashless(fresh["id"]),
+        "accessToken": fresh["minecraftToken"],
+        "userType": "msa",
+        "xuid": core.getOr(fresh, "xuid", "")
+    }
+}
+
+// Seconds of validity left for a token stored as unix seconds.
+method acLeft(map<string, object> entry, string field): integer {
+    return core.toInteger(core.getOr(entry, field, 0)) - os.time()
+}
+
+// The Microsoft account with usable tokens, refreshing them when needed.
+method acFreshEntry(map<string, object> entry): map<string, object> {
+    if (acLeft(entry, "minecraftExpiresAt") > AC_REFRESH_WINDOW && acLeft(entry, "microsoftExpiresAt") > AC_REFRESH_WINDOW) {
+        return entry
+    }
+    var refresh = core.getOr(entry, "microsoftRefresh", "")
+    if (refresh == "") {
+        if (acLeft(entry, "minecraftExpiresAt") > AC_MIN_USABLE) {
+            return entry
+        }
+        core.badRequest("the session of " + entry["name"] + " has expired, sign in again")
+    }
+
+    var outcome = core.runTrapped(AcRefreshTask{refreshToken = refresh})
+    if (outcome.failed() == false) {
+        var renewed = outcome.result()
+        var renewedEntry = {}
+        for (key in entry) {
+            renewedEntry[key] = entry[key]
+        }
+        for (key in renewed) {
+            renewedEntry[key] = renewed[key]
+        }
+        acChange("refresh-save", {"entry": renewedEntry})
+        return renewedEntry
+    }
+
+    var problem = outcome.error()
+    var message = core.decodeFailure(problem)["message"]
+    if (message.contains("invalid_grant")) {
+        acChange("remove", {"id": entry["id"]})
+        core.badRequest("the Microsoft sign-in of " + entry["name"] + " was revoked, sign in again")
+    }
+    if (acLeft(entry, "minecraftExpiresAt") > AC_MIN_USABLE) {
+        core.logWarn("accounts: refreshing " + entry["name"] + " failed, using the cached token: " + message)
+        return entry
+    }
+    core.upstream("the session of " + entry["name"] + " could not be refreshed: " + message)
+    return entry
+}
+
+// The refresh chain as a trapped task: Microsoft refresh, then the sign-in chain. The
+// a revoked sign-in shows up as "invalid_grant" in the error text (see acErrorText).
+define class AcRefreshTask {
+    private string refreshToken: get, set
+
+    method run(): object {
+        var tokens = acRefreshMicrosoft(refreshToken)
+        return acSignIn(tokens["accessToken"], tokens["refreshToken"], tokens["expiresAt"])
+    }
+}

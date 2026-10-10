@@ -1,132 +1,73 @@
 # VoltLauncher
 
-A modern Minecraft launcher: multiple accounts, every major mod loader, and content discovery
-across Modrinth, CurseForge, Technic and FTB.
+Ein moderner Minecraft-Launcher: mehrere Konten, alle gängigen Mod-Loader und Inhalte von Modrinth,
+CurseForge, Technic und FTB.
 
-The launcher is a Java backend that exposes a local HTTP API on `127.0.0.1:45938`, driven by an
-Electron + Vue front end.
+Der Launcher besteht aus zwei Teilen, die über einen lokalen HTTP-Dienst reden. Die Architektur und
+der API-Vertrag stehen in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), der Stand des Funktionsumfangs
+in [docs/FEATURE-PORT.md](docs/FEATURE-PORT.md).
 
-## Modules
-
-| Module | Contains |
+| Teil | Inhalt |
 | --- | --- |
-| `volt-core` | Paths, HTTP, JSON, NBT, crypto, async utilities, tasks, updates, Discord IPC, launcher settings |
-| `volt-auth` | Microsoft / Xbox Live / Minecraft authentication, encrypted account store |
-| `volt-game` | Profiles, version resolution, mod loaders, asset installation, Java runtimes, launching, worlds, logs, backups |
-| `volt-providers` | Modrinth, CurseForge, Technic and FTB clients, content and modpack installation |
-| `volt-server` | The local HTTP API |
-| `volt-app` | Executable entry point; boots the API and the Electron shell |
-| `volt-setup` | Cross-platform installer that registers Start Menu / application entries |
-| `ui/` | Vue 3 + Tailwind front end, packaged with Electron |
-| `bridge/` | Express service holding the CurseForge API key (see below) |
+| `app/` | Electron-App mit React, TypeScript, react-router, Tailwind und Iconify. Startet das Backend als Subprozess. |
+| `backend/` | Backend in [Novus](https://github.com/ezTxmMC/novus): Profile, Mods, Inhalte, Launch, Konten, Spieldaten, System. |
+| `bridge/` | Node-Dienst, der den CurseForge-API-Schlüssel hält (siehe unten). |
+| `docs/` | Architektur, API-Vertrag, Feature-Stand. |
 
-Dependencies flow one way: `core → auth → game → providers → server → app`. `volt-game` knows
-nothing about content providers, which is what keeps the graph acyclic.
+## Entwicklung
 
-## Building
+Voraussetzungen: Node mit pnpm, und der Novus-Compiler `novusc` im `PATH`.
 
 ```bash
-mvn package                    # all modules; volt-app/target/volt-launcher.jar is runnable
-mvn test                       # the test suite
-./build.sh                     # full platform build (native image + Electron + packages)
+# 1. Backend bauen (erzeugt backend/dist/volt-backend)
+cd backend && scripts/build.sh && scripts/smoke.sh && cd ..
+
+# 2. App starten (startet das Backend selbst)
+cd app && pnpm install && pnpm dev
+
+# Oberfläche im Browser mit Mock-Daten, ohne Backend
+cd app && pnpm dev:web
 ```
 
-`build.sh` delegates to `build-linux.sh`, `build-macos.sh` or `build-windows.bat`.
+Tests der einzelnen Module liegen in `backend/tests/` (zum Teil mit Netzwerkzugriff, siehe Skriptkopf).
 
-## Running in development
+## Paketieren
+
+Ein Lauf erzeugt alle Ziele. Die Backend-Binaries werden vorher für jedes Ziel gebaut:
 
 ```bash
-# 1. Front end
-cd ui && pnpm install && pnpm dev
-
-# 2. Backend
-mvn -pl volt-app -am exec:java
-
-# 3. CurseForge bridge (optional — only needed for CurseForge discovery)
-cd bridge && npm install && cp .env.example .env   # paste your key, then:
-npm start
+cd backend && scripts/build-release.sh     # alle Ziele nach backend/dist/<os>-<arch>/
+cd app && pnpm package                     # alle Linux-, Windows- und macOS-Ziele nach app/release/
+cd app && node scripts/package.mjs win-x64 # nur ein Ziel
 ```
 
-## Content providers
+| Ziel | Formate | Gebaut auf |
+| --- | --- | --- |
+| `linux-x64`, `linux-arm64` | AppImage, deb, rpm, zip, tar.gz, flatpak | Linux (deb/rpm über Docker, siehe unten) |
+| `win-x64`, `win-arm64` | exe (NSIS), msi, zip | Linux mit Wine, oder Windows |
+| `mac-arm64` | dmg, zip | macOS für das DMG (`app/scripts/package-mac.sh`), ZIP auch unter Linux |
 
-Modrinth, Technic and FTB need no configuration. CurseForge needs the bridge described below.
-
-Technic and FTB serve whole modpacks only, so the Discover tab collapses to that one kind while
-either is selected. The two platforms distribute packs differently, and the launcher handles both:
-
-* **FTB** publishes a release as a list of files with URLs and hashes, which the launcher
-  downloads straight into the profile. Updates are exact.
-* **Technic** either hosts builds on a *Solder* instance — a list of small archives applied in
-  order — or ships one client zip. Solder frequently omits the Forge version even for packs that
-  plainly need it, in which case the launcher installs the newest Forge build for that Minecraft
-  version rather than silently producing a vanilla profile that ignores every mod.
+Hinweise:
+- **deb und rpm** brauchen `dpkg-deb` und `rpmbuild`. Auf Systemen ohne diese Werkzeuge läuft der Build im Container
+  `electronuserland/builder` (mit `docker run`, Projekt und Electron-Cache einbinden).
+- **flatpak** braucht `flatpak-builder` und die Laufzeiten `org.freedesktop.Platform//24.08`,
+  `org.freedesktop.Sdk//24.08` und `org.electronjs.Electron2.BaseApp//24.08` (pro Architektur).
+- **macOS-DMG** lässt sich nur auf macOS erstellen (`hdiutil`, `sips`). Die Builds sind nicht signiert und nicht notarisiert.
+- Prüfsummen aller Artefakte stehen in `app/release/SHA256SUMS.txt`.
 
 ## CurseForge
 
-CurseForge's API requires a per-developer key, and their terms do not allow shipping it inside a
-client that users can read it out of. The `bridge/` service holds the key and proxies requests, so
-the launcher itself never sees it.
+CurseForge verlangt einen Entwicklerschlüssel, der nicht in einen Client gehört. Der `bridge/`-Dienst
+hält den Schlüssel und leitet Anfragen weiter. Schlüssel in `bridge/.env` eintragen und mit `npm start`
+im Ordner `bridge/` starten. Standardadresse: `http://localhost:8787` (unter den Einstellungen änderbar).
+Ohne Bridge bleiben Modrinth, Technic und FTB voll nutzbar, CurseForge wird als nicht verfügbar angezeigt.
 
-Get a key at <https://console.curseforge.com>, put it in `bridge/.env`, and start the bridge with
-`npm start` — plain `node src/server.js` does not read `.env`. The bridge validates the key on
-startup and says so. The
-launcher points at `http://localhost:8787` by default; change it under **Settings → Content
-providers**. Without a running bridge, Modrinth still works and CurseForge is shown as
-unavailable with an explanation.
+## Discord-Präsenz
 
-## Installing
+Dafür braucht es eine Discord-Application-ID, die unter den Einstellungen eingetragen wird. Ohne sie
+meldet der Launcher den Status „nicht konfiguriert“.
 
-```bash
-java -jar volt-setup.jar                    # per-user install + application menu entry
-java -jar volt-setup.jar --desktop-shortcut # also place a desktop shortcut
-java -jar volt-setup.jar --help
-```
+## Hinweise zum Stand
 
-The installer needs no administrator rights: it installs into `%LOCALAPPDATA%\Programs`,
-`~/.local/share/volt-launcher` or `~/Applications` depending on the platform.
-
-## Discord rich presence
-
-Rich presence needs an application registered at <https://discord.com/developers/applications>,
-because the application id is what decides the name and artwork Discord displays. Paste its id
-under **Settings → General → Discord rich presence** and the feature switches itself on; until
-then it says so rather than failing quietly. Upload an asset named `volt_logo` to that
-application for the large icon.
-
-The launcher talks to the desktop client over its local IPC socket, so no bot token or account
-access is involved, and a Discord that is closed or restarted is simply reconnected to.
-
-## Launcher updates
-
-The Updates screen reads GitHub releases from the repository configured under
-**Settings → Updates**, defaulting to `ezTxmMC/Volt-Launcher`. It downloads the installer for
-your platform into `~/.voltlauncher/updates/` and leaves running it to you: replacing a running
-launcher's own files is platform-specific, and a half-applied update leaves nothing that starts.
-
-## Data layout
-
-Everything lives under `~/.voltlauncher` (override with `VOLTLAUNCHER_HOME`):
-
-```
-config/settings.json     launcher preferences
-auth/                    encrypted account store
-instances/<slug>/game/   per-profile worlds, mods, configs
-shared/                  assets, libraries, client jars and natives, shared across profiles
-runtimes/temurin/        Java runtimes the launcher downloaded
-cache/installers/        cached Forge/NeoForge installer JARs
-backups/<slug>/          profile snapshots, kept outside the profile they protect
-updates/                 downloaded launcher installers
-logs/                    launcher and per-profile game logs
-```
-
-Assets and libraries are shared rather than copied per profile — a Minecraft version costs
-roughly a gigabyte, and duplicating that for every profile added up quickly. Backups deliberately
-live outside the instance directory: a snapshot that disappears along with the profile it was
-protecting is no protection at all.
-
-## A note on the local API
-
-The API binds to loopback only, and rejects URLs that encode path separators or dot segments.
-That last part is not cosmetic: a servlet container normalises a URI before routing it, so
-`DELETE /api/instances/Foo/worlds/%2e%2e` would otherwise collapse onto the endpoint that deletes
-the whole profile. See `PathGuard` in `volt-server`.
+Die Java-Version (`volt-*`, `ui/`) wurde durch dieses Projekt ersetzt. Sie ist in der Git-Historie unter
+Commit `03a34ad` erhalten.

@@ -1,8 +1,0 @@
-@import "tailwindcss";
-@import "@volt-launcher/volt-ui/theme.css";
-@source "../../node_modules/@volt-launcher/volt-ui/src";
-
-@keyframes shimmer {
-  0%   { transform: translateX(-100%); }
-  100% { transform: translateX(250%); }
-}

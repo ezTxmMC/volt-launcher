@@ -1,0 +1,151 @@
+package logo
+
+import core
+import os
+import path
+import providers
+
+// The icon of a modpack profile: the pack's icon at its provider, downloaded once
+// and kept in the logo cache (see images.nv). Every failure answers "" so that the
+// caller falls through to the next logo source; a logo never fails the endpoint.
+//
+//   modrinth   project document icon_url
+//   curseforge bridge /v1/mods/:id, logo.url
+//   ftb        pack document, art entry of type square or icon
+//   technic    pack document, icon.url
+
+define class LogoPackTask {
+    private string provider: get, set
+    private string projectId: get, set
+
+    method run(): object {
+        return logoPackDataUrl(provider, projectId)
+    }
+}
+
+// The cache file name stem <provider>-<projectId>; "" when the provider is unknown or the
+// project id is not a plain name.
+method logoPackStem(string provider, string projectId): string {
+    var known = ["modrinth", "curseforge", "technic", "ftb"]
+    if (known.contains(provider) == false || logoPlainName(projectId) == false) {
+        return ""
+    }
+    return provider + "-" + projectId
+}
+
+// The cached icon of a pack as a data URL, or "".
+method logoCachedPack(string stem): string {
+    for (ext in ["png", "jpg", "webp"]) {
+        var file = path.join(logoCacheDir(), stem + "." + ext)
+        if (os.isFile(file)) {
+            return logoDataUrl(ext, os.readFile(file))
+        }
+    }
+    return ""
+}
+
+// The icon URL the provider names for a project, or "".
+method logoPackIconUrl(string provider, string projectId): string {
+    if (provider == "modrinth") {
+        var project = providers.mrGet("/project/" + providers.urlEncode(projectId))
+        return providers.jstr(project, "icon_url")
+    }
+    if (provider == "curseforge") {
+        var response = providers.cfGet("/v1/mods/" + providers.urlEncode(projectId))
+        return providers.jstr(providers.jobj(providers.jobj(response, "data"), "logo"), "url")
+    }
+    if (provider == "ftb") {
+        var doc = providers.ftbPack(projectId)
+        for (image in providers.jarr(doc, "art")) {
+            var type = providers.jstr(image, "type").toLower()
+            var url = providers.jstr(image, "url")
+            if (url != "" && (type == "square" || type == "icon")) {
+                return url
+            }
+        }
+        return ""
+    }
+    if (provider == "technic") {
+        var pack = providers.technicPack(projectId)
+        return providers.jstr(providers.jobj(pack, "icon"), "url")
+    }
+    return ""
+}
+
+// Downloads the icon through the providers' curl helper, checks that it is a PNG, JPEG or
+// WEBP image no larger than LOGO_MAX_BYTES, caches it and returns its data URL; "" otherwise.
+// The download goes to a file with a random name in the cache directory and is renamed into
+// place only when it is complete. No lock is held during the network or file work.
+method logoFetchPackIcon(string stem, string url): string {
+    var dir = logoEnsureCacheDir()
+    var part = path.join(dir, stem + ".part-" + core.newId())
+    var res = providers.curlFetch("GET", url, {}, "", part, 30)
+    var status = res["status"]
+    if (status < 200 || status >= 300 || os.isFile(part) == false) {
+        if (os.isFile(part)) {
+            os.remove(part)
+        }
+        return ""
+    }
+    var size = os.fileSize(part)
+    if (size <= 0 || size > LOGO_MAX_BYTES) {
+        os.remove(part)
+        return ""
+    }
+    var data = os.readFile(part)
+    var type = logoImageType(data)
+    if (type == "") {
+        os.remove(part)
+        return ""
+    }
+    var target = path.join(dir, stem + "." + type)
+    if (os.isFile(target)) {
+        os.remove(target)
+    }
+    if (os.rename(part, target) == false) {
+        os.remove(part)
+        core.logWarn("logo: cannot cache the icon of " + stem)
+    }
+    return logoDataUrl(type, data)
+}
+
+// The data URL of a pack's icon: from the cache when it is there, else from the provider.
+method logoPackDataUrl(string provider, string projectId): string {
+    var stem = logoPackStem(provider, projectId)
+    if (stem == "") {
+        return ""
+    }
+    var cached = logoCachedPack(stem)
+    if (cached != "") {
+        return cached
+    }
+    var url = logoPackIconUrl(provider, projectId)
+    if (url == "") {
+        return ""
+    }
+    return logoFetchPackIcon(stem, url)
+}
+
+// The icon of the modpack a profile is linked to, or "" (not linked, no icon, or the
+// provider cannot be reached: the reason goes to the log).
+method logoLinkedIcon(map<string, object> profile): string {
+    var source = core.getOr(profile, "source", core.none())
+    if (core.isMap(source) == false) {
+        return ""
+    }
+    var provider = providers.jstr(source, "provider")
+    var projectId = providers.jstr(source, "projectId")
+    if (projectId == "") {
+        return ""
+    }
+    var outcome = core.runTrapped(LogoPackTask{provider = provider, projectId = projectId})
+    if (outcome.failed()) {
+        core.logWarn("logo: no icon for " + provider + "/" + projectId + ": " + providers.failureMessage(outcome.error()))
+        return ""
+    }
+    var url = outcome.result()
+    if (core.isString(url)) {
+        return url
+    }
+    return ""
+}

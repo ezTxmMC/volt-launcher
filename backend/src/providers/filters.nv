@@ -1,0 +1,164 @@
+package providers
+
+import core
+
+// The discovery filters shared by every provider (docs/ARCHITECTURE.md,
+// "Discover / Provider"): the sorts a provider implements, which search
+// parameters it honours, and the paging rules.
+//
+// Sort ids are shared where the meaning is the same (relevance, downloads,
+// follows, newest, updated). A provider lists only the ids it implements;
+// any other value falls back to relevance. Common aliases (installs, plays,
+// ...) map onto the shared ids.
+
+private final PV_DEFAULT_LIMIT = 20
+private final PV_MAX_LIMIT = 50
+
+// [id, label] pairs in display order.
+method sortTable(string provider): array {
+    if (provider == "curseforge") {
+        return [["relevance", "Relevance"], ["follows", "Popularity"], ["updated", "Last updated"],
+            ["name", "Name"], ["downloads", "Total downloads"], ["newest", "Release date"]]
+    }
+    if (provider == "technic") {
+        return [["relevance", "Relevance"], ["popular", "Trending"], ["downloads", "Installs"], ["follows", "Runs"]]
+    }
+    if (provider == "ftb") {
+        return [["relevance", "Relevance"], ["downloads", "Installs"], ["follows", "Plays"], ["updated", "Last updated"]]
+    }
+    return [["relevance", "Relevance"], ["downloads", "Downloads"], ["follows", "Follows"], ["newest", "Newest"], ["updated", "Updated"]]
+}
+
+// The sort ids of a provider, in display order.
+method sortIds(string provider): array {
+    var ids = []
+    for (pair in sortTable(provider)) {
+        ids.append(pair[0])
+    }
+    return ids
+}
+
+// The sorts as the filters answer lists them: [{id, label}].
+method sortList(string provider): array {
+    var out = []
+    for (pair in sortTable(provider)) {
+        out.append({"id": pair[0], "label": pair[1]})
+    }
+    return out
+}
+
+// The sort a provider applies for a request value; "relevance" when it does not know the value.
+method normalizeSort(string provider, string sort): string {
+    var s = sort.trim().toLower()
+    if (s == "installs") {
+        s = "downloads"
+    } else if (s == "plays" || s == "followers" || s == "popularity") {
+        s = "follows"
+    } else if (s == "created" || s == "release") {
+        s = "newest"
+    }
+    if (provider == "ftb" && s == "newest") {
+        s = "updated"
+    }
+    if (sortIds(provider).contains(s)) {
+        return s
+    }
+    return "relevance"
+}
+
+// What a provider does with each search parameter. A parameter it does not
+// honour is ignored and reported as false, never as an error.
+method supportsOf(string provider): map<string, object> {
+    var categories = provider == "modrinth" || provider == "curseforge"
+    var loader = provider != "technic"
+    return {
+        "search": true,
+        "kind": true,
+        "sort": true,
+        "categories": categories,
+        "gameVersion": true,
+        "loader": loader,
+        "paging": true
+    }
+}
+
+// The supports of a provider that cannot be used right now.
+method noSupport(): map<string, object> {
+    return {
+        "search": false,
+        "kind": false,
+        "sort": false,
+        "categories": false,
+        "gameVersion": false,
+        "loader": false,
+        "paging": false
+    }
+}
+
+// The page size of a search: 1..50, default 20. Larger values are clamped;
+// a malformed or zero value is a 400.
+method pageLimit(map<string, string> query): integer {
+    var text = queryText(query, "limit")
+    if (text == "") {
+        return PV_DEFAULT_LIMIT
+    }
+    if (isDigits(text) == false || text.length() > 9) {
+        core.badRequest("'limit' must be a whole number between 1 and " + PV_MAX_LIMIT)
+    }
+    var value = parseInt(text)
+    if (value < 1) {
+        core.badRequest("'limit' must be a whole number between 1 and " + PV_MAX_LIMIT)
+    }
+    if (value > PV_MAX_LIMIT) {
+        return PV_MAX_LIMIT
+    }
+    return value
+}
+
+// Whether items follow the page that starts at offset and holds count items.
+method hasMoreAfter(integer total, integer offset, integer count): bool {
+    return offset + count < total
+}
+
+// The answer of a search: {total, items, hasMore, supports}.
+method searchAnswer(integer total, array items, integer offset, map<string, object> supports): map<string, object> {
+    return {
+        "total": total,
+        "items": items,
+        "hasMore": hasMoreAfter(total, offset, items.length()),
+        "supports": supports
+    }
+}
+
+// An answer without any hit (a kind the provider does not offer).
+method emptySearch(): map<string, object> {
+    return {"total": 0, "items": []}
+}
+
+// The lists of a filters answer that a provider cannot list.
+method emptyLists(): map<string, object> {
+    return {"categories": [], "gameVersions": [], "loaders": []}
+}
+
+// The items in the order of `order` (ids first, in that order); the others follow in their own order.
+method rankByIds(array items, array order): array {
+    var out = []
+    var used = []
+    for (id in order) {
+        for (item in items) {
+            var key = jstr(item, "id")
+            if (key == id && used.contains(key) == false) {
+                out.append(item)
+                used.append(key)
+            }
+        }
+    }
+    for (item in items) {
+        var rest = jstr(item, "id")
+        if (used.contains(rest) == false) {
+            out.append(item)
+            used.append(rest)
+        }
+    }
+    return out
+}

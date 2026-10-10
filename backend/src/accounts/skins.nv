@@ -1,0 +1,272 @@
+package accounts
+
+import base64
+import bytes
+import core
+import json
+import os
+import path
+import thread
+
+// The local skin library and applying a skin to the selected Microsoft account.
+//
+// Library: <dataDir>/skins/skins.json (plain metadata: {"skins": [{id, name, slim,
+// createdAt}], "selectedSkinId": id or ""}) plus <dataDir>/skins/<id>.png. Skins are
+// not secret, so the metadata stays readable, unlike the account store.
+//
+// Applying uploads the PNG to Mojang (POST minecraft/profile/skins, multipart with
+// variant and file) with the account's Minecraft token and only then records the
+// skin as selected. Uploads run as a job.
+
+final AC_MAX_PNG_BYTES = 2097152
+final AC_MAX_SKIN_NAME = 64
+
+var acSkinLock = thread.mutex()
+
+method acSkinsDir(): string {
+    return path.join(core.dataDir(), "skins")
+}
+
+method acSkinsFile(): string {
+    return path.join(acSkinsDir(), "skins.json")
+}
+
+method acSkinPath(string id): string {
+    return path.join(acSkinsDir(), id + ".png")
+}
+
+method acEmptyLibrary(): map<string, object> {
+    return {"skins": [], "selectedSkinId": ""}
+}
+
+// Reads the library; a damaged file raises (it is never overwritten by an empty one).
+method acReadLibrary(): map<string, object> {
+    var file = acSkinsFile()
+    if (os.isFile(file) == false) {
+        return acEmptyLibrary()
+    }
+    var text = os.readFile(file)
+    if (json.isValid(text) == false) {
+        core.internal("skins.json is not valid JSON")
+    }
+    return json.parse(text)
+}
+
+// "" on success, else the error text (the caller decides what to clean up).
+method acWriteLibrary(map<string, object> library): string {
+    core.ensureDir(acSkinsDir())
+    return core.writeFileAtomic(acSkinsFile(), json.pretty(library) + "\n")
+}
+
+// The library entries as the API answers them: metadata plus the PNG as a data URL (the preview).
+method acSkinView(map<string, object> skin, string selectedId, bool withImage): map<string, object> {
+    var view = {
+        "id": skin["id"],
+        "name": skin["name"],
+        "slim": skin["slim"],
+        "createdAt": skin["createdAt"],
+        "selected": skin["id"] == selectedId
+    }
+    if (withImage) {
+        view["imageDataUrl"] = "data:image/png;base64," + base64.encode(os.readFile(acSkinPath(skin["id"])))
+    }
+    return view
+}
+
+method acNormalizeName(string raw): string {
+    var words = []
+    for (word in raw.trim().split(" ")) {
+        if (word != "") {
+            words.append(word)
+        }
+    }
+    return words.join(" ")
+}
+
+method acRequireName(string raw): string {
+    var name = acNormalizeName(raw)
+    if (name == "") {
+        core.badRequest("a skin name is required")
+    }
+    if (name.length() > AC_MAX_SKIN_NAME) {
+        core.badRequest("the skin name must be " + AC_MAX_SKIN_NAME + " characters or shorter")
+    }
+    return name
+}
+
+// A Minecraft skin: a PNG of 64x64 pixels (or 64x32 for the pre-1.8 layout).
+method acRequireSkinPng(string png) {
+    if (bytes.size(png) < 24) {
+        core.badRequest("the skin image must be a PNG file")
+    }
+    if (bytes.size(png) > AC_MAX_PNG_BYTES) {
+        core.badRequest("the skin image must be 2 MB or smaller")
+    }
+    var signature = bytes.putU8(137) + "PNG" + bytes.putU8(13) + bytes.putU8(10) + bytes.putU8(26) + bytes.putU8(10)
+    if (bytes.slice(png, 0, 8) != signature || bytes.slice(png, 12, 16) != "IHDR") {
+        core.badRequest("the skin image must be a PNG file")
+    }
+    var width = bytes.u32(png, 16)
+    var height = bytes.u32(png, 20)
+    if (width != 64 || (height != 64 && height != 32)) {
+        core.badRequest("a Minecraft skin must be 64x64 pixels (or 64x32 for the old layout), but this image is " + width + "x" + height + ".")
+    }
+}
+
+// The PNG of a request: base64, with or without a data: prefix.
+method acDecodeImage(string text): string {
+    var payload = text
+    var comma = text.indexOf(",")
+    if (text.startsWith("data:") && comma >= 0) {
+        payload = text.substring(comma + 1, text.length())
+    }
+    if (payload.trim() == "") {
+        core.badRequest("the skin image is required")
+    }
+    return base64.decode(payload.trim())
+}
+
+// Applies one operation to the library under acSkinLock. Returns the answer.
+method acSkinApply(string op, map<string, object> data): object {
+    var library = acReadLibrary()
+    var skins = core.getOr(library, "skins", [])
+    var selected = core.getOr(library, "selectedSkinId", "")
+    var target = core.getOr(data, "id", "")
+
+    if (op == "list") {
+        return library
+    }
+    if (op == "find") {
+        for (skin in skins) {
+            if (skin["id"] == target) {
+                return skin
+            }
+        }
+        return core.none()
+    }
+
+    var updated = []
+    var found = false
+    for (skin in skins) {
+        if (skin["id"] == target) {
+            found = true
+            if (op == "rename") {
+                var renamed = {}
+                for (key in skin) {
+                    renamed[key] = skin[key]
+                }
+                renamed["name"] = core.getOr(data, "name", skin["name"])
+                updated.append(renamed)
+            } else if (op == "delete") {
+                // dropped below
+            } else {
+                updated.append(skin)
+            }
+        } else {
+            updated.append(skin)
+        }
+    }
+
+    if (op == "add") {
+        // The PNG is written first; it is removed again when the metadata cannot be saved.
+        var added = core.getOr(data, "skin", {})
+        var pngProblem = core.writeFileAtomic(acSkinPath(added["id"]), core.getOr(data, "png", ""))
+        if (pngProblem != "") {
+            core.internal("cannot write the skin image: " + pngProblem)
+        }
+        updated.append(added)
+        library["skins"] = updated
+        var libraryProblem = acWriteLibrary(library)
+        if (libraryProblem != "") {
+            os.remove(acSkinPath(added["id"]))
+            core.internal("cannot save the skin library: " + libraryProblem)
+        }
+        return added
+    }
+    if (found == false) {
+        core.notFound("skin '" + target + "' not found")
+    }
+    if (op == "rename") {
+        library["skins"] = updated
+    } else if (op == "delete") {
+        library["skins"] = updated
+        if (selected == target) {
+            library["selectedSkinId"] = ""
+        }
+    } else if (op == "select") {
+        library["selectedSkinId"] = target
+    } else {
+        core.internal("unknown skin operation '" + op + "'")
+    }
+    var problem = acWriteLibrary(library)
+    if (problem != "") {
+        core.internal("cannot save the skin library: " + problem)
+    }
+    if (op == "delete") {
+        os.remove(acSkinPath(target))
+    }
+    return core.none()
+}
+
+define class AcSkinChange {
+    private string op: get, set
+    private map<string, object> data: get, set
+
+    method run(): object {
+        return acSkinApply(op, data)
+    }
+}
+
+// Runs a library operation under the lock; raises the error after the lock is released.
+method acSkinChange(string op, map<string, object> data): object {
+    var failed = false
+    var message = ""
+    var result = core.none()
+    sync (acSkinLock) {
+        var outcome = core.runTrapped(AcSkinChange{op = op, data = data})
+        failed = outcome.failed()
+        message = outcome.error()
+        if (failed == false) {
+            result = outcome.result()
+        }
+    }
+    if (failed) {
+        core.raise(message)
+    }
+    return core.copyJson(result)
+}
+
+// Uploads a PNG to Mojang with a Minecraft token. Raises on any failure.
+method acUploadSkin(string minecraftToken, bool slim, string pngPath) {
+    var copy = acTempFile(".png")
+    os.copy(pngPath, copy)
+    acChmod(copy, "600")
+    var variant = "classic"
+    if (slim) {
+        variant = "slim"
+    }
+    var extra = "-F " + os.shellQuote("variant=" + variant) + " -F " + os.shellQuote("file=@" + copy + ";type=image/png;filename=skin.png")
+    var res = acSend("POST", AC_MC_SKIN_URL, {"Authorization": "Bearer " + minecraftToken, "Accept": "application/json"}, "", "", extra)
+    os.remove(copy)
+    acRequireOk(res, "uploading the skin to Mojang")
+}
+
+// Applies a skin to the selected account: upload, then record it as selected.
+define class AcSkinApplyJob based JobBody {
+    private string skinId: get, set
+
+    method execute(string jobId): object {
+        core.jobProgress(jobId, 0.1, "Konto wird geprüft")
+        var session = acSkinSession()
+        var skin = acSkinChange("find", {"id": skinId})
+        if (core.isNull(skin)) {
+            core.notFound("skin '" + skinId + "' not found")
+        }
+        core.checkCancelled(jobId)
+        core.jobProgress(jobId, 0.3, "Skin wird hochgeladen")
+        acUploadSkin(session["accessToken"], skin["slim"] == true, acSkinPath(skinId))
+        acSkinChange("select", {"id": skinId})
+        acCurrentForget()
+        return {"skin": acSkinView(skin, skinId, false)}
+    }
+}

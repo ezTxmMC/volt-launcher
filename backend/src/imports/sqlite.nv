@@ -1,0 +1,184 @@
+package imports
+
+import core
+import json
+import os
+import path
+
+// The SQLite launchers: Modrinth App and NoRisk Client (docs/IMPORT-FORMATS.md sections 5
+// and 7). The database is read by the sqlite3 command line tool, read-only (-readonly).
+// Without sqlite3 on PATH the launcher is "unavailable", not guessed at.
+
+final MODRINTH_SQL = "SELECT i.id AS id, i.path AS path, i.name AS name, c.game_version AS game_version, c.loader AS loader, c.loader_version AS loader_version FROM instances AS i LEFT JOIN instance_content_sets AS c ON c.id = i.applied_content_set_id"
+final NORISK_SQL = "SELECT id, name, path, game_version, loader, loader_version, settings, use_shared_minecraft_folder FROM profiles"
+
+// The rows of a query as JSON objects (sqlite3 -json); [] when the query has no rows.
+// The database is never opened in the launcher's folder: a read-only connection to a WAL
+// database can still create its -wal and -shm files there. So app.db (and its -wal) is
+// copied to a scratch folder under the data dir, queried there, and the copy is removed.
+// A failing query raises, which the caller reports as the launcher's unavailable reason.
+define class SqliteTask {
+    private string db: get, set
+    private string sql: get, set
+    private string dir: get, set
+
+    method run(): object {
+        var copy = path.join(dir, "database.db")
+        if (os.copy(db, copy) == false) {
+            core.internal("cannot read a copy of '" + db + "'")
+        }
+        if (os.isFile(db + "-wal") && os.copy(db + "-wal", copy + "-wal") == false) {
+            core.internal("cannot read a copy of '" + db + "-wal'")
+        }
+        var outcome = os.run("sqlite3 -readonly -json " + os.shellQuote(copy) + " " + os.shellQuote(sql) + " 2>/dev/null")
+        if (outcome["code"] != 0) {
+            core.internal("sqlite3 failed with exit code " + outcome["code"])
+        }
+        var text = outcome["output"].trim()
+        if (text == "") {
+            return []
+        }
+        var parsed = json.tryParse(text)
+        if (core.isArray(parsed) == false) {
+            core.internal("sqlite3 printed no JSON rows")
+        }
+        return parsed
+    }
+}
+
+method sqliteRows(string db, string sql): array {
+    var dir = path.join(core.dataDir(), "cache", "imports", core.newId())
+    core.ensureDir(dir)
+    var outcome = core.runTrapped(SqliteTask{db = db, sql = sql, dir = dir})
+    os.removeAll(dir)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    return outcome.result()
+}
+
+// A single folder name from the database: no separators, no parent references.
+method plainFolderName(string name): bool {
+    if (name == "" || name == "." || name.contains("/") || name.contains("\\") || name.contains("..") || name.contains(chr(0))) {
+        return false
+    }
+    return true
+}
+
+// Modrinth's settings folder: THESEUS_CONFIG_DIR or the platform default (see launchers.nv).
+// The launch overrides and the content set link are read as far as the document says; the
+// rest is listed in the notes.
+method detectModrinth(): map<string, object> {
+    var records = []
+    var checked = []
+    for (base in launcherRoots("modrinth")) {
+        checked.append(base)
+        var db = path.join(base, "app.db")
+        if (os.isFile(db) == false) {
+            continue
+        }
+        if (os.hasCommand("sqlite3") == false) {
+            return {"records": [], "checked": checked, "unavailable": "sqlite3 is not installed"}
+        }
+        for (row in sqliteRows(db, MODRINTH_SQL)) {
+            records.append(readModrinthRow(base, db, row))
+        }
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readModrinthRow(string base, string db, object row): map<string, object> {
+    var id = textOf(row, "id")
+    var folderName = textOf(row, "path")
+    var location = path.join(base, "profiles", folderName)
+    var rec = newRecord("modrinth", location, db + "#" + id, textOf(row, "name"))
+    rec["minecraftVersion"] = textOf(row, "game_version")
+    var loader = loaderByName(textOf(row, "loader"))
+    if (loader == "") {
+        refuse(rec, "loader '" + textOf(row, "loader") + "' is not supported or not recorded")
+    } else {
+        rec["loader"] = loader
+        if (loader != "vanilla" && textOf(row, "loader_version") != "") {
+            rec["loaderVersion"] = textOf(row, "loader_version")
+        }
+    }
+    addNote(rec, "Java path and JVM arguments are not imported: the column that links instance_launch_overrides to instances is not documented")
+    addNote(rec, "memory is not imported: the unit of overrides.memory.maximum is not verified")
+    if (plainFolderName(folderName)) {
+        rec["gameDir"] = location
+    } else {
+        refuse(rec, "the profile folder '" + folderName + "' is not a plain folder name")
+    }
+    finishRecord(rec)
+    return rec
+}
+
+// NoRisk's folders: the meta folder holds app.db, profiles/ the game folders (section 7.1).
+method noriskPaths(): map<string, object> {
+    var platform = currentPlatform()
+    var root = path.join(dataHome(), "NoRiskClientV3")
+    var profiles = path.join(root, "profiles")
+    if (platform == "windows") {
+        root = path.join(appDataDir(), "norisk", "NoRiskClientV3")
+        profiles = path.join(root, "data", "profiles")
+    } else if (platform == "macos") {
+        root = path.join(homeDir(), "Library", "Application Support", "gg.norisk.NoRiskClientV3")
+        profiles = path.join(root, "profiles")
+    }
+    return {"meta": path.join(root, "meta"), "profiles": profiles}
+}
+
+method detectNoRisk(): map<string, object> {
+    var records = []
+    var folders = noriskPaths()
+    var meta = folders["meta"]
+    var checked = [meta]
+    var db = path.join(meta, "app.db")
+    if (os.isFile(db) == false) {
+        return {"records": records, "checked": checked}
+    }
+    if (os.hasCommand("sqlite3") == false) {
+        return {"records": [], "checked": checked, "unavailable": "sqlite3 is not installed"}
+    }
+    for (row in sqliteRows(db, NORISK_SQL)) {
+        records.append(readNoRiskRow(db, folders["profiles"], row))
+    }
+    return {"records": records, "checked": checked}
+}
+
+method readNoRiskRow(string db, string profilesDir, object row): map<string, object> {
+    var id = textOf(row, "id")
+    var folderName = textOf(row, "path")
+    var location = path.join(profilesDir, folderName)
+    var rec = newRecord("norisk", location, db + "#" + id, textOf(row, "name"))
+    rec["minecraftVersion"] = textOf(row, "game_version")
+    var loader = loaderByName(textOf(row, "loader"))
+    if (loader == "") {
+        refuse(rec, "loader '" + textOf(row, "loader") + "' is not supported or not recorded")
+    } else {
+        rec["loader"] = loader
+        if (loader != "vanilla" && textOf(row, "loader_version") != "") {
+            rec["loaderVersion"] = textOf(row, "loader_version")
+        }
+    }
+    if (truthy(core.getOr(row, "use_shared_minecraft_folder", false))) {
+        refuse(rec, "the profile uses a shared Minecraft folder: the group folder is not read")
+    }
+    var parsed = json.tryParse(textOf(row, "settings"))
+    if (boolOf(parsed, "use_custom_java_path", false) && textOf(parsed, "java_path") != "") {
+        rec["javaPath"] = textOf(parsed, "java_path")
+    }
+    rec["jvmArgs"] = textOf(parsed, "custom_jvm_args")
+    // settings.memory is {min, max} in MB (the comment at profile_state.rs:306).
+    var memory = core.getOr(mapAt(parsed, "memory"), "max", core.none())
+    if (typeOf(memory) == "integer" && memory >= 256) {
+        rec["memoryMb"] = memory
+    }
+    if (plainFolderName(folderName)) {
+        rec["gameDir"] = location
+    } else {
+        refuse(rec, "the profile folder '" + folderName + "' is not a plain folder name")
+    }
+    finishRecord(rec)
+    return rec
+}

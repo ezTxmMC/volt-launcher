@@ -1,0 +1,196 @@
+package server
+
+import bytes
+import json
+
+// HTTP/1.1, the small part this service needs: one request per connection
+// (request line, headers, Content-Length body), every answer is JSON and
+// closes the connection. No chunked bodies, no keep-alive.
+
+final MAX_HEADER_BYTES = 65536
+final MAX_BODY_BYTES = 16777216
+
+// One accepted connection: what came in so far and what still has to go out.
+define class Conn {
+    private integer fd: get, set
+    private string input: get, set
+    private string output: get, set
+    private bool answered: get, set
+    private float openedAt: get, set
+}
+
+// A parsed request.
+define class Request {
+    private string verb: get, set
+    private string target: get, set
+    private string pathname: get, set
+    private map<string, string> query: get, set
+    private map<string, string> headers: get, set
+    private string body: get, set
+}
+
+// Outcome of parsing a connection's buffer:
+//   "incomplete" - wait for more bytes
+//   "ok"         - request() holds the request
+//   "error"      - status()/message() describe a 4xx to answer
+define class ParseResult {
+    private string state: get, set
+    private Request request: get, set
+    private integer status: get, set
+    private string message: get, set
+}
+
+method incomplete(): ParseResult {
+    return ParseResult{state = "incomplete", status = 0, message = ""}
+}
+
+method parseError(integer status, string message): ParseResult {
+    return ParseResult{state = "error", status = status, message = message}
+}
+
+method parseRequest(string buffer): ParseResult {
+    var end = bytes.indexOf(buffer, "\r\n\r\n", 0)
+    if (end < 0) {
+        if (bytes.size(buffer) > MAX_HEADER_BYTES) {
+            return parseError(431, "request header too large")
+        }
+        return incomplete()
+    }
+    var lines = bytes.slice(buffer, 0, end).split("\r\n")
+    var first = lines[0].split(" ")
+    if (first.length() != 3 || first[2].startsWith("HTTP/1.") == false) {
+        return parseError(400, "malformed request line")
+    }
+    var headers = {}
+    var i = 1
+    while (i < lines.length()) {
+        var colon = lines[i].indexOf(":")
+        if (colon > 0) {
+            headers[lines[i].substring(0, colon).trim().toLower()] = lines[i].substring(colon + 1, lines[i].length()).trim()
+        }
+        i = i + 1
+    }
+    if (headers.has("transfer-encoding")) {
+        return parseError(400, "chunked request bodies are not supported, send Content-Length")
+    }
+    var length = 0
+    if (headers.has("content-length")) {
+        var text = headers["content-length"]
+        if (text == "" || isDigits(text) == false || text.length() > 12) {
+            return parseError(400, "invalid Content-Length")
+        }
+        length = parseInt(text)
+        if (length > MAX_BODY_BYTES) {
+            return parseError(413, "request body too large")
+        }
+    }
+    if (bytes.size(buffer) < end + 4 + length) {
+        return incomplete()
+    }
+    var target = first[1]
+    var pathname = target
+    var queryText = ""
+    var q = target.indexOf("?")
+    if (q >= 0) {
+        pathname = target.substring(0, q)
+        queryText = target.substring(q + 1, target.length())
+    }
+    var request = Request{
+        verb = first[0].toUpper(),
+        target = target,
+        pathname = pathname,
+        query = parseQuery(queryText),
+        headers = headers,
+        body = bytes.slice(buffer, end + 4, end + 4 + length)
+    }
+    return ParseResult{state = "ok", request = request, status = 0, message = ""}
+}
+
+method isDigits(string text): bool {
+    for (ch in text) {
+        if ("0123456789".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+// The path segments, percent-decoded: "/api/profiles/x" -> [api, profiles, x].
+method pathSegments(string pathname): array<string> {
+    var out = []
+    for (part in pathname.split("/")) {
+        if (part != "") {
+            out.append(urlDecode(part, false))
+        }
+    }
+    return out
+}
+
+method parseQuery(string text): map<string, string> {
+    var out = {}
+    for (pair in text.split("&")) {
+        if (pair == "") {
+            continue
+        }
+        var eq = pair.indexOf("=")
+        if (eq < 0) {
+            out[urlDecode(pair, true)] = ""
+            continue
+        }
+        out[urlDecode(pair.substring(0, eq), true)] = urlDecode(pair.substring(eq + 1, pair.length()), true)
+    }
+    return out
+}
+
+// %XX escapes; "+" is a space only in query strings.
+method urlDecode(string s, bool plusIsSpace): string {
+    if (s.contains("%") == false && (plusIsSpace == false || s.contains("+") == false)) {
+        return s
+    }
+    var out = []
+    var i = 0
+    var n = s.length()
+    while (i < n) {
+        var c = s.charAt(i)
+        if (c == "+" && plusIsSpace) {
+            out.append(" ")
+            i = i + 1
+            continue
+        }
+        if (c == "%" && i + 3 <= n) {
+            var decoded = bytes.fromHex(s.substring(i + 1, i + 3))
+            if (bytes.size(decoded) == 1) {
+                out.append(decoded)
+                i = i + 3
+                continue
+            }
+        }
+        out.append(c)
+        i = i + 1
+    }
+    return bytes.join(out)
+}
+
+// A complete JSON response with Connection: close.
+method jsonResponse(integer status, object body): string {
+    var text = json.stringify(body)
+    return "HTTP/1.1 " + status + " " + reason(status) + "\r\n" +
+        "Content-Type: application/json; charset=utf-8\r\n" +
+        "Content-Length: " + bytes.size(text) + "\r\n" +
+        "Cache-Control: no-store\r\n" +
+        "Connection: close\r\n\r\n" + text
+}
+
+method reason(integer status): string {
+    var reasons = {
+        200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+        400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+        405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
+        431: "Request Header Fields Too Large", 500: "Internal Server Error",
+        502: "Bad Gateway", 503: "Service Unavailable"
+    }
+    if (reasons.has(status)) {
+        return reasons[status]
+    }
+    return "Status"
+}

@@ -1,0 +1,413 @@
+package main
+
+import json
+import os
+import path
+import core
+import providers
+
+// Unit tests of the providers module. Run through run.sh, which builds the
+// fixtures, serves them on a local port and passes: <fixtureDir> <port> <hashes.json>.
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+method equal(string name, object actual, object expected) {
+    var same = json.stringify(actual) == json.stringify(expected)
+    if (same == false) {
+        println "      got " + json.stringify(actual) + ", expected " + json.stringify(expected)
+    }
+    check(name, same)
+}
+
+define class DownloadTask {
+    private string url: get, set
+    private string target: get, set
+    private map<string, string> hashes: get, set
+
+    method run(): object {
+        return providers.downloadFile(url, target, hashes, {})
+    }
+}
+
+define class DecideTask {
+    private bool hasMods: get, set
+
+    method run(): object {
+        return providers.decideLoader("1.7.10", "", "", hasMods, "test pack")
+    }
+}
+
+define class ZipReadTask {
+    private string file: get, set
+
+    method run(): object {
+        var zip = providers.zipOpenFile(file, "crc.zip")
+        return providers.zipReadNamed(zip, "file.txt")
+    }
+}
+
+define class PageLimitTask {
+    method run(): object {
+        return providers.pageLimit({"limit": "0"})
+    }
+}
+
+define class UnsafeFileTask {
+    private string rel: get, set
+
+    method run(): object {
+        return providers.recordFileOf(rel)
+    }
+}
+
+define class CfPackTask {
+    private array entries: get, set
+    private map<string, object> resolved: get, set
+    private map<string, object> mods: get, set
+
+    method run(): object {
+        return providers.cfPackFiles(entries, resolved, mods)
+    }
+}
+
+define class PackNameTask {
+    private object body: get, set
+
+    method run(): object {
+        return providers.packInstallName(body)
+    }
+}
+
+// The text repeated n times.
+method times(string text, integer n): string {
+    var out = ""
+    var k = 0
+    while (k < n) {
+        out = out + text
+        k = k + 1
+    }
+    return out
+}
+
+method main(array<string> args) {
+    var dir = args[0]
+    var base = "http://127.0.0.1:" + args[1]
+    var hashes = json.parse(os.readFile(args[2]))
+
+    // --- safe paths (defect 11)
+    equal("safeRelative keeps '..' inside a file name", providers.safeRelative("mods/a..b.jar"), "mods/a..b.jar")
+    equal("safeRelative strips ./", providers.safeRelative("./mods/x.jar"), "mods/x.jar")
+    equal("safeRelative resolves inner ..", providers.safeRelative("config/../mods/x.jar"), "mods/x.jar")
+    equal("safeRelative refuses traversal", providers.safeRelative("../x.jar"), "")
+    equal("safeRelative refuses deep traversal", providers.safeRelative("mods/../../x"), "")
+    equal("safeRelative refuses absolute", providers.safeRelative("/etc/passwd"), "")
+    equal("safeRelative refuses drive letters", providers.safeRelative("C:/x"), "")
+
+    // --- Forge versions in merged ids (defects 3, 8)
+    equal("forge 1.7.10 id", providers.forgeFromVersionId("1.7.10-Forge10.13.4.1558-1.7.10", "1.7.10"), "10.13.4.1558")
+    equal("forge 1.12.2 forge1.12.2- id", providers.forgeFromVersionId("1.12.2-forge1.12.2-14.23.5.2860", "1.12.2"), "14.23.5.2860")
+    equal("forge 1.12.2 id, Minecraft unknown", providers.forgeFromVersionId("1.12.2-forge1.12.2-14.23.5.2860", ""), "14.23.5.2860")
+    equal("forge 1.12.2 forge- id", providers.forgeFromVersionId("1.12.2-forge-14.23.5.2860", "1.12.2"), "14.23.5.2860")
+    equal("forge 1.6.4 id", providers.forgeFromVersionId("1.6.4-Forge9.11.1.965", "1.6.4"), "9.11.1.965")
+    equal("neoforge is not forge", providers.forgeFromVersionId("neoforge-21.1.77", "1.21.1"), "")
+    equal("version.json of the sky pack",
+        providers.loaderFromVersionJson({"id": "1.7.10-Forge10.13.4.1558-1.7.10", "inheritsFrom": "1.7.10"}),
+        {"minecraft": "1.7.10", "loader": "forge", "loaderVersion": "10.13.4.1558"})
+    equal("version.json without inheritsFrom",
+        providers.loaderFromVersionJson({"id": "1.6.4-Forge9.11.1.965"}),
+        {"minecraft": "1.6.4", "loader": "forge", "loaderVersion": "9.11.1.965"})
+    equal("fabric version.json",
+        providers.loaderFromVersionJson({"id": "fabric-loader-0.15.11-1.21.1", "inheritsFrom": "1.21.1"}),
+        {"minecraft": "1.21.1", "loader": "fabric", "loaderVersion": "0.15.11"})
+    equal("Solder forge field", providers.normalizeForgeVersion("1.12.2", "1.12.2-14.23.5.2860"), "14.23.5.2860")
+
+    // --- loader decision (defect 4, 9)
+    var withMods = core.runTrapped(DecideTask{hasMods = true})
+    check("mods without a loader fail", withMods.failed() && withMods.error().contains("no mod loader"))
+    var noMods = core.runTrapped(DecideTask{hasMods = false})
+    check("no mods and no loader is vanilla", noMods.failed() == false && noMods.result()["loader"] == "vanilla")
+
+    // --- wrapper folders (defect 1)
+    equal("client zip wrapper is stripped", providers.technicWrapper(providers.zipOpenFile(path.join(dir, "wrapped.zip"), "w")), "MyPack/")
+    equal("Solder zip rooted at mods/ is not stripped", providers.technicWrapper(providers.zipOpenFile(path.join(dir, "solder.zip"), "s")), "")
+    equal("config-only zip is not stripped", providers.technicWrapper(providers.zipOpenFile(path.join(dir, "configonly.zip"), "c")), "")
+    var wrapped = providers.zipOpenFile(path.join(dir, "wrapped.zip"), "w")
+    equal("loader from wrapped bin/version.json", providers.technicArchiveLoader(wrapped, "MyPack/")["loaderVersion"], "10.13.4.1558")
+    check("wrapped zip has mods", providers.zipHasMods(wrapped, "MyPack/"))
+    var rootClient = providers.zipOpenFile(path.join(dir, "rootclient.zip"), "r")
+    equal("loader from nested bin/modpack.jar", providers.technicArchiveLoader(rootClient, ""),
+        {"minecraft": "1.7.10", "loader": "forge", "loaderVersion": "10.13.4.1558"})
+    var corrupt = core.runTrapped(ZipReadTask{file = path.join(dir, "crc.zip")})
+    check("CRC mismatch is detected", corrupt.failed() && corrupt.error().contains("CRC"))
+
+    // --- downloads (defects 2, 5, 10)
+    var target = path.join(dir, "out", "payload.bin")
+    os.mkdir(path.join(dir, "out"))
+    os.writeFile(target, "")
+    var placeholder = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {}})
+    check("an existing placeholder is downloaded over (no hash)", placeholder.failed() == false && os.fileSize(target) == 5004)
+    os.writeFile(target, "")
+    var withMd5 = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {"md5": hashes["md5"]}})
+    check("MD5 is checked as MD5", withMd5.failed() == false && os.fileSize(target) == 5004)
+    var kept = core.runTrapped(DownloadTask{url = base + "/missing.bin", target = target, hashes = {"md5": hashes["md5"]}})
+    check("a file with a matching known hash is kept", kept.failed() == false && kept.result() == false)
+    os.remove(target)
+    var badMd5 = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {"md5": "00000000000000000000000000000000"}})
+    check("a wrong MD5 fails", badMd5.failed() && badMd5.error().contains("md5 mismatch"))
+    check("a failed download leaves no file", os.exists(target) == false)
+    var sha256 = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {"sha256": hashes["sha256"]}})
+    check("SHA-256 verified", sha256.failed() == false)
+    os.remove(target)
+    var sha512 = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {"sha512": hashes["sha512"]}})
+    check("SHA-512 verified", sha512.failed() == false)
+    os.remove(target)
+    var badSha512 = core.runTrapped(DownloadTask{url = base + "/payload.bin", target = target, hashes = {"sha512": hashes["sha1"]}})
+    check("a wrong SHA-512 fails", badSha512.failed())
+    var redirect = core.runTrapped(DownloadTask{url = base + "/redirect/payload.bin", target = target, hashes = {"sha1": hashes["sha1"]}})
+    check("redirects are followed", redirect.failed() == false && os.fileSize(target) == 5004)
+    var notFound = core.runTrapped(DownloadTask{url = base + "/nope.bin", target = path.join(dir, "out", "nope.bin"), hashes = {}})
+    check("HTTP 404 fails with the status", notFound.failed() && notFound.error().contains("HTTP 404"))
+
+    // --- discovery: sorts, categories, paging (filters.nv, curseforge.nv)
+    equal("curseforge sort ids", providers.sortIds("curseforge"), ["relevance", "follows", "updated", "name", "downloads", "newest"])
+    equal("technic sort ids", providers.sortIds("technic"), ["relevance", "popular", "downloads", "follows"])
+    equal("ftb sort ids", providers.sortIds("ftb"), ["relevance", "downloads", "follows", "updated"])
+    equal("modrinth sort ids unchanged", providers.sortIds("modrinth"), ["relevance", "downloads", "follows", "newest", "updated"])
+    equal("installs is downloads", providers.normalizeSort("ftb", "installs"), "downloads")
+    equal("plays is follows", providers.normalizeSort("ftb", "plays"), "follows")
+    equal("ftb newest is updated", providers.normalizeSort("ftb", "newest"), "updated")
+    equal("technic popular is kept", providers.normalizeSort("technic", "popular"), "popular")
+    equal("ftb has no popular sort", providers.normalizeSort("ftb", "popular"), "relevance")
+    equal("unknown sort is relevance", providers.normalizeSort("technic", "bogus"), "relevance")
+    equal("cf relevance is Featured", providers.cfSortField("relevance"), 1)
+    equal("cf popularity", providers.cfSortField("follows"), 2)
+    equal("cf last updated", providers.cfSortField("updated"), 3)
+    equal("cf name", providers.cfSortField("name"), 4)
+    equal("cf total downloads", providers.cfSortField("downloads"), 6)
+    equal("cf release date", providers.cfSortField("newest"), 11)
+    equal("cf names sort A to Z", providers.cfSortOrder("name"), "asc")
+    equal("cf downloads sort largest first", providers.cfSortOrder("downloads"), "desc")
+    equal("one cf category is categoryId", providers.cfCategoryParam("423"), "&categoryId=423")
+    equal("several cf categories are categoryIds", providers.cfCategoryParam("423, 406,423"), "&categoryIds=" + providers.urlEncode("[423,406]"))
+    equal("modrinth names are no cf category", providers.cfCategoryParam("optimization"), "")
+    equal("no cf category", providers.cfCategoryParam(""), "")
+    equal("rankByIds puts the ranked first",
+        providers.rankByIds([{"id": "b"}, {"id": "a"}, {"id": "c"}], ["c", "a", "zzz"]),
+        [{"id": "c"}, {"id": "a"}, {"id": "b"}])
+    check("hasMore is false on the last page", providers.hasMoreAfter(40, 20, 20) == false)
+    check("hasMore is true before the total", providers.hasMoreAfter(41, 20, 20))
+    var page = providers.searchAnswer(3, [{"id": "a"}], 0, providers.supportsOf("technic"))
+    check("search answer has hasMore", page["hasMore"] == true && page["total"] == 3)
+    var emptyPage = providers.searchAnswer(0, [], 0, providers.supportsOf("technic"))
+    check("empty search answer has no hasMore", emptyPage["hasMore"] == false)
+    var technicSupports = providers.supportsOf("technic")
+    check("technic supports no categories or loader", technicSupports["categories"] == false && technicSupports["loader"] == false)
+    check("technic supports gameVersion and paging", technicSupports["gameVersion"] == true && technicSupports["paging"] == true)
+    var ftbSupports = providers.supportsOf("ftb")
+    check("ftb supports loader, not categories", ftbSupports["loader"] == true && ftbSupports["categories"] == false)
+    var limitTask = core.runTrapped(PageLimitTask{})
+    check("limit 0 is refused", limitTask.failed() && limitTask.error().contains("'limit'"))
+    var big = providers.pageLimit({"limit": "500"})
+    equal("limit above 50 is clamped", big, 50)
+
+    // --- filters answer shape (no network: Technic and FTB list nothing)
+    var technicFilters = providers.providerFilters("technic", "modpack")
+    check("filters has the contract keys", technicFilters.has("kinds") && technicFilters.has("sorts") && technicFilters.has("categories") && technicFilters.has("gameVersions") && technicFilters.has("loaders") && technicFilters.has("supports"))
+    equal("technic filters kinds", technicFilters["kinds"], ["modpack"])
+    var technicSorts = providers.jarr(technicFilters, "sorts")
+    equal("technic filters sort labels", providers.jstr(technicSorts[0], "label"), "Relevance")
+    equal("technic filters categories are empty", technicFilters["categories"], [])
+    equal("technic filters loaders are empty", technicFilters["loaders"], [])
+    var techFiltersSupports = technicFilters["supports"]
+    check("technic filters report no categories", techFiltersSupports["categories"] == false)
+    var ftbFilters = providers.providerFilters("ftb", "")
+    equal("ftb filters default kind is modpack", ftbFilters["kinds"], ["modpack"])
+    check("ftb filters report gameVersion support", ftbFilters["supports"]["gameVersion"] == true)
+    var cfStatusNow = providers.cfStatus()
+    if (cfStatusNow["ok"] == false) {
+        var cfFilters = providers.providerFilters("curseforge", "mod")
+        equal("curseforge filters without the bridge are empty", cfFilters["categories"], [])
+        equal("curseforge filters without the bridge have no sorts", cfFilters["sorts"], [])
+        check("curseforge filters without the bridge support nothing", cfFilters["supports"]["search"] == false)
+    } else {
+        println "skip  curseforge filters without the bridge (bridge is running)"
+    }
+
+    // --- pack file sources (install.nv: the source a pack file gets)
+    equal("download URL with spaces and brackets is encoded",
+        providers.encodeDownloadUrl("https://edge.forgecdn.net/files/2353/142/LongFall Boots [Hard].jar"),
+        "https://edge.forgecdn.net/files/2353/142/LongFall%20Boots%20%5BHard%5D.jar")
+    equal("download URL without special characters is kept",
+        providers.encodeDownloadUrl("https://cdn.modrinth.com/data/AANobbMI/versions/KIRFiWG4/sodium.jar"),
+        "https://cdn.modrinth.com/data/AANobbMI/versions/KIRFiWG4/sodium.jar")
+    var packSource = providers.packSourceMap("modrinth", "1KVo5zza", "N276l2ON", "Fabulously Optimized")
+    equal("pack source has the profile's keys", packSource,
+        {"provider": "modrinth", "projectId": "1KVo5zza", "versionId": "N276l2ON", "name": "Fabulously Optimized", "kind": "modpack"})
+    equal("a Modrinth pack names no project or version for its files",
+        providers.packFallbackSource(packSource),
+        {"provider": "modrinth", "projectId": "", "versionId": "", "versionNumber": "", "name": "Fabulously Optimized", "kind": "modpack"})
+    var cfPack = providers.packSourceMap("curseforge", "238222", "4201", "Some Pack")
+    equal("a CurseForge pack names no file version for its files",
+        providers.packFallbackSource(cfPack),
+        {"provider": "curseforge", "projectId": "238222", "versionId": "", "versionNumber": "", "name": "Some Pack", "kind": "modpack"})
+    var technicPack = providers.packSourceMap("technic", "tc-redux", "3.3.6", "The Classic Pack")
+    equal("a Technic pack names its build as the version",
+        providers.packFallbackSource(technicPack),
+        {"provider": "technic", "projectId": "tc-redux", "versionId": "3.3.6", "versionNumber": "3.3.6", "name": "The Classic Pack", "kind": "modpack"})
+    equal("a Modrinth file source has the install-by-id fields",
+        providers.modrinthFileSource({"id": "KIRFiWG4", "project_id": "AANobbMI", "version_number": "mc1.21.1-0.8.12-fabric", "name": "Sodium 0.8.12 for Fabric 1.21.1"}),
+        {"provider": "modrinth", "projectId": "AANobbMI", "versionId": "KIRFiWG4", "versionNumber": "mc1.21.1-0.8.12-fabric", "name": "Sodium 0.8.12 for Fabric 1.21.1"})
+    equal("a CurseForge file source has the install-by-id fields",
+        providers.cfFileSource({"id": "4201", "projectId": "238222", "versionNumber": "jei-1.20.1-15.0.0.12.jar", "name": "jei-1.20.1-15.0.0.12.jar"}),
+        {"provider": "curseforge", "projectId": "238222", "versionId": "4201", "versionNumber": "jei-1.20.1-15.0.0.12.jar", "name": "jei-1.20.1-15.0.0.12.jar"})
+
+    // --- connect (connect.nv, modpack.nv): file lists, record, update removal, status
+    equal("modrinth index: content files that download, once each",
+        providers.modrinthIndexFiles({"files": [
+            {"path": "mods/a.jar", "downloads": ["https://example.invalid/a.jar"], "env": {"client": "required"}},
+            {"path": "mods/server-only.jar", "downloads": ["https://example.invalid/s.jar"], "env": {"client": "unsupported"}},
+            {"path": "mods/nothing.jar", "downloads": []},
+            {"path": "config/options.txt", "downloads": ["https://example.invalid/o.txt"]},
+            {"path": "resourcepacks/pack.zip", "downloads": ["https://example.invalid/p.zip"]},
+            {"path": "mods/a.jar", "downloads": ["https://example.invalid/a.jar"]}
+        ]}),
+        ["mods/a.jar", "resourcepacks/pack.zip"])
+    var manifest = {"files": [
+        {"fileID": 100, "projectID": 5, "required": true},
+        {"fileID": 101, "projectID": 5, "required": false},
+        {"fileID": 102, "projectID": 12},
+        {"projectID": 9}
+    ]}
+    check("cf manifest: optional and id-less entries are left out", providers.cfRequiredFiles(manifest).length() == 2)
+    var cfResolved = {
+        "100": {"id": 100, "modId": 5, "fileName": "a.jar"},
+        "102": {"id": 102, "modId": 12, "fileName": "pack.zip"}
+    }
+    var cfMods = {"5": {"id": 5, "classId": 6}, "12": {"id": 12, "classId": 12}}
+    equal("cf pack files: class folders and file names",
+        providers.cfPackFiles(providers.cfRequiredFiles(manifest), cfResolved, cfMods),
+        ["mods/a.jar", "resourcepacks/pack.zip"])
+    var cfMissing = core.runTrapped(CfPackTask{entries = providers.cfRequiredFiles(manifest), resolved = {}, mods = cfMods})
+    check("cf file that did not resolve is 422 unsupported", cfMissing.failed() && cfMissing.error().contains("|422|unsupported|"))
+    equal("technic client zip: wrapper stripped, bin/ skipped",
+        providers.technicClientFiles(providers.zipOpenFile(path.join(dir, "wrapped.zip"), "w")), ["mods/a.jar"])
+    equal("technic client zip without wrapper",
+        providers.technicClientFiles(providers.zipOpenFile(path.join(dir, "rootclient.zip"), "r")), ["mods/m.jar"])
+    equal("ftb release: content files, server-only and nameless skipped",
+        providers.ftbReleaseFiles({"files": [
+            {"name": "a.jar", "path": "mods", "serveronly": false},
+            {"name": "srv.jar", "path": "mods", "serveronly": true},
+            {"name": "options.txt", "path": ""},
+            {"name": "", "path": "mods"},
+            {"name": "b.zip", "path": "resourcepacks\\"}
+        ]}),
+        ["mods/a.jar", "resourcepacks/b.zip"])
+    var escaping = core.runTrapped(UnsafeFileTask{rel = "../outside.jar"})
+    check("a pack file outside the game directory is 422 unsupported", escaping.failed() && escaping.error().contains("|422|unsupported|"))
+
+    var game = path.join(dir, "game-connect")
+    os.mkdir(game)
+    os.mkdir(path.join(game, "mods"))
+    os.mkdir(path.join(game, "config"))
+    os.mkdir(path.join(game, "saves"))
+    os.mkdir(path.join(game, "saves", "World"))
+    for (f in ["mods/old.jar", "mods/keep.jar", "mods/user.jar", "config/c.cfg", "saves/World/level.dat"]) {
+        os.writeFile(path.join(game, f), "x")
+    }
+    equal("pack record is written", providers.writePackRecordText(game, "v1", ["mods/old.jar", "mods/keep.jar"]), "")
+    var recorded = providers.readPackRecord(game)
+    equal("pack record reads back", recorded, {"versionId": "v1", "files": ["mods/old.jar", "mods/keep.jar"]})
+    equal("update to v2 removes what v1 shipped and v2 does not",
+        providers.dropStaleFiles(game, recorded["files"], ["mods/keep.jar", "mods/new.jar"]), ["mods/old.jar"])
+    check("the removed pack file is gone", os.isFile(path.join(game, "mods", "old.jar")) == false)
+    check("kept pack file, user mod, config and world stay",
+        os.isFile(path.join(game, "mods", "keep.jar")) && os.isFile(path.join(game, "mods", "user.jar"))
+        && os.isFile(path.join(game, "config", "c.cfg")) && os.isFile(path.join(game, "saves", "World", "level.dat")))
+    equal("disconnect removes the record", providers.removePackRecord(game), "")
+    check("the record file is gone", os.isFile(providers.packRecordFile(game)) == false)
+    equal("disconnect without a record is fine", providers.removePackRecord(game), "")
+
+    var releases = [{"id": "v2", "versionNumber": "2.0", "datePublished": "2026-02-01"}, {"id": "v1", "versionNumber": "1.0", "datePublished": "2026-01-01"}]
+    var behind = providers.linkedStatus(providers.packSourceMap("modrinth", "P1", "v1", "Pack"), releases, "")
+    check("status of an older release: linked, number, update available",
+        behind["linked"] == true && behind["versionNumber"] == "1.0" && behind["updateAvailable"] == true && behind["latestVersionId"] == "v2" && behind["projectId"] == "P1")
+    var newest = providers.linkedStatus(providers.packSourceMap("modrinth", "P1", "v2", "Pack"), releases, "")
+    check("status of the newest release: no update", newest["updateAvailable"] == false && newest["versionNumber"] == "2.0")
+    var technicStatus = providers.linkedStatus(providers.packSourceMap("technic", "tc", "3.3.6", "Pack"), [], "Technic packs cannot be updated yet.")
+    check("technic status names the build as the version", technicStatus["versionNumber"] == "3.3.6" && technicStatus["updateAvailable"] == false && technicStatus["reason"] != "")
+    check("unlinked status", providers.unlinkedStatus("none")["linked"] == false)
+
+    // --- CurseForge descriptions: HTML to Markdown (htmltext.nv)
+    equal("cf description: image, then heading",
+        providers.htmlToMarkdown("<p><img src=\"https://www.bisecthosting.com/a.webp\" alt=\"\"></p><h1 style=\"text-align:center\">The Official Homestead Modpack</h1>"),
+        "![](https://www.bisecthosting.com/a.webp)\n\n# The Official Homestead Modpack")
+    equal("cf description: heading levels", providers.htmlToMarkdown("<h3>Three</h3><h6>Six</h6>"), "### Three\n\n###### Six")
+    equal("cf description: double encoded linkout is unwrapped",
+        providers.htmlToMarkdown("Get it on <a href=\"/linkout?remoteUrl=https%253A%252F%252Fmodrinth.com%252Fmod%252Fx\" target=\"_blank\" rel=\"nofollow\">Tectonic</a>."),
+        "Get it on [Tectonic](https://modrinth.com/mod/x).")
+    equal("cf description: single encoded curseforge linkout is unwrapped",
+        providers.htmlToMarkdown("<a href=\"https://www.curseforge.com/linkout?remoteUrl=https%3A%2F%2Fmodrinth.com%2Fmod%2Fx\">Tectonic</a>"),
+        "[Tectonic](https://modrinth.com/mod/x)")
+    equal("cf description: an image inside a link keeps its brackets",
+        providers.htmlToMarkdown("<a href=\"https://x.test/\"><img src=\"https://a.test/b.webp\" alt=\"BisectHosting\"></a>"),
+        "[![BisectHosting](https://a.test/b.webp)](https://x.test/)")
+    equal("cf description: linkout image is a link",
+        providers.htmlToMarkdown("<img src=\"/linkout?remoteUrl=https%3A%2F%2Fexample.com%2Fa\" alt=\"Site\">"),
+        "[Site](https://example.com/a)")
+    equal("cf description: youtube iframe becomes a link",
+        providers.htmlToMarkdown("<iframe src=\"https://www.youtube.com/embed/AbC-123?feature=oembed\" width=\"560\"></iframe>"),
+        "[Video](https://www.youtube.com/watch?v=AbC-123)")
+    equal("cf description: other iframes are dropped",
+        providers.htmlToMarkdown("<p>x</p><iframe src=\"https://example.com/x\"></iframe><p>y</p>"), "x\n\ny")
+    equal("cf description: nested lists", providers.htmlToMarkdown("<ul><li>One</li><li>Two<ul><li>Nested</li></ul></li></ul>"), "- One\n- Two\n  - Nested")
+    equal("cf description: ordered list", providers.htmlToMarkdown("<ol><li>First</li><li>Second</li></ol>"), "1. First\n2. Second")
+    equal("cf description: entities decoded",
+        providers.htmlToMarkdown("<p>Tom &amp; Jerry &lt;3 &quot;hi&quot; it&#39;s&nbsp;here &#x41;</p>"),
+        "Tom & Jerry <3 \"hi\" it's here A")
+    equal("cf description: emphasis and code",
+        providers.htmlToMarkdown("<p><strong>Bold</strong> and <em>it</em> and <code>x</code></p>"), "**Bold** and *it* and `x`")
+    equal("cf description: inner space leaves the mark", providers.htmlToMarkdown("<p>a <b>bold </b>c</p>"), "a **bold** c")
+    equal("cf description: blockquote", providers.htmlToMarkdown("<blockquote>Quoted<br>line</blockquote><p>After</p>"), "> Quoted  \n> line\n\nAfter")
+    equal("cf description: script, style and comments are removed",
+        providers.htmlToMarkdown("<!-- hidden --><style>p{}</style><script>alert(1)</script><p>Shown</p>"), "Shown")
+    equal("cf description: a block start in text is escaped", providers.htmlToMarkdown("<p>&#35; not a heading</p>"), "\\# not a heading")
+    equal("cf description: tag-like text is escaped", providers.htmlToMarkdown("<p>&lt;b&gt;bold&lt;/b&gt;</p>"), "\\<b>bold\\</b>")
+    equal("cf description: unknown tags keep their text", providers.htmlToMarkdown("<span class=\"x\">Hi</span> <font color=\"red\">there</font>"), "Hi there")
+    equal("cf description: blank lines collapse", providers.htmlToMarkdown("<p>a</p>\n\n\n\n<p>b</p>"), "a\n\nb")
+    equal("cf description: markdown characters in text stay", providers.htmlToMarkdown("<p>5 * 3 _x_</p>"), "5 * 3 _x_")
+    equal("cf description: unicode and numeric entities", providers.htmlToMarkdown("<p>Café &mdash; &#x1F600; ok</p>"), "Café — 😀 ok")
+    equal("cf description: empty stays empty", providers.htmlToMarkdown(""), "")
+    equal("cf description: empty paragraph stays empty", providers.htmlToMarkdown("<p></p><p> </p>"), "")
+
+    // --- pack install name (route.nv): absent = the pack's name, otherwise 1 to 64 characters
+    equal("pack name: absent is the pack's own name", providers.packInstallName({"provider": "modrinth"}), "")
+    equal("pack name: null is absent", providers.packInstallName({"name": core.none()}), "")
+    equal("pack name: custom name is trimmed", providers.packInstallName({"name": "  Mein Pack  "}), "Mein Pack")
+    equal("pack name: 64 characters are allowed", providers.packInstallName({"name": times("a", 64)}), times("a", 64))
+    equal("pack name: characters, not bytes, are counted", providers.packNameLength("ööa"), 3)
+    var emptyName = core.runTrapped(PackNameTask{body = {"name": "   "}})
+    check("pack name: empty is 400", emptyName.failed() && emptyName.error().contains("|400|bad_request|"))
+    var longName = core.runTrapped(PackNameTask{body = {"name": times("a", 65)}})
+    check("pack name: 65 characters are 400", longName.failed() && longName.error().contains("|400|bad_request|") && longName.error().contains("64"))
+    var notText = core.runTrapped(PackNameTask{body = {"name": 5}})
+    check("pack name: a number is 400", notText.failed() && notText.error().contains("|400|bad_request|"))
+    var tooManyBytes = core.runTrapped(PackNameTask{body = {"name": times("ö", 64)}})
+    check("pack name: profile name rule (100 bytes) still applies", tooManyBytes.failed() && tooManyBytes.error().contains("|400|bad_request|"))
+
+    println "providers unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures > 0) {
+        return 1
+    }
+    return 0
+}

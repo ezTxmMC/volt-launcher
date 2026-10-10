@@ -1,0 +1,1056 @@
+package providers
+
+import core
+import json
+import mods
+import os
+import path
+import strings
+import thread
+
+// Shared install mechanics: staging, safe paths, parallel downloads with
+// progress, zip extraction, the loader decision and the busy markers.
+//
+// Sources: every file a pack installs gets a source in the content store of
+// its folder (see recordPackSources), so the files show where they came from
+// without an identify.
+
+// --- busy profiles -----------------------------------------------------------------
+
+var pvBusyLock = thread.mutex()
+var pvBusy = {}
+
+method claimBusy(string profileId, string what) {
+    if (profileId == "") {
+        return
+    }
+    sync (pvBusyLock) {
+        pvBusy[profileId] = what
+    }
+}
+
+method releaseBusy(string profileId) {
+    if (profileId == "") {
+        return
+    }
+    sync (pvBusyLock) {
+        pvBusy.remove(profileId)
+    }
+}
+
+method busyWith(string profileId): string {
+    var what = ""
+    sync (pvBusyLock) {
+        if (pvBusy.has(profileId)) {
+            what = pvBusy[profileId]
+        }
+    }
+    return what
+}
+
+// --- paths -------------------------------------------------------------------------
+
+// A game-relative path with "." and ".." resolved, or "" when it is empty,
+// absolute or climbs out of the game directory. A ".." inside a file name
+// ("a..b.jar") is fine; only a real traversal is refused.
+method safeRelative(string rel): string {
+    var p = rel.replace("\\", "/")
+    if (p.startsWith("/") || p.contains(":") || p.contains(chr(0))) {
+        return ""
+    }
+    var out = []
+    for (seg in p.split("/")) {
+        if (seg == "" || seg == ".") {
+            continue
+        }
+        if (seg == "..") {
+            if (out.length() == 0) {
+                return ""
+            }
+            out.pop()
+            continue
+        }
+        out.append(seg)
+    }
+    return out.join("/")
+}
+
+// gameDir/rel, or a 502 when rel escapes the game directory.
+method gamePath(string gameDir, string rel, string what): string {
+    var clean = safeRelative(rel)
+    if (clean == "") {
+        core.upstream(what + " tried to write outside the game directory: '" + rel + "'")
+    }
+    return path.join(gameDir, clean)
+}
+
+// A provider file name kept to one path segment.
+method safeFileName(string name): string {
+    var n = name.replace("\\", "/")
+    var slash = strings.lastIndexOf(n, "/")
+    if (slash >= 0) {
+        n = n.substring(slash + 1, n.length())
+    }
+    var cleaned = ""
+    for (ch in n) {
+        if (ord(ch) >= 32 && ch != ":") {
+            cleaned = cleaned + ch
+        }
+    }
+    cleaned = cleaned.trim()
+    if (cleaned == "" || cleaned == "." || cleaned == "..") {
+        core.upstream("refusing a file with an unusable name: '" + name + "'")
+    }
+    return cleaned
+}
+
+// <dataDir>/tmp/providers-<jobId>, created empty.
+method stagingDir(string jobId): string {
+    var dir = path.join(core.dataDir(), "tmp", "providers-" + jobId)
+    if (os.exists(dir)) {
+        os.removeAll(dir)
+    }
+    return core.ensureDir(dir)
+}
+
+// --- progress ----------------------------------------------------------------------
+
+method toF(integer value): float {
+    float f = value
+    return f
+}
+
+// Progress between `from` and `to` after done of total steps.
+method stepProgress(string jobId, float from, float to, integer done, integer total, string message) {
+    var fraction = 1.0
+    if (total > 0) {
+        fraction = toF(done) / toF(total)
+    }
+    core.jobProgress(jobId, from + (to - from) * fraction, message)
+}
+
+// --- downloads -----------------------------------------------------------------------
+
+define class PvDownloadTask {
+    private string jobId: get, set
+    private string url: get, set
+    private string target: get, set
+    private map<string, string> hashes: get, set
+    private map<string, string> headers: get, set
+    private integer counter: get, set
+    private integer total: get, set
+    private float from: get, set
+    private float to: get, set
+
+    method run(): object {
+        if (url != "") {
+            downloadFile(url, target, hashes, headers)
+        }
+        // Blank URLs count as done too, so the bar reaches the end.
+        var done = thread.add(counter, 1)
+        stepProgress(jobId, from, to, done, total, "Lade " + done + " / " + total + " Dateien")
+        return target
+    }
+}
+
+// Downloads every {url, target, hashes} at most 8 at a time. Fails with a
+// summary when any download failed (or ends cancelled on a cancel request).
+method downloadAll(string jobId, array files, map<string, string> headers, float from, float to) {
+    var counter = thread.counter(0)
+    var tasks = []
+    for (f in files) {
+        tasks.append(PvDownloadTask{
+            jobId = jobId, url = f["url"], target = f["target"], hashes = f["hashes"], headers = headers,
+            counter = counter, total = files.length(), from = from, to = to
+        })
+    }
+    stepProgress(jobId, from, to, 0, files.length(), "Lade 0 / " + files.length() + " Dateien")
+    var outcomes = runParallel(tasks, PV_MAX_PARALLEL, jobId)
+    var failed = countFailures(outcomes)
+    if (failed > 0) {
+        var first = ""
+        for (outcome in outcomes) {
+            if (outcome.failed()) {
+                if (core.isCancelFailure(outcome.error())) {
+                    core.raiseCancelled()
+                }
+                if (first == "") {
+                    first = failureMessage(outcome.error())
+                }
+            }
+        }
+        core.upstream("failed to download " + failed + " of " + files.length() + " files; first error: " + first)
+    }
+    core.checkCancelled(jobId)
+}
+
+// --- zip extraction ----------------------------------------------------------------
+
+private final PV_GAME_FOLDERS = ["mods", "config", "bin", "scripts", "resourcepacks", "coremods",
+    "libraries", "shaderpacks", "datapacks", "options.txt", "saves", "flan", "jarmods", "texturepacks"]
+
+// The single top folder of a Technic client zip that is a wrapper (named
+// after the pack), or "". A top folder that is itself a game folder
+// (mods/, config/, bin/ ...) is never stripped.
+method technicWrapper(PvZip zip): string {
+    var top = ""
+    for (entry in zip.entries()) {
+        var name = entry.name()
+        if (name == "" || name.startsWith("__MACOSX/")) {
+            continue
+        }
+        var slash = name.indexOf("/")
+        if (slash <= 0) {
+            if (entry.directory() == false) {
+                return ""
+            }
+            continue
+        }
+        var t = name.substring(0, slash)
+        if (top == "") {
+            top = t
+        } else if (t != top) {
+            return ""
+        }
+    }
+    if (top == "" || PV_GAME_FOLDERS.contains(top.toLower())) {
+        return ""
+    }
+    return top + "/"
+}
+
+// Whether a game-relative path is a mod file.
+method isModPath(string rel): bool {
+    var lower = rel.toLower()
+    if ((lower.startsWith("mods/") || lower.startsWith("coremods/")) == false) {
+        return false
+    }
+    return lower.endsWith(".jar") || lower.endsWith(".zip") || lower.endsWith(".litemod") || lower.endsWith(".jar.disabled")
+}
+
+// The game-relative path an entry extracts to under `prefix` (entries
+// outside it give ""), skipping directories, __MACOSX and, when skipBin,
+// Technic's own bin/ folder.
+method entryTarget(PvZipEntry entry, string prefix, bool skipBin): string {
+    var name = entry.name()
+    if (entry.directory() || name.startsWith(prefix) == false) {
+        return ""
+    }
+    var rel = name.substring(prefix.length(), name.length())
+    if (rel == "" || rel.startsWith("__MACOSX/")) {
+        return ""
+    }
+    if (skipBin && rel.toLower().startsWith("bin/")) {
+        return ""
+    }
+    return rel
+}
+
+// Whether the archive holds mod files below prefix.
+method zipHasMods(PvZip zip, string prefix): bool {
+    for (entry in zip.entries()) {
+        var rel = entryTarget(entry, prefix, true)
+        if (rel != "" && isModPath(rel)) {
+            return true
+        }
+    }
+    return false
+}
+
+// Extracts the entries below prefix over the game directory. Returns how many files were written.
+// The content files written are noted in the pack state (their sources are recorded later).
+method extractZip(string jobId, PvZip zip, string gameDir, string prefix, bool skipBin, PvPackState state): integer {
+    var written = 0
+    for (entry in zip.entries()) {
+        var rel = entryTarget(entry, prefix, skipBin)
+        if (rel == "") {
+            continue
+        }
+        var target = gamePath(gameDir, rel, zip.label())
+        var dir = path.dirname(target)
+        if (os.isDir(dir) == false && os.mkdir(dir) == false) {
+            core.internal("cannot create directory '" + dir + "'")
+        }
+        os.writeFile(target, zipRead(zip, entry))
+        state.addContent(rel)
+        written = written + 1
+        if (written % 50 == 0) {
+            core.checkCancelled(jobId)
+        }
+    }
+    return written
+}
+
+// --- loaders and profiles -----------------------------------------------------------
+
+// {minecraft, loader, loaderVersion} for a profile. A pack that ships mods
+// but names no loader fails instead of becoming a vanilla profile that
+// would ignore its mods.
+method decideLoader(string minecraft, string loader, string loaderVersion, bool hasMods, string what): map<string, object> {
+    if (minecraft == "") {
+        core.upstream(what + " does not say which Minecraft version it needs")
+    }
+    var l = loader.toLower()
+    if (l != "" && l != "vanilla") {
+        if (["forge", "neoforge", "fabric", "quilt"].contains(l) == false) {
+            core.upstream(what + " needs the mod loader '" + loader + "', which the launcher does not support")
+        }
+        if (loaderVersion.trim() == "") {
+            core.upstream(what + " names the loader " + l + " without a version")
+        }
+        return {"minecraft": minecraft, "loader": l, "loaderVersion": loaderVersion.trim()}
+    }
+    if (hasMods) {
+        core.upstream(what + " contains mods, but no mod loader (Forge, NeoForge, Fabric, Quilt) could be determined")
+    }
+    return {"minecraft": minecraft, "loader": "vanilla", "loaderVersion": ""}
+}
+
+// The state of one pack run: the profile it creates or (update) changes, and
+// the content files (mods/, resourcepacks/, shaderpacks/, datapacks/) it wrote.
+define class PvPackState {
+    private string profileId: get, set
+    private bool update: get, set
+    private array files: get, set
+    private string title: get, set      // import: the name the user chose ("" = the pack's own name)
+    private string chosenName: get, set // install: the profile's name when it is not the pack's own ("" = the pack's name)
+    private map<string, object> packSource: get, set    // the pack itself: {provider, projectId, versionId, name, kind}
+    private map<string, object> fileSources: get, set   // game-relative path (lower case) -> the provider file it is
+    private array content: get, set     // game-relative content paths the pack wrote (downloads and overrides)
+
+    method addFile(string rel) {
+        if (isContentRel(rel) && files.contains(rel) == false) {
+            files.append(rel)
+        }
+    }
+
+    // Notes a content file the pack wrote (game-relative; other paths are ignored).
+    method addContent(string rel) {
+        var clean = safeRelative(rel)
+        if (clean != "" && isContentRel(clean) && content.contains(clean) == false) {
+            content.append(clean)
+        }
+    }
+
+    // The provider file a pack file came from, when the pack names it (CurseForge).
+    method ownSource(string rel, map<string, object> source) {
+        var clean = safeRelative(rel)
+        if (clean != "") {
+            fileSources[clean.toLower()] = source
+        }
+    }
+}
+
+// Whether a game-relative path is a content file the content module manages.
+method isContentRel(string rel): bool {
+    var lower = rel.toLower()
+    return lower.startsWith("mods/") || lower.startsWith("resourcepacks/") || lower.startsWith("shaderpacks/") || lower.startsWith("datapacks/")
+}
+
+// The source of a pack itself, as the profile records it.
+method packSourceMap(string provider, string projectId, string versionId, string name): map<string, object> {
+    return {"provider": provider, "projectId": projectId, "versionId": versionId, "name": name, "kind": "modpack"}
+}
+
+// A fresh pack state: the profile it creates or (update) changes, no files yet.
+method newPackState(string profileId, bool update, string title): PvPackState {
+    return PvPackState{profileId = profileId, update = update, files = [], title = title, chosenName = "", packSource = {}, fileSources = {}, content = []}
+}
+
+// --- sources of pack files --------------------------------------------------------------
+//
+// Every file a pack writes into mods/, resourcepacks/ or shaderpacks/ gets a
+// source in that folder's content store, once it is on disk:
+//   - a file the provider names (CurseForge pack files) -> that file (state.fileSources);
+//   - a file Modrinth knows by sha1 (Modrinth packs) -> its project and version, as an install by id records it;
+//   - anything else -> the pack itself (packFallbackSource).
+// The sha1 is taken from the file on disk, so the entries match what scanContent reports.
+
+private final PV_HASH_BATCH = 100
+
+// Modrinth's version documents by sha1 (see mods.versionsByHash); a failed
+// lookup is raised so the caller can fall back.
+define class PvHashVersionsTask {
+    private array hashes: get, set
+
+    method run(): object {
+        return mods.versionsByHash(hashes)
+    }
+}
+
+// The source of a Modrinth version (the same fields an install by id records).
+method modrinthFileSource(map<string, object> version): map<string, object> {
+    return {
+        "provider": "modrinth",
+        "projectId": jstr(version, "project_id"),
+        "versionId": jstr(version, "id"),
+        "versionNumber": jstr(version, "version_number"),
+        "name": jstr(version, "name")
+    }
+}
+
+// The source of a CurseForge file (the same fields an install by id records).
+method cfFileSource(map<string, object> version): map<string, object> {
+    return {
+        "provider": "curseforge",
+        "projectId": jstr(version, "projectId"),
+        "versionId": jstr(version, "id"),
+        "versionNumber": jstr(version, "versionNumber"),
+        "name": jstr(version, "name")
+    }
+}
+
+// The source of a file that no provider file is known for: the pack.
+// Modrinth and CurseForge packs keep the pack's project out of the file's
+// project (a Modrinth version switch or a CurseForge export would take the
+// pack for one of the mods), so they only name the pack by its name. Technic
+// and FTB packs name their build or release as the version.
+method packFallbackSource(map<string, object> pack): map<string, object> {
+    var provider = jstr(pack, "provider")
+    var projectId = jstr(pack, "projectId")
+    var versionId = jstr(pack, "versionId")
+    var versionNumber = ""
+    if (provider == "technic" || provider == "ftb") {
+        versionNumber = versionId
+    } else if (provider == "modrinth") {
+        projectId = ""
+        versionId = ""
+    } else {
+        versionId = ""
+    }
+    return {"provider": provider, "projectId": projectId, "versionId": versionId, "versionNumber": versionNumber, "name": jstr(pack, "name"), "kind": "modpack"}
+}
+
+// Records the source of every content file the pack wrote (state.content). A
+// failed Modrinth lookup leaves the files with the pack as their source
+// instead of failing the install.
+method recordPackSources(string jobId, PvPackState state, bool byHash) {
+    var profileId = state.profileId()
+    var gameDir = core.profileDir(profileId)
+    var found = []
+    for (rel in state.content()) {
+        var folder = rel.substring(0, rel.indexOf("/")).toLower()
+        if (["mods", "resourcepacks", "shaderpacks"].contains(folder) == false) {
+            continue
+        }
+        var file = path.join(gameDir, rel)
+        if (os.isFile(file) == false) {
+            continue
+        }
+        found.append({"rel": rel, "sha1": sha1Hex(os.readFile(file)), "folder": folder, "fileName": path.basename(rel)})
+    }
+    var byVersion = {}
+    if (byHash) {
+        var hashes = []
+        var seen = {}
+        for (f in found) {
+            if (seen.has(f["sha1"]) == false) {
+                seen[f["sha1"]] = true
+                hashes.append(f["sha1"])
+            }
+        }
+        var done = 0
+        while (done < hashes.length()) {
+            core.checkCancelled(jobId)
+            var chunk = pageOf(hashes, done, PV_HASH_BATCH)
+            var outcome = core.runTrapped(PvHashVersionsTask{hashes = chunk})
+            if (outcome.failed()) {
+                core.logWarn("providers: cannot look up the sources of " + profileId + " by hash: " + failureMessage(outcome.error()))
+            } else {
+                var answer = outcome.result()
+                for (h in answer) {
+                    if (core.isMap(answer[h])) {
+                        byVersion[h] = answer[h]
+                    }
+                }
+            }
+            done = done + chunk.length()
+        }
+        core.checkCancelled(jobId)
+    }
+    for (folder in ["mods", "resourcepacks", "shaderpacks"]) {
+        var batch = []
+        for (f in found) {
+            if (f["folder"] != folder) {
+                continue
+            }
+            var key = f["rel"].toLower()
+            object source = packFallbackSource(state.packSource())
+            if (state.fileSources().has(key)) {
+                source = state.fileSources()[key]
+            } else if (byVersion.has(f["sha1"])) {
+                source = modrinthFileSource(byVersion[f["sha1"]])
+            }
+            batch.append({"sha1": f["sha1"], "fileName": f["fileName"], "source": source, "update": core.none()})
+        }
+        if (batch.length() > 0) {
+            mods.changeStore(mods.contentLoc(profileId, folder, ""), batch, [])
+        }
+    }
+    core.logInfo("providers: pack " + profileId + ": sources recorded for " + found.length() + " content file(s)")
+}
+
+// A download URL with the characters curl rejects or misreads (spaces and
+// brackets in file names, for example) percent-encoded. Other URLs are kept.
+method encodeDownloadUrl(string url): string {
+    var out = url
+    for (pair in [[" ", "%20"], ["[", "%5B"], ["]", "%5D"], ["{", "%7B"], ["}", "%7D"], ["|", "%7C"], ["<", "%3C"], [">", "%3E"], ["^", "%5E"], ["`", "%60"]]) {
+        out = out.replace(pair[0], pair[1])
+    }
+    return out
+}
+
+// Creates the profile of a pack install (with source) and marks it busy. An
+// update keeps the profile and moves it to the new release's loader and source.
+method createPackProfile(PvPackState state, string name, map<string, object> loader, string provider, string projectId, string versionId): string {
+    if (state.update()) {
+        var updated = packSourceMap(provider, projectId, versionId, name)
+        state.packSource(updated)
+        var changes = {
+            "minecraftVersion": loader["minecraft"],
+            "loader": loader["loader"],
+            "source": updated
+        }
+        if (loader["loaderVersion"] != "") {
+            changes["loaderVersion"] = loader["loaderVersion"]
+        }
+        core.updateProfile(state.profileId(), changes)
+        return core.profileDir(state.profileId())
+    }
+    var title = name.trim()
+    if (state.title() != "") {
+        title = state.title()
+    }
+    if (title == "") {
+        title = "Modpack"
+    }
+    if (title.length() > 100) {
+        title = title.substring(0, 100)
+    }
+    var pack = packSourceMap(provider, projectId, versionId, title)
+    state.packSource(pack)
+    // The profile takes the chosen name; its source keeps the pack's own name (the UI shows it).
+    var profileName = title
+    if (state.chosenName() != "") {
+        profileName = state.chosenName()
+    }
+    var fields = {
+        "name": profileName,
+        "minecraftVersion": loader["minecraft"],
+        "loader": loader["loader"],
+        "source": pack
+    }
+    if (loader["loaderVersion"] != "") {
+        fields["loaderVersion"] = loader["loaderVersion"]
+    }
+    var created = core.createProfile(fields)
+    state.profileId(created["id"])
+    claimBusy(created["id"], "pack-install")
+    return core.profileDir(created["id"])
+}
+
+define class PvDeleteProfileTask {
+    private string profileId: get, set
+
+    method run(): object {
+        core.deleteProfile(profileId)
+        return true
+    }
+}
+
+// --- the pack install job --------------------------------------------------------------
+
+define class PvPackTask {
+    private string jobId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+    private string staging: get, set
+    private PvPackState state: get, set
+
+    method run(): object {
+        if (provider == "modrinth") {
+            installModrinthPack(jobId, projectId, versionId, staging, state)
+        } else if (provider == "curseforge") {
+            installCurseForgePack(jobId, projectId, versionId, staging, state)
+        } else if (provider == "technic") {
+            installTechnicPack(jobId, projectId, versionId, staging, state)
+        } else {
+            installFtbPack(jobId, projectId, versionId, state)
+        }
+        return true
+    }
+}
+
+define class PvPackInstallJob based JobBody {
+    private string provider: get, set
+    private string projectId: get, set
+    private string versionId: get, set
+    private string name: get, set       // the profile's name ("" = the pack's own name)
+
+    method execute(string jobId): object {
+        var state = newPackState("", false, "")
+        state.chosenName(name)
+        var staging = stagingDir(jobId)
+        var outcome = core.runTrapped(PvPackTask{
+            jobId = jobId, provider = provider, projectId = projectId, versionId = versionId,
+            staging = staging, state = state
+        })
+        os.removeAll(staging)
+        var profileId = state.profileId()
+        releaseBusy(profileId)
+        if (outcome.failed()) {
+            // Roll back: a failed install leaves no half filled profile behind.
+            if (profileId != "") {
+                var removed = core.runTrapped(PvDeleteProfileTask{profileId = profileId})
+                if (removed.failed()) {
+                    core.logWarn("pack install " + jobId + ": cannot remove profile " + profileId + ": " + removed.error())
+                }
+            }
+            core.raise(outcome.error())
+        }
+        writePackRecord(core.profileDir(profileId), versionId, state.files())
+        return {"profileId": profileId}
+    }
+}
+
+// --- Modrinth .mrpack ------------------------------------------------------------------
+
+method installModrinthPack(string jobId, string projectId, string versionId, string staging, PvPackState state) {
+    core.jobProgress(jobId, 0.01, "Lese Modpack-Version")
+    var doc = mrVersionDoc(versionId)
+    var packProject = jstr(doc, "project_id")
+    if (sameProject("modrinth", projectId, packProject) == false) {
+        core.badRequest("Modrinth version '" + versionId + "' does not belong to project '" + projectId + "'")
+    }
+    var packFile = {}
+    for (f in jarr(doc, "files")) {
+        if (jstr(f, "filename").endsWith(".mrpack") && (packFile.length() == 0 || jbool(f, "primary"))) {
+            packFile = f
+        }
+    }
+    if (packFile.length() == 0) {
+        core.upstream("Modrinth version '" + versionId + "' has no .mrpack file")
+    }
+    var hashes = jobj(packFile, "hashes")
+    var archive = path.join(staging, "pack.mrpack")
+    core.jobProgress(jobId, 0.02, "Lade Modpack-Archiv")
+    downloadFile(jstr(packFile, "url"), archive, hashMap(jstr(hashes, "sha1"), "", "", jstr(hashes, "sha512")), mrHeaders())
+    core.checkCancelled(jobId)
+    if (packProject == "") {
+        packProject = projectId
+    }
+    applyModrinthArchive(jobId, archive, packProject, versionId, jstr(doc, "name"), state)
+}
+
+// Installs a Modrinth .mrpack that is on disk: the profile is created (an
+// update changes it instead), its files downloaded and the overrides
+// extracted. Import calls it with an empty project and version.
+method applyModrinthArchive(string jobId, string archive, string packProject, string versionId, string docName, PvPackState state) {
+    var zip = zipOpenFile(archive, "the .mrpack archive")
+    var indexText = zipReadNamed(zip, "modrinth.index.json")
+    var index = json.tryParse(indexText)
+    if (core.isMap(index) == false) {
+        core.upstream("the .mrpack archive has no valid modrinth.index.json")
+    }
+    var deps = jobj(index, "dependencies")
+    var loader = ""
+    var loaderVersion = ""
+    for (pair in [["neoforge", "neoforge"], ["fabric-loader", "fabric"], ["forge", "forge"], ["quilt-loader", "quilt"]]) {
+        if (loader == "" && jstr(deps, pair[0]) != "") {
+            loader = pair[1]
+            loaderVersion = jstr(deps, pair[0])
+        }
+    }
+    var gameDirPending = []
+    var hasMods = zipHasMods(zip, "overrides/") || zipHasMods(zip, "client-overrides/")
+    for (f in jarr(index, "files")) {
+        var rel = jstr(f, "path")
+        if (rel == "") {
+            continue
+        }
+        if (jstr(jobj(f, "env"), "client") == "unsupported") {
+            continue
+        }
+        var urls = stringList(jarr(f, "downloads"))
+        if (urls.length() == 0) {
+            continue
+        }
+        var h = jobj(f, "hashes")
+        gameDirPending.append({"rel": rel, "url": urls[0], "hashes": hashMap(jstr(h, "sha1"), "", "", jstr(h, "sha512"))})
+        if (isModPath(rel)) {
+            hasMods = true
+        }
+    }
+    var decided = decideLoader(jstr(deps, "minecraft"), loader, loaderVersion, hasMods, "the Modrinth pack")
+    var name = jstr(index, "name")
+    if (name == "") {
+        name = docName
+    }
+    var gameDir = createPackProfile(state, name, decided, "modrinth", packProject, versionId)
+    var files = []
+    for (p in gameDirPending) {
+        files.append({"url": p["url"], "target": gamePath(gameDir, p["rel"], "the Modrinth pack"), "hashes": p["hashes"]})
+        state.addFile(p["rel"])
+        state.addContent(p["rel"])
+    }
+    downloadAll(jobId, files, mrHeaders(), 0.05, 0.9)
+    core.jobProgress(jobId, 0.9, "Entpacke Overrides")
+    extractZip(jobId, zip, gameDir, "overrides/", false, state)
+    extractZip(jobId, zip, gameDir, "client-overrides/", false, state)
+    recordPackSources(jobId, state, true)
+}
+
+// --- CurseForge .zip -------------------------------------------------------------------
+
+method installCurseForgePack(string jobId, string projectId, string versionId, string staging, PvPackState state) {
+    core.jobProgress(jobId, 0.01, "Lese Modpack-Version")
+    var version = cfVersionById(versionId)
+    if (sameProject("curseforge", projectId, version["projectId"]) == false) {
+        core.badRequest("CurseForge file '" + versionId + "' does not belong to project '" + projectId + "'")
+    }
+    if (version["downloadUrl"] == "") {
+        core.upstream("this modpack cannot be downloaded automatically (third-party downloads are disabled)")
+    }
+    var archive = path.join(staging, "pack.zip")
+    core.jobProgress(jobId, 0.02, "Lade Modpack-Archiv")
+    downloadFile(version["downloadUrl"], archive, hashMap(version["sha1"], version["md5"], "", ""), {})
+    core.checkCancelled(jobId)
+    var packProject = version["projectId"]
+    if (packProject == "") {
+        packProject = projectId
+    }
+    applyCurseForgeArchive(jobId, archive, packProject, versionId, version["name"], state)
+}
+
+// Installs a CurseForge pack zip that is on disk (see applyModrinthArchive).
+method applyCurseForgeArchive(string jobId, string archive, string packProject, string versionId, string docName, PvPackState state) {
+    var zip = zipOpenFile(archive, "the CurseForge pack archive")
+    var manifest = json.tryParse(zipReadNamed(zip, "manifest.json"))
+    if (core.isMap(manifest) == false) {
+        core.upstream("the CurseForge pack has no valid manifest.json")
+    }
+    var minecraft = jobj(manifest, "minecraft")
+    var loader = ""
+    var loaderVersion = ""
+    var chosen = {}
+    for (l in jarr(minecraft, "modLoaders")) {
+        if (chosen.length() == 0 || jbool(l, "primary")) {
+            chosen = l
+        }
+    }
+    var loaderId = jstr(chosen, "id")
+    var dash = loaderId.indexOf("-")
+    if (dash > 0) {
+        loader = loaderId.substring(0, dash).toLower()
+        loaderVersion = loaderId.substring(dash + 1, loaderId.length())
+    } else if (loaderId != "") {
+        loader = loaderId
+    }
+    var overrides = jstr(manifest, "overrides")
+    if (overrides == "") {
+        overrides = "overrides"
+    }
+    var fileIds = []
+    var projectIds = []
+    for (f in jarr(manifest, "files")) {
+        if (core.isMap(f) && f.has("required") && core.isBool(f["required"]) && f["required"] == false) {
+            continue
+        }
+        var fid = jint(f, "fileID", 0)
+        if (fid > 0) {
+            fileIds.append(fid)
+            var pid = jint(f, "projectID", 0)
+            if (pid > 0 && projectIds.contains(pid) == false) {
+                projectIds.append(pid)
+            }
+        }
+    }
+    core.jobProgress(jobId, 0.04, "Löse Dateien auf")
+    var resolved = cfFilesById(fileIds)
+    var mods = cfModsById(projectIds)
+    var pending = []
+    var missing = []
+    var hasMods = zipHasMods(zip, overrides + "/")
+    for (fid in fileIds) {
+        var key = "" + fid
+        if (resolved.has(key) == false) {
+            missing.append("file " + key)
+            continue
+        }
+        var v = cfVersion(resolved[key])
+        if (v["downloadUrl"] == "") {
+            missing.append(v["fileName"])
+            continue
+        }
+        var classId = jint(jobj(mods, v["projectId"]), "classId", 6)
+        var folder = cfFolderOf(classId)
+        if (folder == "mods") {
+            hasMods = true
+        }
+        pending.append({"rel": folder + "/" + safeFileName(v["fileName"]), "url": v["downloadUrl"], "hashes": hashMap(v["sha1"], v["md5"], "", ""), "source": cfFileSource(v)})
+    }
+    if (missing.length() > 0) {
+        core.upstream("this pack contains " + missing.length() + " file(s) CurseForge does not let other launchers download: " + missing.join(", "))
+    }
+    var decided = decideLoader(jstr(minecraft, "version"), loader, loaderVersion, hasMods, "the CurseForge pack")
+    var name = jstr(manifest, "name")
+    if (name == "") {
+        name = docName
+    }
+    var gameDir = createPackProfile(state, name, decided, "curseforge", packProject, versionId)
+    var files = []
+    for (p in pending) {
+        files.append({"url": p["url"], "target": gamePath(gameDir, p["rel"], "the CurseForge pack"), "hashes": p["hashes"]})
+        state.addFile(p["rel"])
+        state.addContent(p["rel"])
+        state.ownSource(p["rel"], p["source"])
+    }
+    downloadAll(jobId, files, {}, 0.05, 0.9)
+    core.jobProgress(jobId, 0.9, "Entpacke Overrides")
+    extractZip(jobId, zip, gameDir, overrides + "/", false, state)
+    recordPackSources(jobId, state, false)
+}
+
+// --- Technic -----------------------------------------------------------------------------
+
+method technicBuildId(string slug, string versionId): string {
+    var build = versionId.trim()
+    if (build.startsWith(slug + ":")) {
+        build = build.substring(slug.length() + 1, build.length())
+    }
+    if (build == "") {
+        core.badRequest("'versionId' (the Technic build) is required")
+    }
+    return build
+}
+
+// The loader sources of a Technic archive below prefix: bin/version.json,
+// then the version.json (or forgeversion.properties) of bin/modpack.jar.
+method technicArchiveLoader(PvZip zip, string prefix): map<string, object> {
+    var versionJson = zipReadNamed(zip, prefix + "bin/version.json")
+    if (versionJson != "") {
+        var parsed = json.tryParse(versionJson)
+        if (core.isMap(parsed)) {
+            var found = loaderFromVersionJson(parsed)
+            if (found["loader"] != "") {
+                return found
+            }
+        }
+    }
+    var jar = zipReadNamed(zip, prefix + "bin/modpack.jar")
+    if (jar != "") {
+        return loaderFromModpackJar(jar, "bin/modpack.jar")
+    }
+    return {"minecraft": "", "loader": "", "loaderVersion": ""}
+}
+
+method installTechnicPack(string jobId, string projectId, string versionId, string staging, PvPackState state) {
+    if (projectId == "") {
+        core.badRequest("'projectId' (the Technic pack slug) is required")
+    }
+    core.jobProgress(jobId, 0.01, "Lese Pack-Daten")
+    var doc = technicPack(projectId)
+    var slug = jstr(doc, "name")
+    if (slug == "") {
+        slug = technicSlug(projectId)
+    }
+    var build = technicBuildId(slug, versionId)
+    var name = jstr(doc, "displayName")
+    if (name == "") {
+        name = slug
+    }
+    var solder = technicSolderUrl(doc)
+    if (solder != "") {
+        installSolderBuild(jobId, doc, slug, solder, build, name, staging, state)
+        return
+    }
+    var url = encodeDownloadUrl(jstr(doc, "url"))
+    if (url == "") {
+        core.upstream("this Technic pack publishes no download; its author may have restricted it to the Technic launcher")
+    }
+    var packVersion = jstr(doc, "version")
+    if (build != "latest" && packVersion != "" && build != packVersion) {
+        core.badRequest("Technic pack '" + slug + "' only offers build '" + packVersion + "'")
+    }
+    // A fresh name in an empty staging directory: nothing can make the
+    // download look done before it ran.
+    var archive = path.join(staging, "client-" + core.newId() + ".zip")
+    core.jobProgress(jobId, 0.02, "Lade Modpack-Archiv")
+    downloadFile(url, archive, {}, technicHeaders())
+    core.checkCancelled(jobId)
+    applyTechnicArchive(jobId, archive, name, slug, build, jstr(doc, "minecraft"), state)
+}
+
+// Installs a Technic client zip that is on disk (see applyModrinthArchive).
+method applyTechnicArchive(string jobId, string archive, string name, string slug, string build, string fallbackMinecraft, PvPackState state) {
+    core.jobProgress(jobId, 0.6, "Prüfe Archiv")
+    var zip = zipOpenFile(archive, "the Technic pack archive")
+    var wrapper = technicWrapper(zip)
+    var found = technicArchiveLoader(zip, wrapper)
+    var minecraft = found["minecraft"]
+    if (minecraft == "") {
+        minecraft = fallbackMinecraft
+    }
+    var decided = decideLoader(minecraft, found["loader"], found["loaderVersion"], zipHasMods(zip, wrapper), "the Technic pack '" + name + "'")
+    var gameDir = createPackProfile(state, name, decided, "technic", slug, build)
+    core.jobProgress(jobId, 0.7, "Entpacke Modpack")
+    extractZip(jobId, zip, gameDir, wrapper, true, state)
+    recordPackSources(jobId, state, false)
+}
+
+method safeStem(string value): string {
+    var out = ""
+    for (ch in value.toLower()) {
+        if ("abcdefghijklmnopqrstuvwxyz0123456789._-".contains(ch)) {
+            out = out + ch
+        } else {
+            out = out + "_"
+        }
+    }
+    if (out == "") {
+        out = "mod"
+    }
+    return out
+}
+
+method installSolderBuild(string jobId, object doc, string slug, string solder, string build, string name, string staging, PvPackState state) {
+    var listing = solderPack(solder, slug)
+    var builds = stringList(jarr(listing, "builds"))
+    if (builds.contains(build) == false) {
+        core.notFound("Technic pack '" + slug + "' has no build '" + build + "'")
+    }
+    var manifest = solderBuild(solder, slug, build)
+    var mods = jarr(manifest, "mods")
+    // Solder archives are rooted at the game directory (mods/x.jar, bin/...):
+    // they are extracted as they are, without any wrapper folder rule, in
+    // the order Solder lists them (a later archive overwrites an earlier one).
+    var files = []
+    var archives = []
+    var i = 0
+    for (m in mods) {
+        var url = encodeDownloadUrl(jstr(m, "url"))
+        var target = path.join(staging, "" + i + "-" + safeStem(jstr(m, "name")) + ".zip")
+        files.append({"url": url, "target": target, "hashes": hashMap("", jstr(m, "md5"), "", "")})
+        if (url != "") {
+            archives.append(target)
+        } else {
+            core.logWarn("Technic build " + slug + " " + build + ": '" + jstr(m, "name") + "' has no URL, skipped")
+        }
+        i = i + 1
+    }
+    downloadAll(jobId, files, technicHeaders(), 0.02, 0.75)
+
+    core.jobProgress(jobId, 0.76, "Prüfe Archive")
+    var minecraft = jstr(manifest, "minecraft")
+    if (minecraft == "") {
+        minecraft = jstr(doc, "minecraft")
+    }
+    var loader = ""
+    var loaderVersion = ""
+    var forge = jstr(manifest, "forge").trim()
+    if (forge != "" && forge.toLower() != "null") {
+        loader = "forge"
+        loaderVersion = normalizeForgeVersion(minecraft, forge)
+    }
+    var hasMods = false
+    for (a in archives) {
+        var zip = zipOpenFile(a, "Solder archive " + path.basename(a))
+        if (zipHasMods(zip, "")) {
+            hasMods = true
+        }
+        if (loader == "") {
+            var found = technicArchiveLoader(zip, "")
+            if (found["loader"] != "") {
+                loader = found["loader"]
+                loaderVersion = found["loaderVersion"]
+                if (minecraft == "") {
+                    minecraft = found["minecraft"]
+                }
+            }
+        }
+    }
+    var decided = decideLoader(minecraft, loader, loaderVersion, hasMods, "Technic build " + slug + " " + build)
+    var gameDir = createPackProfile(state, name, decided, "technic", slug, build)
+    var n = 0
+    for (a in archives) {
+        core.checkCancelled(jobId)
+        var zip = zipOpenFile(a, "Solder archive " + path.basename(a))
+        extractZip(jobId, zip, gameDir, "", true, state)
+        n = n + 1
+        stepProgress(jobId, 0.8, 1.0, n, archives.length(), "Entpacke " + n + " / " + archives.length())
+    }
+    recordPackSources(jobId, state, false)
+}
+
+// --- FTB ----------------------------------------------------------------------------------
+
+method installFtbPack(string jobId, string projectId, string versionId, PvPackState state) {
+    if (projectId == "") {
+        core.badRequest("'projectId' (the FTB pack id) is required")
+    }
+    core.jobProgress(jobId, 0.01, "Lese Release")
+    var release = ftbRelease(projectId, versionId)
+    var name = jstr(release, "name")
+    var packName = core.runTrapped(FtbPackTask{packId = projectId})
+    if (packName.failed() == false && jstr(packName.result(), "name") != "") {
+        name = jstr(packName.result(), "name")
+    }
+    var targets = ftbTargets(release)
+    var games = targets["gameVersions"]
+    var minecraft = ""
+    if (games.length() > 0) {
+        minecraft = games[0]
+    }
+    var loader = ""
+    var loaderVersion = ""
+    var loaders = targets["loaders"]
+    if (loaders.length() > 0) {
+        loader = loaders[0]["name"]
+        loaderVersion = loaders[0]["version"]
+        if (loader == "") {
+            core.upstream("this FTB release names a mod loader without a name")
+        }
+    }
+    var pending = []
+    var hasMods = false
+    for (f in jarr(release, "files")) {
+        if (jbool(f, "serveronly")) {
+            continue
+        }
+        var fileName = jstr(f, "name")
+        if (fileName == "") {
+            continue
+        }
+        var url = encodeDownloadUrl(jstr(f, "url"))
+        if (url == "") {
+            var mirrors = stringList(jarr(f, "mirrors"))
+            if (mirrors.length() > 0) {
+                url = encodeDownloadUrl(mirrors[0])
+            }
+        }
+        var dir = jstr(f, "path").replace("\\", "/")
+        var rel = fileName
+        if (dir != "") {
+            rel = dir + "/" + fileName
+        }
+        var hashes = jobj(f, "hashes")
+        var sha1 = jstr(f, "sha1")
+        if (sha1 == "") {
+            sha1 = jstr(hashes, "sha1")
+        }
+        pending.append({"rel": rel, "url": url, "hashes": hashMap(sha1, "", jstr(hashes, "sha256"), jstr(hashes, "sha512"))})
+        if (isModPath(safeRelative(rel))) {
+            hasMods = true
+        }
+    }
+    var decided = decideLoader(minecraft, loader, loaderVersion, hasMods, "the FTB release")
+    var gameDir = createPackProfile(state, name, decided, "ftb", ftbPackId(projectId), jstr(release, "id"))
+    var files = []
+    for (p in pending) {
+        files.append({"url": p["url"], "target": gamePath(gameDir, p["rel"], "the FTB release"), "hashes": p["hashes"]})
+        state.addContent(p["rel"])
+    }
+    downloadAll(jobId, files, ftbHeaders(), 0.03, 1.0)
+    recordPackSources(jobId, state, false)
+}

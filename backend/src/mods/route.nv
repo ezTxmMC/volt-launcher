@@ -1,0 +1,346 @@
+package mods
+
+import os
+import path
+import core
+
+// The content module (see docs/ARCHITECTURE.md, "Mods" and "Inhalte und Modpacks").
+//
+// Mods (unchanged for existing callers):
+//   GET    /api/profiles/:id/mods                     ModFile[]
+//   POST   /api/profiles/:id/mods/identify            Job
+//   POST   /api/profiles/:id/mods/check-updates       Job
+//   POST   /api/profiles/:id/mods/update-all          Job
+//   POST   /api/profiles/:id/mods/:fileName/update    Job
+//   POST   /api/profiles/:id/mods/:fileName/toggle    x.jar <-> x.jar.disabled, ModFile
+//   DELETE /api/profiles/:id/mods/:fileName           {"deleted": fileName}
+//
+// Generic (mods, resourcepacks, shaderpacks, datapacks):
+//   GET    /api/profiles/:id/content/:type                       ModFile[]
+//   POST   /api/profiles/:id/content/:type/identify              Job
+//   POST   /api/profiles/:id/content/:type/check-updates         Job
+//   POST   /api/profiles/:id/content/:type/update-all            Job
+//   POST   /api/profiles/:id/content/:type/toggle-all            {"enabled"} -> {changed, enabled, skipped}
+//   GET    /api/profiles/:id/content/:type/dependencies          {"warnings": [...]} (mods)
+//   GET    /api/profiles/:id/content/:type/:file/versions        [ProjectVersion]
+//   POST   /api/profiles/:id/content/:type/:file/version         {"versionId"} -> Job (any release)
+//   POST   /api/profiles/:id/content/:type/:file/update          Job
+//   POST   /api/profiles/:id/content/:type/:file/toggle          ModFile
+//   DELETE /api/profiles/:id/content/:type/:file                 {"deleted"}
+//   GET    /api/profiles/:id/content/datapacks/worlds            {"worlds": [{folder, datapacks}]}
+//
+// Data packs live in a world: every datapacks request takes ?world=<folder>.
+//
+// Files: zip.nv (jar reader), metadata.nv (fabric/quilt/forge metadata),
+// store.nv (locations, sha1 cache, .volt/*.json stores, busy flags),
+// modrinth.nv (API calls), logic.nv (the operations), versions.nv (versions,
+// dependencies). segments are the path segments after /api.
+
+// --- jobs -------------------------------------------------------------------------
+
+// What a content job does; ModsJob wraps it so the profile's busy flag is
+// released however the work ends.
+define abstract ModsWork {
+    abstract method work(string jobId): object
+}
+
+define class WorkTask {
+    private string jobId: get, set
+    private ModsWork job: get, set
+
+    method run(): object {
+        return job.work(jobId)
+    }
+}
+
+define class ModsJob based JobBody {
+    private string profileId: get, set
+    private ModsWork job: get, set
+
+    method execute(string jobId): object {
+        var outcome = core.runTrapped(WorkTask{jobId = jobId, job = job})
+        releaseProfile(profileId)
+        if (outcome.failed()) {
+            // Re-raise the same text: core.fail encodings and the cancel
+            // mark survive, so the job runner sees what happened.
+            core.raise(outcome.error())
+        }
+        return outcome.result()
+    }
+}
+
+define class IdentifyWork based ModsWork {
+    private ContentLoc loc: get, set
+
+    method work(string jobId): object {
+        return identifyContent(jobId, loc, 0.0, 1.0)
+    }
+}
+
+define class CheckUpdatesWork based ModsWork {
+    private ContentLoc loc: get, set
+    private array loaders: get, set
+    private array gameVersions: get, set
+
+    method work(string jobId): object {
+        return checkContent(jobId, loc, loaders, gameVersions)
+    }
+}
+
+define class UpdateWork based ModsWork {
+    private ContentLoc loc: get, set
+    private string fileName: get, set
+
+    method work(string jobId): object {
+        return updateContent(jobId, loc, fileName, 0.0, 1.0)
+    }
+}
+
+define class UpdateAllWork based ModsWork {
+    private ContentLoc loc: get, set
+
+    method work(string jobId): object {
+        return updateAllContent(jobId, loc)
+    }
+}
+
+define class ChangeVersionWork based ModsWork {
+    private ContentLoc loc: get, set
+    private string fileName: get, set
+    private string versionId: get, set
+
+    method work(string jobId): object {
+        return changeVersionContent(jobId, loc, fileName, versionId, 0.0, 1.0)
+    }
+}
+
+// Starts a content job for the profile: 409 while another one runs for it.
+method startModsJob(string profileId, string kind, string title, ModsWork work): map<string, object> {
+    if (claimProfile(profileId, kind) == false) {
+        core.conflict("another content job (" + busyKind(profileId) + ") is running for this profile")
+    }
+    return core.respond(202, core.startJob(kind, title, ModsJob{profileId = profileId, job = work}))
+}
+
+// 409 while a job may move files of the profile.
+method requireNoUpdateRunning(string profileId) {
+    var kind = busyKind(profileId)
+    if (kind == "mods-update" || kind == "mods-update-all" || kind == "mods-version") {
+        core.conflict("an update of this profile's content is running")
+    }
+}
+
+// --- request helpers -----------------------------------------------------------------
+
+// The content type of a path segment, or 404.
+method contentKind(string text): string {
+    if (text == "mods" || text == "resourcepacks" || text == "shaderpacks" || text == "datapacks") {
+        return text
+    }
+    core.notFound("unknown content type '" + text + "' (mods, resourcepacks, shaderpacks, datapacks)")
+    return ""
+}
+
+// A world folder name kept to one path segment.
+method requireWorldFolder(string world): string {
+    if (world == "" || world == "." || world == ".." || world.contains("/") || world.contains("\\") || world.contains(chr(0))) {
+        core.badRequest("invalid world folder '" + world + "'")
+    }
+    return world
+}
+
+// ?world=<folder> of a data pack request; 400 without it, 404 when the world is missing.
+method requireWorldParam(string profileId, map<string, string> query): string {
+    if (query.has("world") == false) {
+        core.badRequest("data packs live inside a world: pass ?world=<folder> (GET .../content/datapacks/worlds lists them)")
+    }
+    var world = requireWorldFolder(query["world"])
+    if (os.isDir(path.join(core.profileDir(profileId), "saves", world)) == false) {
+        core.notFound("world '" + world + "' not found")
+    }
+    return world
+}
+
+// The worlds of a profile with the number of data packs each has.
+method dataPackWorlds(string profileId): map<string, object> {
+    var saves = path.join(core.profileDir(profileId), "saves")
+    var worlds = []
+    if (os.isDir(saves)) {
+        for (name in os.listDir(saves)) {
+            if (os.isDir(path.join(saves, name))) {
+                var loc = contentLoc(profileId, "datapacks", name)
+                worlds.append({"folder": name, "datapacks": contentFileNames(loc).length()})
+            }
+        }
+    }
+    return {"worlds": worlds}
+}
+
+// The folder of mods, resource packs and shader packs exists after any request that uses it.
+method prepareContentDir(ContentLoc loc) {
+    if (loc.kind() != "datapacks") {
+        core.ensureDir(loc.dir())
+    }
+}
+
+// The JSON body's string field, 400 when missing or empty.
+method requireBodyText(object body, string key): string {
+    if (core.isMap(body) == false || body.has(key) == false || core.isString(body[key]) == false || body[key].trim() == "") {
+        core.badRequest("'" + key + "' is required")
+    }
+    return body[key].trim()
+}
+
+// The JSON body's boolean field, 400 when missing.
+method requireBodyBool(object body, string key): bool {
+    if (core.isMap(body) == false || body.has(key) == false || core.isBool(body[key]) == false) {
+        core.badRequest("expected {\"" + key + "\": true or false}")
+    }
+    return body[key]
+}
+
+// --- routes -------------------------------------------------------------------------
+
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    var id = segments[1]
+    if (core.isId(id) == false) {
+        core.notFound("profile '" + id + "' not found")
+    }
+    var profile = core.requireProfile(id)
+    var kind = "mods"
+    var world = ""
+    var rest = []
+    if (segments[2] == "mods") {
+        rest = slice(segments, 3, segments.length())
+    } else {
+        if (segments.length() < 4) {
+            core.notFound("no such endpoint: /api/" + segments.join("/"))
+        }
+        kind = contentKind(segments[3])
+        rest = slice(segments, 4, segments.length())
+        if (kind == "datapacks") {
+            if (rest.length() == 1 && rest[0] == "worlds") {
+                if (verb != "GET") {
+                    return core.methodNotAllowed(verb, segments)
+                }
+                return core.ok(dataPackWorlds(id))
+            }
+            world = requireWorldParam(id, query)
+        }
+    }
+    return contentRoute(verb, segments, profile, kind, world, rest, body)
+}
+
+// The operations of one content location; `rest` is the path after the content type.
+method contentRoute(string verb, array<string> segments, map<string, object> profile, string kind, string world, array<string> rest, object body): map<string, object> {
+    var id = "" + profile["id"]
+    var loc = contentLoc(id, kind, world)
+    var n = rest.length()
+    if (n == 0) {
+        if (verb == "GET") {
+            prepareContentDir(loc)
+            return core.ok(scanContent(loc))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+
+    var action = rest[0]
+    if (n == 1) {
+        if (action == "identify") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            prepareContentDir(loc)
+            return startModsJob(id, "mods-identify", "Identifiziere Inhalte von " + profile["name"], IdentifyWork{loc = loc})
+        }
+        if (action == "check-updates") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            if (kind == "mods" && profile["loader"] == "vanilla") {
+                core.badRequest("profile '" + id + "' has no mod loader (vanilla)")
+            }
+            prepareContentDir(loc)
+            var loaders = kindLoaders(kind, "" + profile["loader"])
+            var gameVersions = [profile["minecraftVersion"]]
+            return startModsJob(id, "mods-check-updates", "Suche Updates für " + profile["name"], CheckUpdatesWork{loc = loc, loaders = loaders, gameVersions = gameVersions})
+        }
+        if (action == "update-all") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            prepareContentDir(loc)
+            return startModsJob(id, "mods-update-all", "Aktualisiere alle Inhalte von " + profile["name"], UpdateAllWork{loc = loc})
+        }
+        if (action == "toggle-all") {
+            if (verb != "POST") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            var enabled = requireBodyBool(body, "enabled")
+            requireNoUpdateRunning(id)
+            prepareContentDir(loc)
+            return core.ok(toggleAllContent(loc, enabled))
+        }
+        if (action == "dependencies") {
+            if (verb != "GET") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok({"warnings": dependencyWarnings(loc)})
+        }
+        if (isContentFileName(kind, action) == false) {
+            if (verb == "DELETE") {
+                requireContentFileName(kind, action)
+            }
+            core.notFound("no such endpoint: /api/" + segments.join("/"))
+        }
+        if (verb == "DELETE") {
+            requireNoUpdateRunning(id)
+            return core.ok(deleteContent(loc, action))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+
+    if (n == 2) {
+        var fileName = action
+        var sub = rest[1]
+        if (sub != "update" && sub != "toggle" && sub != "versions" && sub != "version") {
+            core.notFound("no such endpoint: /api/" + segments.join("/"))
+        }
+        if (sub == "versions") {
+            if (verb != "GET") {
+                return core.methodNotAllowed(verb, segments)
+            }
+            return core.ok(versionsOfFile(loc, fileName, "" + profile["minecraftVersion"], "" + profile["loader"]))
+        }
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        requireContentFileName(kind, fileName)
+        if (sub == "toggle") {
+            requireNoUpdateRunning(id)
+            return core.ok(toggleContent(loc, fileName))
+        }
+        if (sub == "update") {
+            // Check what can be checked before the job starts.
+            if (os.isFile(path.join(loc.dir(), fileName)) == false) {
+                core.notFound("file '" + fileName + "' not found")
+            }
+            var current = modFile(loc, fileName, loadStore(loc))
+            if (core.isMap(current["update"]) == false) {
+                core.conflict("no update known for '" + fileName + "' (run check-updates first)")
+            }
+            return startModsJob(id, "mods-update", "Aktualisiere " + fileName, UpdateWork{loc = loc, fileName = fileName})
+        }
+        // version: any release of the file's project
+        var versionId = requireBodyText(body, "versionId")
+        var known = trackedSource(loc, fileName)
+        if (versionId == textOr(known, "versionId", "")) {
+            core.conflict("'" + fileName + "' already is this version")
+        }
+        requireNoUpdateRunning(id)
+        return startModsJob(id, "mods-version", "Wechsle Version von " + fileName, ChangeVersionWork{loc = loc, fileName = fileName, versionId = versionId})
+    }
+
+    core.notFound("no such endpoint: /api/" + segments.join("/"))
+    return {}
+}

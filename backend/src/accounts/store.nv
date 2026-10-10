@@ -1,0 +1,367 @@
+package accounts
+
+import base64
+import bytes
+import core
+import crypto
+import json
+import os
+import path
+import thread
+import time
+
+// The account store: <dataDir>/accounts/accounts.enc, sealed with crypto.nv.
+//
+// Plain text state (only ever in memory):
+//   {"selected": "<id>" or "", "accounts": [entry, ...]}
+//   offline entry:   {"type": "offline", "id", "name"}
+//   microsoft entry: {"type": "microsoft", "id", "name", "xuid", "userHash",
+//                     "minecraftToken", "minecraftExpiresAt",
+//                     "microsoftToken", "microsoftExpiresAt", "microsoftRefresh"}
+// Times are unix seconds. Ids are dashed UUIDs (the Mojang id of a Microsoft
+// account, or the offline UUID of its name). The default offline account "Player"
+// is always listed first; it is never stored and cannot be removed. It is selected
+// until the user chooses another account.
+//
+// Every read-modify-write runs under acStoreLock. Nothing inside the lock raises
+// (a raise would leave the lock held, see core/errors.nv); errors are carried out of
+// the lock and raised after it.
+
+final AC_DEFAULT_NAME = "Player"
+
+var acStoreLock = thread.mutex()
+
+method acFile(): string {
+    return path.join(acDir(), "accounts.enc")
+}
+
+method acEmptyState(): map<string, object> {
+    return {"selected": "", "accounts": []}
+}
+
+// The offline UUID Minecraft uses for a name (UUID.nameUUIDFromBytes("OfflinePlayer:" + name)).
+method acOfflineId(string name): string {
+    return crypto.uuidText(crypto.uuid3("", "OfflinePlayer:" + name))
+}
+
+// 32 hex digits to the dashed form.
+method acDashed(string hex): string {
+    return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-" + hex.substring(12, 16) + "-" + hex.substring(16, 20) + "-" + hex.substring(20, 32)
+}
+
+method acDashless(string id): string {
+    return id.replace("-", "")
+}
+
+method acIsUuid(string text): bool {
+    if (text.length() != 36) {
+        return false
+    }
+    var i = 0
+    while (i < 36) {
+        var ch = text.substring(i, i + 1)
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (ch != "-") {
+                return false
+            }
+        } else if ("0123456789abcdefABCDEF".contains(ch) == false) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Minecraft user names: 3 to 16 letters, digits or underscores.
+method acValidOfflineName(string name): bool {
+    if (name.length() < 3 || name.length() > 16) {
+        return false
+    }
+    for (ch in name) {
+        if ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".contains(ch) == false) {
+            return false
+        }
+    }
+    return true
+}
+
+method acDefaultEntry(): map<string, object> {
+    return {"type": "offline", "id": acOfflineId(AC_DEFAULT_NAME), "name": AC_DEFAULT_NAME}
+}
+
+// Reads and opens the store. A missing file is an empty store; a damaged one raises.
+method acReadState(): map<string, object> {
+    var file = acFile()
+    if (os.isFile(file) == false) {
+        return acEmptyState()
+    }
+    var text = os.readFile(file)
+    if (json.isValid(text) == false) {
+        core.internal("accounts.enc is not valid JSON")
+    }
+    var wrapper = json.parse(text)
+    var version = core.getOr(wrapper, "version", 0)
+    if (core.isWholeNumber(version) == false || core.toInteger(version) != 1) {
+        core.internal("accounts.enc has an unknown format version")
+    }
+    var master = acMasterKey(false)
+    if (master == "") {
+        core.internal("the account key is missing, so the stored accounts cannot be opened")
+    }
+    var plain = acOpen(master, core.getOr(wrapper, "iv", ""), core.getOr(wrapper, "data", ""), core.getOr(wrapper, "mac", ""))
+    return json.parse(plain)
+}
+
+method acWriteState(map<string, object> state) {
+    var master = acMasterKey(true)
+    var sealed = acSeal(master, json.stringify(state))
+    sealed["version"] = 1
+    sealed["algorithm"] = "AES-128-CFB8 + HMAC-SHA256"
+    acEnsureDir()
+    var problem = core.writeFileAtomic(acFile(), json.pretty(sealed) + "\n")
+    if (problem != "") {
+        core.internal("cannot write accounts.enc: " + problem)
+    }
+    acChmod(acFile(), "600")
+}
+
+// The stored entries (without the default), as an array.
+method acStored(map<string, object> state): array {
+    var list = []
+    for (entry in core.getOr(state, "accounts", [])) {
+        if (core.isMap(entry)) {
+            list.append(entry)
+        }
+    }
+    return list
+}
+
+// Every account, the default first.
+method acAllEntries(map<string, object> state): array {
+    var defaultId = acDefaultEntry()["id"]
+    var list = [acDefaultEntry()]
+    for (entry in acStored(state)) {
+        if (entry["id"] != defaultId) {
+            list.append(entry)
+        }
+    }
+    return list
+}
+
+// The entry with this id, or null.
+method acFindEntry(map<string, object> state, string id): object {
+    for (entry in acAllEntries(state)) {
+        if (entry["id"] == id) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// The id of the selected account; the default when nothing valid is selected.
+method acSelectedId(map<string, object> state): string {
+    var selected = core.getOr(state, "selected", "")
+    if (core.isString(selected) && selected != "") {
+        if (core.isNull(acFindEntry(state, selected)) == false) {
+            return selected
+        }
+    }
+    return acDefaultEntry()["id"]
+}
+
+// Offline entries (the default and any stored ones) are listed but unusable: only a
+// Microsoft account can launch. Their data stays in the store.
+method acPublicEntry(map<string, object> entry, string selectedId): map<string, object> {
+    var defaultId = acDefaultEntry()["id"]
+    return {
+        "id": entry["id"],
+        "name": entry["name"],
+        "type": entry["type"],
+        "selected": entry["id"] == selectedId,
+        "default": entry["id"] == defaultId,
+        "usable": entry["type"] == "microsoft"
+    }
+}
+
+// The answer of the account list endpoints.
+method acView(map<string, object> state): map<string, object> {
+    var selected = acSelectedId(state)
+    var list = []
+    var selectedType = "offline"
+    for (entry in acAllEntries(state)) {
+        list.append(acPublicEntry(entry, selected))
+        if (entry["id"] == selected) {
+            selectedType = entry["type"]
+        }
+    }
+    return {"accounts": list, "selectedId": selected, "offlineMode": selectedType == "offline"}
+}
+
+// The stored entries with the one `id` replaced (or `entry` appended when it is new).
+method acUpsert(map<string, object> state, map<string, object> entry): array {
+    var list = []
+    var replaced = false
+    for (existing in acStored(state)) {
+        if (existing["id"] == entry["id"]) {
+            list.append(entry)
+            replaced = true
+        } else {
+            list.append(existing)
+        }
+    }
+    if (replaced == false) {
+        list.append(entry)
+    }
+    return list
+}
+
+method acWithout(map<string, object> state, string id): array {
+    var list = []
+    for (existing in acStored(state)) {
+        if (existing["id"] != id) {
+            list.append(existing)
+        }
+    }
+    return list
+}
+
+// Applies one operation to the store and writes it back. Returns the answer of the
+// operation (usually the account view). Runs under acStoreLock.
+method acApply(string op, map<string, object> data): object {
+    var state = acReadState()
+    var selected = acSelectedId(state)
+
+    if (op == "list") {
+        return acView(state)
+    }
+    if (op == "microsoft-entries") {
+        // The stored Microsoft entries with their tokens (for the skin list, outside the lock).
+        var microsoft = []
+        for (entry in acStored(state)) {
+            if (entry["type"] == "microsoft") {
+                microsoft.append(entry)
+            }
+        }
+        return microsoft
+    }
+    if (op == "current") {
+        return acFindEntry(state, selected)
+    }
+
+    if (op == "select") {
+        var target = core.getOr(data, "id", "")
+        if (core.isNull(acFindEntry(state, target))) {
+            core.notFound("account '" + target + "' not found")
+        }
+        state["selected"] = target
+    } else if (op == "remove") {
+        var doomed = core.getOr(data, "id", "")
+        if (doomed == acDefaultEntry()["id"]) {
+            core.conflict("the default offline account cannot be removed")
+        }
+        if (core.isNull(acFindEntry(state, doomed))) {
+            core.notFound("account '" + doomed + "' not found")
+        }
+        state["accounts"] = acWithout(state, doomed)
+        if (selected == doomed) {
+            state["selected"] = ""
+        }
+    } else if (op == "logout") {
+        var kept = []
+        for (existing in acStored(state)) {
+            if (existing["type"] != "microsoft") {
+                kept.append(existing)
+            }
+        }
+        state["accounts"] = kept
+        var still = core.getOr(state, "selected", "")
+        if (core.isNull(acFindEntry(state, still))) {
+            state["selected"] = ""
+        }
+    } else if (op == "add-offline") {
+        var name = core.getOr(data, "name", "")
+        if (acValidOfflineName(name) == false) {
+            core.badRequest("an offline name must be 3 to 16 letters, digits or underscores")
+        }
+        var id = acOfflineId(name)
+        if (core.isNull(acFindEntry(state, id)) == false) {
+            core.conflict("an account named '" + name + "' already exists")
+        }
+        var entry = {"type": "offline", "id": id, "name": name}
+        state["accounts"] = acUpsert(state, entry)
+        state["selected"] = id
+        acWriteState(state)
+        var view = acView(state)
+        view["account"] = acPublicEntry(entry, id)
+        return view
+    } else if (op == "save-microsoft") {
+        var fresh = core.getOr(data, "entry", {})
+        state["accounts"] = acUpsert(state, fresh)
+        if (core.getOr(data, "select", false) == true) {
+            state["selected"] = fresh["id"]
+        }
+    } else if (op == "refresh-save") {
+        // Only an account that still exists gets its new tokens (it may have been removed meanwhile).
+        var renewed = core.getOr(data, "entry", {})
+        if (core.isNull(acFindEntry(state, renewed["id"])) == false) {
+            state["accounts"] = acUpsert(state, renewed)
+        }
+    } else if (op == "offline-mode") {
+        if (core.getOr(data, "enabled", false) == true) {
+            var chosen = acDefaultEntry()["id"]
+            for (entry in acStored(state)) {
+                if (entry["type"] == "offline") {
+                    chosen = entry["id"]
+                    break
+                }
+            }
+            state["selected"] = chosen
+        } else {
+            var microsoft = ""
+            for (entry in acStored(state)) {
+                if (entry["type"] == "microsoft") {
+                    microsoft = entry["id"]
+                    break
+                }
+            }
+            if (microsoft == "") {
+                core.conflict("sign in with a Microsoft account first")
+            }
+            state["selected"] = microsoft
+        }
+    } else {
+        core.internal("unknown account operation '" + op + "'")
+    }
+
+    acWriteState(state)
+    return acView(state)
+}
+
+define class AcStoreChange {
+    private string op: get, set
+    private map<string, object> data: get, set
+
+    method run(): object {
+        return acApply(op, data)
+    }
+}
+
+// Runs one store operation under the lock and returns its answer. Raises the
+// operation's error (a core.fail or any runtime error) after the lock is released.
+method acChange(string op, map<string, object> data): object {
+    var failed = false
+    var message = ""
+    var result = core.none()
+    sync (acStoreLock) {
+        var outcome = core.runTrapped(AcStoreChange{op = op, data = data})
+        failed = outcome.failed()
+        message = outcome.error()
+        if (failed == false) {
+            result = outcome.result()
+        }
+    }
+    if (failed) {
+        core.raise(message)
+    }
+    return core.copyJson(result)
+}

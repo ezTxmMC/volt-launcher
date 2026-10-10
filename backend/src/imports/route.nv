@@ -1,0 +1,25 @@
+package imports
+
+import core
+
+// Profile import from other launchers (docs/ARCHITECTURE.md, "Profil-Import"):
+//
+//   GET  /api/imports/scan                 the launchers and their profiles (read-only)
+//   POST /api/imports {items: [{launcher, key}]}   -> 202 job (kind "import"), result {items, done, partial, failed}
+//
+// segments are the path segments after /api.
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 2 && segments[1] == "scan") {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.ok(scanAll())
+    }
+    if (segments.length() == 1) {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.respond(202, startImport(body))
+    }
+    return core.notFound("no such endpoint")
+}

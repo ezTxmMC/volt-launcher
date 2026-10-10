@@ -1,0 +1,689 @@
+package core
+
+import json
+import os
+import path
+import thread
+
+// Profiles: <dataDir>/profiles.json (an array of Profile objects) plus one
+// managed directory per profile at <dataDir>/profiles/<id>. The game runs in
+// that directory unless the profile sets its own gameDirectory.
+//
+//   GET    /api/profiles       list
+//   POST   /api/profiles       {name, minecraftVersion, loader, loaderVersion?, synced?} -> 201
+//   GET    /api/profiles/:id
+//   PATCH  /api/profiles/:id   change fields
+//   DELETE /api/profiles/:id   removes the profile and its files (synced folders: only their links)
+//
+// Feature modules use profile(id), profiles(), updateProfile(id, fields),
+// createProfile(fields) and profileModsDir(id). Everything handed out is a copy.
+
+var profileLock = thread.mutex()
+var profileList = []
+
+final LOADERS = ["vanilla", "fabric", "quilt", "forge", "neoforge"]
+final MAX_NAME_LENGTH = 100
+final MAX_GROUP_LENGTH = 60
+final MAX_COMMAND_LENGTH = 4000
+final MAX_ENV_VARS = 64
+final MAX_ICON_CHARS = 400000
+final ENV_NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+// The fields a POST /api/profiles may set besides name, minecraftVersion, loader, loaderVersion.
+final PROFILE_EXTRA_KEYS = ["memoryMb", "javaPath", "jvmArgs", "source", "gameDirectory", "wrapperCommand",
+    "preLaunchCommand", "postExitCommand", "envVars", "fullscreen", "hideLauncher", "favourite", "group", "iconUrl"]
+
+method profilesFile(): string {
+    return path.join(dataDir(), "profiles.json")
+}
+
+// The directory the game runs in: the profile's gameDirectory when it has one,
+// else its managed directory. Feature modules use this for mods, logs and so on.
+method profileDir(string id): string {
+    var found = findProfile(id)
+    if (isNull(found)) {
+        return managedProfileDir(id)
+    }
+    return effectiveGameDir(found)
+}
+
+// <dataDir>/profiles/<id>, computed from the id so a DELETE can never reach
+// outside <dataDir>/profiles. Create, delete and duplicate use this one.
+method managedProfileDir(string id): string {
+    return path.join(profilesRoot(), id)
+}
+
+// The game directory of a profile record (copy or stored; never a lock holder).
+method effectiveGameDir(map<string, object> p): string {
+    var custom = getOr(p, "gameDirectory", none())
+    if (isString(custom) && custom != "") {
+        return custom
+    }
+    return managedProfileDir(p["id"])
+}
+
+// <gameDir>/mods, created when missing.
+method profileModsDir(string id): string {
+    requireProfile(id)
+    return ensureDir(path.join(profileDir(id), "mods"))
+}
+
+method loadProfiles() {
+    var stored = readJsonFile(profilesFile(), [])
+    var loaded = []
+    if (isArray(stored)) {
+        for (entry in stored) {
+            if (isMap(entry) && isString(getOr(entry, "id", 0)) && isId(entry["id"])) {
+                loaded.append(normalizeProfile(entry))
+            } else {
+                logWarn("profiles.json: skipping an entry without a valid id")
+            }
+        }
+    }
+    sync (profileLock) {
+        profileList = loaded
+    }
+}
+
+// Fills fields a stored profile may lack (older files) and fixes gameDir.
+method normalizeProfile(map<string, object> entry): map<string, object> {
+    var p = {
+        "id": entry["id"],
+        "name": getOr(entry, "name", ""),
+        "minecraftVersion": getOr(entry, "minecraftVersion", ""),
+        "loader": getOr(entry, "loader", "vanilla"),
+        "loaderVersion": getOr(entry, "loaderVersion", none()),
+        "memoryMb": getOr(entry, "memoryMb", none()),
+        "javaPath": getOr(entry, "javaPath", none()),
+        "jvmArgs": getOr(entry, "jvmArgs", ""),
+        "gameDirectory": getOr(entry, "gameDirectory", none()),
+        "gameDir": "",
+        "wrapperCommand": getOr(entry, "wrapperCommand", none()),
+        "preLaunchCommand": getOr(entry, "preLaunchCommand", none()),
+        "postExitCommand": getOr(entry, "postExitCommand", none()),
+        "envVars": getOr(entry, "envVars", {}),
+        "fullscreen": getOr(entry, "fullscreen", false),
+        "hideLauncher": getOr(entry, "hideLauncher", none()),
+        "favourite": getOr(entry, "favourite", false),
+        "group": getOr(entry, "group", none()),
+        "iconUrl": getOr(entry, "iconUrl", none()),
+        "totalPlaytimeMs": getOr(entry, "totalPlaytimeMs", 0),
+        "createdAt": getOr(entry, "createdAt", nowIso()),
+        "lastPlayed": getOr(entry, "lastPlayed", none()),
+        "source": getOr(entry, "source", none()),
+        "synced": storedSynced(getOr(entry, "synced", []))
+    }
+    p["gameDir"] = effectiveGameDir(p)
+    return p
+}
+
+// --- reading -------------------------------------------------------------------------
+
+method profiles(): array {
+    var text = ""
+    sync (profileLock) {
+        text = json.stringify(profileList)
+    }
+    var copies = json.parse(text)
+    for (p in copies) {
+        p["gameDir"] = effectiveGameDir(p)
+    }
+    return copies
+}
+
+// The profile, or null when there is none with this id.
+method findProfile(string id): object {
+    var text = ""
+    sync (profileLock) {
+        for (p in profileList) {
+            if (p["id"] == id) {
+                text = json.stringify(p)
+            }
+        }
+    }
+    if (text == "") {
+        return none()
+    }
+    var copy = json.parse(text)
+    copy["gameDir"] = effectiveGameDir(copy)
+    return copy
+}
+
+// The profile, or a 404.
+method requireProfile(string id): map<string, object> {
+    var found = findProfile(id)
+    if (isNull(found)) {
+        notFound("profile '${id}' not found")
+    }
+    return found
+}
+
+method profile(string id): map<string, object> {
+    return requireProfile(id)
+}
+
+// --- validation ------------------------------------------------------------------------
+
+method requireText(map<string, object> fields, string key): string {
+    if (fields.has(key) == false || isString(fields[key]) == false) {
+        badRequest("'${key}' is required and must be a string")
+    }
+    var text = fields[key].trim()
+    if (text == "") {
+        badRequest("'${key}' must not be empty")
+    }
+    return text
+}
+
+method checkName(string name): string {
+    if (name.length() > MAX_NAME_LENGTH) {
+        badRequest("'name' is longer than ${MAX_NAME_LENGTH} characters")
+    }
+    return name
+}
+
+method checkLoader(string loader): string {
+    if (LOADERS.contains(loader) == false) {
+        badRequest("'loader' must be one of " + LOADERS.join(", "))
+    }
+    return loader
+}
+
+method optionalText(object value, string key): object {
+    if (isNull(value)) {
+        return none()
+    }
+    if (isString(value) == false) {
+        badRequest("'${key}' must be a string or null")
+    }
+    var text = value.trim()
+    if (text == "") {
+        return none()
+    }
+    return text
+}
+
+method optionalMemory(object value): object {
+    if (isNull(value)) {
+        return none()
+    }
+    if (isWholeNumber(value) == false || toInteger(value) < 256) {
+        badRequest("'memoryMb' must be null or an integer of at least 256")
+    }
+    return toInteger(value)
+}
+
+method optionalSource(object value): object {
+    if (isNull(value)) {
+        return none()
+    }
+    if (isMap(value) == false) {
+        badRequest("'source' must be null or an object")
+    }
+    return copyJson(value)
+}
+
+method requireBool(object value, string key): bool {
+    if (isBool(value) == false) {
+        badRequest("'${key}' must be true or false")
+    }
+    return value
+}
+
+method optionalBool(object value, string key): object {
+    if (isNull(value)) {
+        return none()
+    }
+    return requireBool(value, key)
+}
+
+// null, or a command line of at most `max` characters (run by the shell).
+method optionalCommand(object value, string key, integer max): object {
+    var text = optionalText(value, key)
+    if (isNull(text)) {
+        return none()
+    }
+    if (text.length() > max) {
+        badRequest("'${key}' is longer than ${max} characters")
+    }
+    return text
+}
+
+// null, or an absolute directory (normalized). Empty means "managed directory".
+method optionalGameDir(object value): object {
+    if (isNull(value)) {
+        return none()
+    }
+    if (isString(value) == false) {
+        badRequest("'gameDirectory' must be an absolute path or null")
+    }
+    var text = value.trim()
+    if (text == "") {
+        return none()
+    }
+    if (path.isAbsolute(text) == false) {
+        badRequest("'gameDirectory' must be an absolute path")
+    }
+    return path.normalize(text)
+}
+
+method optionalGroup(object value): object {
+    var text = optionalText(value, "group")
+    if (isNull(text)) {
+        return none()
+    }
+    if (text.length() > MAX_GROUP_LENGTH) {
+        badRequest("'group' is longer than ${MAX_GROUP_LENGTH} characters")
+    }
+    return text
+}
+
+// Environment variable names: letters, digits and underscores, not starting with a digit.
+method validEnvName(string name): bool {
+    if (name.length() == 0 || name.length() > 128) {
+        return false
+    }
+    var first = true
+    for (ch in name) {
+        if (ENV_NAME_CHARS.contains(ch) == false) {
+            return false
+        }
+        if (first && "0123456789".contains(ch)) {
+            return false
+        }
+        first = false
+    }
+    return true
+}
+
+// {NAME: value} of strings; the whole object replaces the old one.
+method checkEnvVars(object value): map<string, object> {
+    if (isMap(value) == false) {
+        badRequest("'envVars' must be an object with string values")
+    }
+    var count = 0
+    var result = {}
+    for (key in value) {
+        count = count + 1
+        if (count > MAX_ENV_VARS) {
+            badRequest("'envVars' has more than ${MAX_ENV_VARS} entries")
+        }
+        if (validEnvName(key) == false) {
+            badRequest("'envVars' has an invalid name '${key}'")
+        }
+        if (isString(value[key]) == false) {
+            badRequest("environment variable '${key}' must be a string")
+        }
+        result[key] = value[key]
+    }
+    return result
+}
+
+// null, or a PNG, JPEG, GIF or WebP image as a data URL (at most ~300 KB). Only
+// the header is decoded to check the image type; the browser checks the rest.
+method optionalIcon(object value): object {
+    if (isNull(value)) {
+        return none()
+    }
+    if (isString(value) == false) {
+        badRequest("'iconUrl' must be a data URL or null")
+    }
+    if (value.length() > MAX_ICON_CHARS) {
+        badRequest("the icon is larger than 300 KB")
+    }
+    var kind = ""
+    if (value.startsWith("data:image/png;base64,")) {
+        kind = "png"
+    } else if (value.startsWith("data:image/jpeg;base64,")) {
+        kind = "jpeg"
+    } else if (value.startsWith("data:image/gif;base64,")) {
+        kind = "gif"
+    } else if (value.startsWith("data:image/webp;base64,")) {
+        kind = "webp"
+    }
+    if (kind == "") {
+        badRequest("the icon must be a PNG, JPEG, GIF or WebP image")
+    }
+    // The base64 text every file of the type starts with (its magic bytes, encoded).
+    var body = value.substring(value.indexOf(",") + 1, value.length())
+    var magic = "iVBORw0KGgo"
+    if (kind == "jpeg") {
+        magic = "/9j/"
+    } else if (kind == "gif") {
+        magic = "R0lGOD"
+    } else if (kind == "webp") {
+        magic = "UklGR"
+    }
+    if (body.startsWith(magic) == false) {
+        badRequest("the icon data is not a " + kind + " image")
+    }
+    return value
+}
+
+// The changes a PATCH asks for, validated. Read-only fields are an error.
+method validateProfilePatch(object patch): map<string, object> {
+    if (isMap(patch) == false) {
+        badRequest("expected a JSON object with the fields to change")
+    }
+    var changes = {}
+    for (key in patch) {
+        var value = patch[key]
+        if (key == "name") {
+            changes[key] = checkName(requireText(patch, key))
+        } else if (key == "minecraftVersion") {
+            changes[key] = requireText(patch, key)
+        } else if (key == "loader") {
+            changes[key] = checkLoader(requireText(patch, key))
+        } else if (key == "loaderVersion" || key == "javaPath") {
+            changes[key] = optionalText(value, key)
+        } else if (key == "jvmArgs") {
+            if (isString(value) == false) {
+                badRequest("'jvmArgs' must be a string")
+            }
+            changes[key] = value
+        } else if (key == "memoryMb") {
+            changes[key] = optionalMemory(value)
+        } else if (key == "source") {
+            changes[key] = optionalSource(value)
+        } else if (key == "gameDirectory") {
+            changes[key] = optionalGameDir(value)
+        } else if (key == "wrapperCommand") {
+            changes[key] = optionalCommand(value, key, MAX_COMMAND_LENGTH)
+        } else if (key == "preLaunchCommand" || key == "postExitCommand") {
+            changes[key] = optionalCommand(value, key, MAX_COMMAND_LENGTH)
+        } else if (key == "envVars") {
+            changes[key] = checkEnvVars(value)
+        } else if (key == "fullscreen" || key == "favourite") {
+            changes[key] = requireBool(value, key)
+        } else if (key == "hideLauncher") {
+            changes[key] = optionalBool(value, key)
+        } else if (key == "group") {
+            changes[key] = optionalGroup(value)
+        } else if (key == "iconUrl") {
+            changes[key] = optionalIcon(value)
+        } else if (key == "synced") {
+            changes[key] = checkSyncedPatch(value)
+        } else if (key == "id" || key == "gameDir" || key == "createdAt" || key == "lastPlayed" || key == "totalPlaytimeMs") {
+            badRequest("'${key}' cannot be changed")
+        } else {
+            badRequest("unknown profile field '${key}'")
+        }
+    }
+    return changes
+}
+
+// --- writing ---------------------------------------------------------------------------
+
+// Persists profileList. Call only with profileLock held; returns "" or the error.
+method saveProfilesLocked(): string {
+    return writeFileAtomic(profilesFile(), json.pretty(profileList) + "\n")
+}
+
+// Creates a profile from {name, minecraftVersion, loader, loaderVersion?, synced?}
+// (plus, for internal callers, memoryMb/javaPath/jvmArgs/source). "synced" lists the
+// shared folders (see synced.nv); each one becomes a link in the new game directory.
+method createProfile(object body): map<string, object> {
+    if (isMap(body) == false) {
+        badRequest("expected a JSON object {name, minecraftVersion, loader, loaderVersion?}")
+    }
+    var name = checkName(requireText(body, "name"))
+    var minecraftVersion = requireText(body, "minecraftVersion")
+    var loader = checkLoader(requireText(body, "loader"))
+    var loaderVersion = optionalText(getOr(body, "loaderVersion", none()), "loaderVersion")
+    if (loader == "vanilla") {
+        loaderVersion = none()
+    }
+    var extra = {}
+    for (key in PROFILE_EXTRA_KEYS) {
+        if (body.has(key)) {
+            extra[key] = body[key]
+        }
+    }
+    var changes = validateProfilePatch(extra)
+    var synced = checkSynced(getOr(body, "synced", none()))
+
+    var id = newId()
+    while (isNull(findProfile(id)) == false) {
+        id = newId()
+    }
+    var created = {
+        "id": id,
+        "name": name,
+        "minecraftVersion": minecraftVersion,
+        "loader": loader,
+        "loaderVersion": loaderVersion,
+        "createdAt": nowIso(),
+        "lastPlayed": none(),
+        "synced": synced
+    }
+    for (key in changes) {
+        created[key] = changes[key]
+    }
+    created = normalizeProfile(created)
+    // The links are made before the profile is stored, so a failure needs no list rollback.
+    if (synced.length() > 0) {
+        checkSyncedTargets(created["gameDir"], synced)
+    }
+    ensureDir(managedProfileDir(id))
+    if (isString(created["gameDirectory"])) {
+        ensureDir(created["gameDirectory"])
+    }
+    if (synced.length() > 0) {
+        var linking = runTrapped(SyncedLinksTask{gameDir = created["gameDir"], keys = synced})
+        if (linking.failed()) {
+            discardProfileFiles(id, created)
+            raise(linking.error())
+        }
+    }
+
+    var writeError = ""
+    sync (profileLock) {
+        profileList.append(created)
+        writeError = saveProfilesLocked()
+        if (writeError != "") {
+            profileList.pop()
+        }
+    }
+    if (writeError != "") {
+        discardProfileFiles(id, created)
+        internal("cannot save profiles: " + writeError)
+    }
+    logInfo("profile ${id} created (${name}, ${minecraftVersion}, ${loader})")
+    return copyJson(created)
+}
+
+// Applies already validated `fields` to a profile and persists it. Internal
+// callers (launch: lastPlayed, providers: source) use this directly.
+method updateProfile(string id, map<string, object> fields): map<string, object> {
+    var text = ""
+    var writeError = ""
+    sync (profileLock) {
+        for (p in profileList) {
+            if (p["id"] == id) {
+                for (key in fields) {
+                    p[key] = fields[key]
+                }
+                if (p["loader"] == "vanilla") {
+                    p["loaderVersion"] = none()
+                }
+                p["gameDir"] = effectiveGameDir(p)
+                text = json.stringify(p)
+            }
+        }
+        if (text != "") {
+            writeError = saveProfilesLocked()
+        }
+    }
+    if (text == "") {
+        notFound("profile '${id}' not found")
+    }
+    if (writeError != "") {
+        internal("cannot save profiles: " + writeError)
+    }
+    return json.parse(text)
+}
+
+// Removes what a profile left on disk: its synced links first (removeAll on a Windows
+// junction would walk into the shared folder), then the managed directory. The
+// directory stays when a link could not be removed. Never touches shared content.
+method discardProfileFiles(string id, map<string, object> profile) {
+    if (removeProfileLinks(id, profile) == false) {
+        logWarn("profile ${id}: a synced folder link could not be removed; '${managedProfileDir(id)}' is kept")
+        return
+    }
+    os.removeAll(managedProfileDir(id))
+}
+
+// PATCH: "synced" changes the links and shared folders first (synced.nv); the answer then carries
+// "syncReport". Other fields are stored with it or not at all.
+method patchProfile(string id, object patch): map<string, object> {
+    requireProfile(id)
+    var changes = validateProfilePatch(patch)
+    if (changes.has("synced") == false) {
+        return updateProfile(id, changes)
+    }
+    var wanted = checkSynced(changes["synced"])
+    changes.remove("synced")
+    return patchSynced(id, wanted, changes)
+}
+
+// Like updateProfile, but a save error puts the record back and returns the error text instead of
+// raising (PATCH with "synced" must undo its links first). "" on success.
+method storeProfileFields(string id, map<string, object> fields): string {
+    var writeError = ""
+    sync (profileLock) {
+        var found = false
+        for (p in profileList) {
+            if (p["id"] == id) {
+                found = true
+                var previous = {"loaderVersion": getOr(p, "loaderVersion", none()), "gameDir": getOr(p, "gameDir", "")}
+                for (key in fields) {
+                    if (previous.has(key) == false) {
+                        previous[key] = getOr(p, key, none())
+                    }
+                    p[key] = fields[key]
+                }
+                if (p["loader"] == "vanilla") {
+                    p["loaderVersion"] = none()
+                }
+                p["gameDir"] = effectiveGameDir(p)
+                writeError = saveProfilesLocked()
+                if (writeError != "") {
+                    for (key in previous) {
+                        p[key] = previous[key]
+                    }
+                }
+            }
+        }
+        if (found == false) {
+            writeError = "profile '" + id + "' not found"
+        }
+    }
+    return writeError
+}
+
+method deleteProfile(string id) {
+    var before = findProfile(id)
+    var found = false
+    var writeError = ""
+    sync (profileLock) {
+        var kept = []
+        for (p in profileList) {
+            if (p["id"] == id) {
+                found = true
+            } else {
+                kept.append(p)
+            }
+        }
+        if (found) {
+            var previous = profileList
+            profileList = kept
+            writeError = saveProfilesLocked()
+            if (writeError != "") {
+                profileList = previous
+            }
+        }
+    }
+    if (found == false) {
+        notFound("profile '${id}' not found")
+    }
+    if (writeError != "") {
+        internal("cannot save profiles: " + writeError)
+    }
+    // The synced links go first; only then the managed directory. A custom gameDirectory
+    // belongs to the user and keeps its files (its synced links are removed, if any).
+    var dir = managedProfileDir(id)
+    if (isNull(before) == false && removeProfileLinks(id, before) == false) {
+        logWarn("profile ${id} deleted, but a synced folder link could not be removed; '${dir}' is kept")
+        return
+    }
+    if (os.exists(dir) && os.removeAll(dir) == false) {
+        logWarn("profile ${id} deleted, but '${dir}' could not be removed completely")
+    }
+    logInfo("profile ${id} deleted")
+}
+
+// Adds one play session to totalPlaytimeMs (called when a game exits).
+method addPlaytime(string id, integer milliseconds) {
+    var writeError = ""
+    sync (profileLock) {
+        var found = false
+        for (p in profileList) {
+            if (p["id"] == id) {
+                p["totalPlaytimeMs"] = toInteger(getOr(p, "totalPlaytimeMs", 0)) + milliseconds
+                found = true
+            }
+        }
+        if (found) {
+            writeError = saveProfilesLocked()
+        }
+    }
+    if (writeError != "") {
+        logWarn("cannot save the playtime of profile ${id}: " + writeError)
+    }
+}
+
+// The distinct group names of all profiles, in the order they first appear.
+method profileGroups(): array {
+    var names = []
+    for (p in profiles()) {
+        var groupName = getOr(p, "group", none())
+        if (isString(groupName) && groupName != "" && names.contains(groupName) == false) {
+            names.append(groupName)
+        }
+    }
+    return names
+}
+
+// --- routes ----------------------------------------------------------------------------
+
+// /api/profiles and /api/profiles/:id (deeper paths go to the feature
+// modules, see server/router.nv).
+method profilesRoute(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments.length() == 1) {
+        if (verb == "GET") {
+            return ok(profiles())
+        }
+        if (verb == "POST") {
+            return respond(201, createProfile(body))
+        }
+        return methodNotAllowed(verb, segments)
+    }
+    if (segments.length() != 2) {
+        notFound("no such endpoint")
+    }
+    var id = segments[1]
+    if (isId(id) == false) {
+        notFound("profile '${id}' not found")
+    }
+    if (verb == "GET") {
+        return ok(requireProfile(id))
+    }
+    if (verb == "PATCH") {
+        return ok(patchProfile(id, body))
+    }
+    if (verb == "DELETE") {
+        deleteProfile(id)
+        return ok({"deleted": id})
+    }
+    return methodNotAllowed(verb, segments)
+}

@@ -1,0 +1,184 @@
+package main
+
+import core
+import json
+import launch
+import os
+import path
+
+// Checks of the legacy Forge install (src/launch/legacyforge.nv) and of the branch in
+// launchRunInstaller. legacyforge-test.sh downloads the real 1.12.2-14.23.5.2847 installer,
+// writes the fixtures and compiles this against src/core, src/accounts and src/launch.
+// Usage: legacyforge-unit <installer> <dataDir> <fixtureDir>
+// The fixtures are no-profile.jar (no install_profile.json) and no-universal.jar (no filePath entry).
+
+final LEGACY_ID = "1.12.2-forge1.12.2-14.23.5.2847"
+final LEGACY_JAR = "net.minecraftforge:forge:1.12.2-14.23.5.2847"
+final LEGACY_FILE = "forge-1.12.2-14.23.5.2847-universal.jar"
+final LEGACY_MAVEN = "https://libraries.minecraft.net/"
+
+var failures = 0
+var checks = 0
+
+method check(string name, bool condition) {
+    checks = checks + 1
+    if (condition) {
+        println "ok    " + name
+    } else {
+        failures = failures + 1
+        println "FAIL  " + name
+    }
+}
+
+// A failure of a trapped task as "<status> <code>", or "" when it succeeded.
+method failureOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    var decoded = core.decodeFailure(outcome.error())
+    return "" + decoded["status"] + " " + decoded["code"]
+}
+
+// The message of a trapped failure, or "" when the task succeeded.
+method messageOf(object task): string {
+    var outcome = core.runTrapped(task)
+    if (outcome.failed() == false) {
+        return ""
+    }
+    return core.decodeFailure(outcome.error())["message"]
+}
+
+// Runs launchRunInstaller for `resolved` (its "meta" gives the libraries plan).
+define class RunInstallerTask {
+    private map<string, object> resolved: get, set
+    method run(): object {
+        var meta = resolved["meta"]
+        launch.launchRunInstaller(resolved, launch.launchPlanLibraries(meta), "/nonexistent/java", "")
+        return true
+    }
+}
+
+// Runs the legacy install directly.
+define class LegacyInstallTask {
+    private map<string, object> resolved: get, set
+    method run(): object {
+        launch.launchLegacyForgeInstall(resolved, "")
+        return true
+    }
+}
+
+// The versionInfo of the installer's install_profile.json, or an empty map.
+method versionInfoOf(string installer): map<string, object> {
+    var profile = json.tryParse(launch.launchZipEntryText(installer, "install_profile.json"))
+    if (core.isMap(profile) == false) {
+        return {}
+    }
+    var info = core.getOr(profile, "versionInfo", core.none())
+    if (core.isMap(info) == false) {
+        return {}
+    }
+    return info
+}
+
+// Whether a planned download has this URL.
+method hasDownload(array downloads, string url): bool {
+    for (item in downloads) {
+        if (item["url"] == url) {
+            return true
+        }
+    }
+    return false
+}
+
+method main(array<string> arguments): integer {
+    var installer = arguments[0]
+    var dataDir = arguments[1]
+    var fixtures = arguments[2]
+    core.init(dataDir, false)
+
+    // --- branch choice: Minecraft below 1.13 is legacy, 1.13 and newer are not
+    check("1.12.2 is a legacy Forge version", launch.launchIsLegacyForge("1.12.2"))
+    check("1.12 is a legacy Forge version", launch.launchIsLegacyForge("1.12"))
+    check("1.7.10 is a legacy Forge version", launch.launchIsLegacyForge("1.7.10"))
+    check("1.13 is not legacy", launch.launchIsLegacyForge("1.13") == false)
+    check("1.13.2 is not legacy", launch.launchIsLegacyForge("1.13.2") == false)
+    check("1.16.5 is not legacy", launch.launchIsLegacyForge("1.16.5") == false)
+    check("1.21.1 is not legacy", launch.launchIsLegacyForge("1.21.1") == false)
+    check("a snapshot id is not legacy", launch.launchIsLegacyForge("24w14a") == false)
+
+    // --- 1.13+ keeps the headless path: launchRunInstaller starts java, which does not exist here
+    var headless = {
+        "versionId": "1.21.1-forge-52.0.16",
+        "minecraftVersion": "1.21.1",
+        "loader": "forge",
+        "installer": installer,
+        "meta": {"libraries": []}
+    }
+    var headlessMessage = messageOf(RunInstallerTask{resolved = headless})
+    check("1.21.1 runs the installer headless (it fails to start java)", headlessMessage.contains("installer"))
+
+    // --- 1.12.2 with the real installer: the legacy path, no java involved
+    var meta = versionInfoOf(installer)
+    check("the installer has a versionInfo with the expected id", meta["id"] == LEGACY_ID)
+    var resolved = {
+        "versionId": LEGACY_ID,
+        "minecraftVersion": "1.12.2",
+        "loader": "forge",
+        "installer": installer,
+        "meta": meta
+    }
+    check("1.12.2 installs without running the installer", messageOf(RunInstallerTask{resolved = resolved}) == "")
+    var universal = path.join(launch.launchLibrariesDir(), launch.launchMavenPath(LEGACY_JAR))
+    check("the universal jar is in its Maven path", os.isFile(universal))
+    check("the version JSON is at the folder the launch looks up", os.isFile(launch.launchVersionJson(LEGACY_ID)))
+    check("a second install keeps the files", messageOf(LegacyInstallTask{resolved = resolved}) == "" && os.isFile(universal))
+
+    // the library plan of the merged metadata: libraries without downloads get their url
+    // (or the default libraries.minecraft.net) and the Maven path; the universal jar is on disk
+    var plan = launch.launchPlanLibraries(meta)
+    check("the classpath has the universal jar", plan["classpath"].contains(universal))
+    check("the universal jar is not fetched again", launch.launchHashOk(universal, "") == true)
+    check("a library without url uses libraries.minecraft.net", hasDownload(plan["downloads"], LEGACY_MAVEN + "net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar"))
+    check("a library with a url uses that url", hasDownload(plan["downloads"], "https://maven.minecraftforge.net/org/ow2/asm/asm-all/5.2/asm-all-5.2.jar"))
+
+    // --- failures: 500 internal naming the installer and what is missing
+    var noProfile = path.join(fixtures, "no-profile.jar")
+    var noProfileResolved = {
+        "versionId": LEGACY_ID,
+        "minecraftVersion": "1.12.2",
+        "loader": "forge",
+        "installer": noProfile,
+        "meta": meta
+    }
+    check("an installer without install_profile.json is a 500 internal", failureOf(LegacyInstallTask{resolved = noProfileResolved}) == "500 internal")
+    var noProfileMessage = messageOf(LegacyInstallTask{resolved = noProfileResolved})
+    check("the message names the installer and install_profile.json", noProfileMessage.contains("no-profile.jar") && noProfileMessage.contains("install_profile.json"))
+
+    var noUniversal = path.join(fixtures, "no-universal.jar")
+    var noUniversalResolved = {
+        "versionId": LEGACY_ID,
+        "minecraftVersion": "1.12.2",
+        "loader": "forge",
+        "installer": noUniversal,
+        "meta": meta
+    }
+    var noUniversalMessage = messageOf(LegacyInstallTask{resolved = noUniversalResolved})
+    check("an installer without the universal jar is a 500 internal", failureOf(LegacyInstallTask{resolved = noUniversalResolved}) == "500 internal")
+    check("the message names the missing universal jar", noUniversalMessage.contains(LEGACY_FILE))
+
+    var otherResolved = {
+        "versionId": "1.12.2-forge-other",
+        "minecraftVersion": "1.12.2",
+        "loader": "forge",
+        "installer": installer,
+        "meta": meta
+    }
+    check("a version id that differs from the profile is a 500 internal", failureOf(LegacyInstallTask{resolved = otherResolved}) == "500 internal")
+
+    println "legacy forge unit: " + (checks - failures) + " / " + checks + " checks passed"
+    if (failures > 0) {
+        return 1
+    }
+    return 0
+}

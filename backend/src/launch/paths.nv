@@ -1,0 +1,161 @@
+package launch
+
+import os
+import path
+import core
+
+// Directory layout and platform facts of the launch module.
+//
+//   <dataDir>/shared/versions/<folder>/<folder>.jar|.json
+//   <dataDir>/shared/libraries/...
+//   <dataDir>/shared/assets/{indexes,objects,virtual,log_configs}/
+//   <dataDir>/shared/natives/<folder>/
+//   <dataDir>/shared/runtimes/jdk-<major>-<os>-<arch>/    (downloaded JDKs)
+//   <dataDir>/shared/runtimes/downloads/                   (their archives)
+//   <dataDir>/shared/installers/                           (Forge/NeoForge installer jars)
+//   <gameDir>/logs/launch.log                              (game output, appended per launch)
+//
+// Every top level name of this package starts with "launch"/"Launch" (except
+// route): Novus resolves unqualified names across all packages and class
+// names are global, so generic names could collide with the other modules.
+
+method launchSharedDir(): string {
+    return path.join(core.dataDir(), "shared")
+}
+
+method launchVersionsDir(): string {
+    return path.join(launchSharedDir(), "versions")
+}
+
+method launchLibrariesDir(): string {
+    return path.join(launchSharedDir(), "libraries")
+}
+
+method launchAssetsDir(): string {
+    return path.join(launchSharedDir(), "assets")
+}
+
+method launchNativesRoot(): string {
+    return path.join(launchSharedDir(), "natives")
+}
+
+method launchRuntimesDir(): string {
+    return path.join(launchSharedDir(), "runtimes")
+}
+
+method launchInstallersDir(): string {
+    return path.join(launchSharedDir(), "installers")
+}
+
+// A version id as a folder name: ':' '/' '\' become '_'.
+method launchFolderName(string versionId): string {
+    if (versionId.trim() == "") {
+        return "unknown-version"
+    }
+    return versionId.replace(":", "_").replace("/", "_").replace("\\", "_")
+}
+
+method launchVersionJar(string versionId): string {
+    var folder = launchFolderName(versionId)
+    return path.join(launchVersionsDir(), folder, folder + ".jar")
+}
+
+method launchVersionJson(string versionId): string {
+    var folder = launchFolderName(versionId)
+    return path.join(launchVersionsDir(), folder, folder + ".json")
+}
+
+method launchLogFile(string profileId): string {
+    return path.join(core.profileDir(profileId), "logs", "launch.log")
+}
+
+// Creates a directory with its parents; a failure is a 500.
+method launchEnsureDir(string dir): string {
+    if (os.isDir(dir) == false && os.mkdir(dir) == false) {
+        core.internal("cannot create directory '" + dir + "'")
+    }
+    return dir
+}
+
+// --- platform ------------------------------------------------------------------
+
+// The OS name Mojang's rules use: windows | osx | linux.
+method launchOsName(): string {
+    var p = os.platform()
+    if (p == "windows") {
+        return "windows"
+    }
+    if (p == "macos") {
+        return "osx"
+    }
+    return "linux"
+}
+
+method launchIsWindows(): bool {
+    return os.platform() == "windows"
+}
+
+var launchArchCache = ""
+
+// The architecture in the spelling of Java's os.arch (the rules are written
+// against it): amd64 | aarch64 | x86 | arm | <uname -m>.
+method launchArch(): string {
+    if (launchArchCache != "") {
+        return launchArchCache
+    }
+    var raw = ""
+    if (launchIsWindows()) {
+        raw = os.env("PROCESSOR_ARCHITEW6432")
+        if (raw == "") {
+            raw = os.env("PROCESSOR_ARCHITECTURE")
+        }
+    } else {
+        raw = os.run("uname -m 2>/dev/null")["output"].trim()
+    }
+    raw = raw.toLower()
+    var arch = raw
+    if (raw == "x86_64" || raw == "amd64" || raw == "x64") {
+        arch = "amd64"
+    } else if (raw == "aarch64" || raw == "arm64") {
+        arch = "aarch64"
+    } else if (raw == "i386" || raw == "i486" || raw == "i586" || raw == "i686" || raw == "x86") {
+        arch = "x86"
+    } else if (raw.startsWith("arm")) {
+        arch = "arm"
+    }
+    if (arch == "") {
+        arch = "amd64"
+    }
+    launchArchCache = arch
+    return arch
+}
+
+// "64" or "32" - the ${arch} of legacy native classifiers.
+method launchArchBits(): string {
+    if (launchArch().contains("64")) {
+        return "64"
+    }
+    return "32"
+}
+
+method launchClasspathSeparator(): string {
+    if (launchIsWindows()) {
+        return ";"
+    }
+    return ":"
+}
+
+method launchJavaExeName(): string {
+    if (launchIsWindows()) {
+        return "java.exe"
+    }
+    return "java"
+}
+
+// A shell suffix that drops stderr.
+method launchQuietNull(): string {
+    if (launchIsWindows()) {
+        return " 2>NUL"
+    }
+    return " 2>/dev/null"
+}
