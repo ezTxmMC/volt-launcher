@@ -1,57 +1,57 @@
-# VoltLauncher — neue Architektur
+# VoltLauncher — new architecture
 
-Der Launcher besteht aus zwei getrennten Teilen, die über einen lokalen HTTP-Dienst reden.
-Das alte Java-Backend (`volt-*`) und `ui/` bleiben vorerst unberührt; das Neue lebt in
-`app/` und `backend/`.
+The launcher consists of two separate parts that talk to each other over a local HTTP service.
+The old Java backend (`volt-*`) and `ui/` remain untouched for now; the new code lives in
+`app/` and `backend/`.
 
 ```
 ┌──────────────────────── app/ (Electron) ────────────────────────┐
 │  main process                    renderer (React)               │
-│  ├─ wählt freien Port + Token    ├─ react-router Seiten         │
-│  ├─ startet backend/ als         ├─ ruft window.volt.api(...)   │
-│  │  Subprozess (spawn)           │   (preload → IPC → main)     │
-│  ├─ proxied API-Aufrufe   ◄──────┘                              │
-│  └─ beendet Backend beim Schließen                              │
+│  ├─ picks free port + token      ├─ react-router pages          │
+│  ├─ starts backend/ as           ├─ calls window.volt.api(...)  │
+│  │  subprocess (spawn)           │   (preload → IPC → main)     │
+│  ├─ proxies API calls     ◄──────┘                              │
+│  └─ stops backend on close                                      │
 └──────────────┬──────────────────────────────────────────────────┘
-               │ HTTP 127.0.0.1:<port>, Header X-Volt-Token
+               │ HTTP 127.0.0.1:<port>, header X-Volt-Token
 ┌──────────────▼─────────── backend/ (Novus) ─────────────────────┐
-│  http-Server (net) → Router → Module                             │
+│  http server (net) → router → modules                            │
 │  ├─ settings, profiles, jobs      (core)                         │
-│  ├─ mods        (Dateiscan, Metadaten, Update-Prüfung)           │
-│  ├─ providers   (Modrinth, CurseForge-Bridge, Technic, FTB)      │
-│  └─ launch      (Minecraft-Installation, Java, Start)            │
+│  ├─ mods        (file scan, metadata, update check)              │
+│  ├─ providers   (Modrinth, CurseForge bridge, Technic, FTB)      │
+│  └─ launch      (Minecraft installation, Java, launch)           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Prozess-Logik
+## Process logic
 
-1. Electron (main) sucht einen freien TCP-Port auf `127.0.0.1` und erzeugt ein zufälliges
-   Token (32 Byte, hex).
-2. Electron startet das Backend als Kindprozess:
+1. Electron (main) looks for a free TCP port on `127.0.0.1` and generates a random
+   token (32 bytes, hex).
+2. Electron starts the backend as a child process:
    `volt-backend --port <port> --token <token> --data-dir <dir>`.
-   Die Binary liegt in `backend/dist/` (Entwicklung) bzw. in `resources/backend/` (gepackt).
-3. Electron pollt `GET /api/health`, bis das Backend antwortet (Timeout 15 s).
-4. Die Renderer-Seite spricht **nie direkt** mit dem Backend. Sie ruft
-   `window.volt.api(method, path, body?)` auf; der Preload schickt das per IPC an den
-   main-Prozess, der die HTTP-Anfrage mit Token ausführt. Dadurch braucht das Backend kein CORS,
-   und das Token verlässt den main-Prozess nie.
-5. Beim Beenden von Electron wird der Kindprozess beendet.
+   The binary is located in `backend/dist/` (development) or in `resources/backend/` (packaged).
+3. Electron polls `GET /api/health` until the backend responds (timeout 15 s).
+4. The renderer side **never** talks directly to the backend. It calls
+   `window.volt.api(method, path, body?)`; the preload sends this over IPC to the
+   main process, which executes the HTTP request with the token. As a result, the backend needs no CORS,
+   and the token never leaves the main process.
+5. When Electron exits, the child process is terminated.
 
-Das Backend beendet sich nicht von selbst; es ist ein reiner Dienst.
+The backend does not exit on its own; it is a pure service.
 
-## HTTP-Konventionen
+## HTTP conventions
 
-- Alle Pfade beginnen mit `/api`. Jeder Request braucht `X-Volt-Token`; ohne gültiges Token
-  antwortet das Backend mit `401`.
-- Body und Antwort sind JSON (`Content-Type: application/json; charset=utf-8`).
-- Fehler: HTTP-Status plus
+- All paths begin with `/api`. Every request needs `X-Volt-Token`; without a valid token
+  the backend responds with `401`.
+- Request and response bodies are JSON (`Content-Type: application/json; charset=utf-8`).
+- Errors: HTTP status plus
   `{"error": {"code": "not_found" | "bad_request" | "conflict" | "upstream" | "internal", "message": "…"}}`.
-- Zeitstempel: ISO-8601 in UTC (`2026-10-10T12:00:00Z`).
-- IDs: Profile-IDs sind 12-stellige Hex-Strings. Job-IDs sind 12-stellige Hex-Strings.
-- Lange Vorgänge laufen als **Job**: der Endpunkt antwortet sofort mit `202` und einem Job,
-  der Fortschritt wird über `GET /api/jobs/:id` abgefragt (Polling, ca. alle 500 ms).
+- Timestamps: ISO-8601 in UTC (`2026-10-10T12:00:00Z`).
+- IDs: Profile IDs are 12-character hex strings. Job IDs are 12-character hex strings.
+- Long-running operations run as a **job**: the endpoint responds immediately with `202` and a job;
+  progress is queried via `GET /api/jobs/:id` (polling, roughly every 500 ms).
 
-## Datenmodelle
+## Data models
 
 **Settings**
 
@@ -86,12 +86,12 @@ Das Backend beendet sich nicht von selbst; es ist ein reiner Dienst.
 }
 ```
 
-`loader` ist einer von `vanilla | fabric | quilt | forge | neoforge`. `memoryMb: null` bedeutet
-"globalen Wert aus den Settings verwenden". `source` ist `null` oder
+`loader` is one of `vanilla | fabric | quilt | forge | neoforge`. `memoryMb: null` means
+"use the global value from the settings". `source` is `null` or
 `{"provider": "modrinth", "projectId": "…", "versionId": "…", "name": "…", "kind": "modpack"}`
-und sagt, woher ein Modpack stammt (wichtig für spätere Pack-Updates).
+and states where a modpack came from (important for later pack updates).
 
-**ModFile** (Eintrag aus `<gameDir>/mods`)
+**ModFile** (entry from `<gameDir>/mods`)
 
 ```json
 {
@@ -117,11 +117,11 @@ und sagt, woher ein Modpack stammt (wichtig für spätere Pack-Updates).
 }
 ```
 
-- `enabled` ist `false`, wenn die Datei auf `.jar.disabled` endet. Umschalten benennt nur um.
-- `metadata` kommt aus dem Jar (fabric.mod.json, quilt.mod.json, META-INF/mods.toml,
-  META-INF/neoforge.mods.toml, mcmod.info). Fehlt Metadaten, ist `loader` `"unknown"`.
-- `source` ist `null`, wenn der Hash bei keinem Provider bekannt ist.
-- `update` ist `null` oder `{"versionId", "versionNumber", "fileName", "sha1", "url", "gameVersions": [...], "loaders": [...]}`.
+- `enabled` is `false` if the file ends in `.jar.disabled`. Toggling only renames the file.
+- `metadata` comes from the jar (fabric.mod.json, quilt.mod.json, META-INF/mods.toml,
+  META-INF/neoforge.mods.toml, mcmod.info). If metadata is missing, `loader` is `"unknown"`.
+- `source` is `null` if the hash is not known to any provider.
+- `update` is `null` or `{"versionId", "versionNumber", "fileName", "sha1", "url", "gameVersions": [...], "loaders": [...]}`.
 
 **Job**
 
@@ -129,10 +129,10 @@ und sagt, woher ein Modpack stammt (wichtig für spätere Pack-Updates).
 {
   "id": "0f1e2d3c4b5a",
   "kind": "pack-install",
-  "title": "Installiere All the Mods 10",
+  "title": "Installing All the Mods 10",
   "state": "running",
   "progress": 0.42,
-  "message": "Lade 12 / 30 Dateien",
+  "message": "Downloading 12 / 30 files",
   "error": null,
   "result": null,
   "createdAt": "2026-10-10T12:00:00Z",
@@ -140,8 +140,8 @@ und sagt, woher ein Modpack stammt (wichtig für spätere Pack-Updates).
 }
 ```
 
-`state` ist `running | done | failed | cancelled`. `progress` liegt in `0.0 … 1.0`.
-`result` wird bei `done` gesetzt, z. B. `{"profileId": "…"}` nach einer Pack-Installation.
+`state` is `running | done | failed | cancelled`. `progress` is in the range `0.0 … 1.0`.
+`result` is set when `state` is `done`, e.g. `{"profileId": "…"}` after a pack installation.
 
 **ProjectSummary** (Discover)
 
@@ -160,177 +160,177 @@ und sagt, woher ein Modpack stammt (wichtig für spätere Pack-Updates).
 }
 ```
 
-`provider` ist `modrinth | curseforge | technic | ftb`. `kind` ist `mod | modpack | resourcepack | shader | datapack`.
+`provider` is `modrinth | curseforge | technic | ftb`. `kind` is `mod | modpack | resourcepack | shader | datapack`.
 
-## Endpunkte
+## Endpoints
 
-### Allgemein
+### General
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/health` | `{"status": "ok", "version": "…", "dataDir": "…"}`; ohne Token erreichbar |
+| GET | `/api/health` | `{"status": "ok", "version": "…", "dataDir": "…"}`; reachable without a token |
 | GET | `/api/settings` | Settings |
-| PATCH | `/api/settings` | Teil-Update, gibt die vollständigen Settings zurück |
-| GET | `/api/jobs` | alle Jobs, neueste zuerst |
-| GET | `/api/jobs/:id` | ein Job |
-| POST | `/api/jobs/:id/cancel` | Abbruch anfordern |
+| PATCH | `/api/settings` | Partial update, returns the complete settings |
+| GET | `/api/jobs` | All jobs, newest first |
+| GET | `/api/jobs/:id` | One job |
+| POST | `/api/jobs/:id/cancel` | Request cancellation |
 
-### Profile
+### Profiles
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/profiles` | Liste |
+| GET | `/api/profiles` | List |
 | POST | `/api/profiles` | `{name, minecraftVersion, loader, loaderVersion?}` → Profile (201) |
-| GET | `/api/profiles/:id` | ein Profil |
-| PATCH | `/api/profiles/:id` | Felder ändern |
-| DELETE | `/api/profiles/:id` | löscht Profil und Dateien |
+| GET | `/api/profiles/:id` | One profile |
+| PATCH | `/api/profiles/:id` | Change fields |
+| DELETE | `/api/profiles/:id` | Deletes the profile and its files |
 
 ### Mods
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/profiles/:id/mods` | scannt `mods/` und liefert `ModFile[]`; erkannte Quellen und Updates sind enthalten, sofern bereits geprüft |
-| POST | `/api/profiles/:id/mods/identify` | Job: Hashes an Modrinth schicken, `source` setzen |
-| POST | `/api/profiles/:id/mods/check-updates` | Job: `update` für alle identifizierten Mods setzen |
-| POST | `/api/profiles/:id/mods/:fileName/update` | Job: Mod auf `update` aktualisieren (altes Jar wird nach `mods/.volt-backup/` verschoben) |
-| POST | `/api/profiles/:id/mods/update-all` | Job: alle verfügbaren Updates einspielen |
-| POST | `/api/profiles/:id/mods/:fileName/toggle` | aktiviert/deaktiviert den Mod |
-| DELETE | `/api/profiles/:id/mods/:fileName` | löscht die Datei |
+| GET | `/api/profiles/:id/mods` | Scans `mods/` and returns `ModFile[]`; detected sources and updates are included if they have already been checked |
+| POST | `/api/profiles/:id/mods/identify` | Job: send hashes to Modrinth, set `source` |
+| POST | `/api/profiles/:id/mods/check-updates` | Job: set `update` for all identified mods |
+| POST | `/api/profiles/:id/mods/:fileName/update` | Job: update the mod to `update` (the old jar is moved to `mods/.volt-backup/`) |
+| POST | `/api/profiles/:id/mods/update-all` | Job: apply all available updates |
+| POST | `/api/profiles/:id/mods/:fileName/toggle` | Enables/disables the mod |
+| DELETE | `/api/profiles/:id/mods/:fileName` | Deletes the file |
 
-### Discover / Provider
+### Discover / Providers
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/providers` | `[{id, name, kinds: [...], configured: bool, message}]` |
 | GET | `/api/providers/:provider/search?q=&kind=&gameVersion=&loader=&categories=&sort=&offset=&limit=` | `{total, items: ProjectSummary[], hasMore, supports}`; `limit` 1–50 |
-| GET | `/api/providers/:provider/filters?kind=` | `{kinds, sorts: [{id, label}], categories: [{id, label}], gameVersions, loaders, supports}`; leere Listen: der Anbieter kann sie nicht auflisten |
-| GET | `/api/providers/:provider/projects/:id` | Detail: ProjectSummary + `description` (Markdown) + `gallery`. CurseForge liefert HTML: die Beschreibung wird in `providers/htmltext.nv` in Markdown umgewandelt (Überschriften, Listen, Links, Bilder; `/linkout`-Weiterleitungen werden aufgelöst, YouTube-iframes werden zu Links, Skripte, Stile und andere iframes entfernt). Modrinth bleibt unverändert. |
+| GET | `/api/providers/:provider/filters?kind=` | `{kinds, sorts: [{id, label}], categories: [{id, label}], gameVersions, loaders, supports}`; empty lists: the provider cannot list them |
+| GET | `/api/providers/:provider/projects/:id` | Detail: ProjectSummary + `description` (Markdown) + `gallery`. CurseForge returns HTML: the description is converted to Markdown in `providers/htmltext.nv` (headings, lists, links, images; `/linkout` redirects are resolved, YouTube iframes become links, scripts, styles, and other iframes are removed). Modrinth stays unchanged. |
 | GET | `/api/providers/:provider/projects/:id/versions?gameVersion=&loader=` | `[{id, name, versionNumber, gameVersions, loaders, fileName, downloadUrl, sha1, datePublished, dependencies}]` |
-| POST | `/api/providers/packs/install` | `{provider, projectId, versionId, name?}` → Job; legt ein Profil mit `source` an. `name` (optional, getrimmt, 1–64 Zeichen, sonst 400) ist der Profilname; ohne `name` der Name des Packs. `source` nennt immer den Namen des Packs. |
-| POST | `/api/profiles/:id/content/install` | `{provider, projectId, versionId, kind}` → Job; installiert eine Datei in das Profil |
+| POST | `/api/providers/packs/install` | `{provider, projectId, versionId, name?}` → Job; creates a profile with `source`. `name` (optional, trimmed, 1–64 characters, otherwise 400) is the profile name; without `name`, the name of the pack is used. `source` always names the pack. |
+| POST | `/api/profiles/:id/content/install` | `{provider, projectId, versionId, kind}` → Job; installs a file into the profile |
 
 ### Launch
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/profiles/:id/install-game` | Job: Minecraft, Loader und Libraries/Assets laden |
-| POST | `/api/profiles/:id/launch` | Job: startet das Spiel (Prozess wird vom Backend überwacht); optionaler Body `quickPlay`, siehe unten |
+| POST | `/api/profiles/:id/install-game` | Job: download Minecraft, loader, and libraries/assets |
+| POST | `/api/profiles/:id/launch` | Job: launches the game (the process is monitored by the backend); optional `quickPlay` body, see below |
 | GET | `/api/profiles/:id/game` | `{running: bool, pid: int|null, startedAt: ISO|null}` |
-| POST | `/api/profiles/:id/game/stop` | beendet den laufenden Prozess |
-| GET | `/api/java` | erkannte Java-Installationen |
+| POST | `/api/profiles/:id/game/stop` | Terminates the running process |
+| GET | `/api/java` | Detected Java installations |
 
-**Quick Play** (`launch/route.nv`, `launch/command.nv`): Der Body von `POST …/launch` darf
-`{"quickPlay": {"mode": "multiplayer", "server": "host"}}` oder `{"quickPlay": {"mode": "multiplayer", "server": "host:port"}}`
-oder `{"quickPlay": {"mode": "singleplayer", "world": "<Ordnername>"}}` enthalten. Ohne Body oder ohne `quickPlay`
-läuft der Start unverändert.
+**Quick Play** (`launch/route.nv`, `launch/command.nv`): The body of `POST …/launch` may contain
+`{"quickPlay": {"mode": "multiplayer", "server": "host"}}` or `{"quickPlay": {"mode": "multiplayer", "server": "host:port"}}`
+or `{"quickPlay": {"mode": "singleplayer", "world": "<folder name>"}}`. Without a body or without `quickPlay`,
+the launch runs unchanged.
 
-- 400 `bad_request`: `mode` ist nicht `multiplayer` oder `singleplayer`; `server` fehlt, ist leer, länger als 255 Zeichen
-  oder enthält Leerzeichen, `/` oder andere Zeichen als Buchstaben, Ziffern, `.`, `-`, `_` (IPv6 in Klammern, Port 1 bis 65535);
-  `world` fehlt, ist leer, `.`, oder enthält `/`, `\` oder `..`.
-- 404 `not_found`: der Weltordner fehlt in `saves/` des Profils.
-- 422 `unsupported` („This Minecraft version cannot open a world from the command line.“): Singleplayer bei einer Version
-  ohne Quick Play. Der Versionsname entscheidet vor dem Job (1.19 und älter, Snapshots vor 23w14a); sonst prüft der Job die Metadaten.
-- Diese Antworten kommen synchron, vor dem Job. Ein gültiger Body ergibt 202 mit dem Job wie bisher.
-- Versionen mit der Regel `has_quick_plays_support` (1.20 und neuer) bekommen `--quickPlayMultiplayer` bzw.
-  `--quickPlaySingleplayer` über die Platzhalter; `${quickPlayPath}` zeigt auf `<Profilordner>/quickPlay/java/quickplay.json`.
-- Ältere Versionen bekommen bei Multiplayer `--server <host> --port <port>` (Port 25565 ohne Angabe) nach den Spielargumenten.
-- Das Launch-Log hat die Zeile `[VoltLauncher] quick play: multiplayer <server>` bzw. `singleplayer <Welt>`; die Kommandozeile
-  enthält das Argument ebenfalls (Access-Token maskiert).
+- 400 `bad_request`: `mode` is not `multiplayer` or `singleplayer`; `server` is missing, empty, longer than 255 characters,
+  or contains spaces, `/`, or characters other than letters, digits, `.`, `-`, `_` (IPv6 in brackets, port 1 to 65535);
+  `world` is missing, empty, `.`, or contains `/`, `\` or `..`.
+- 404 `not_found`: the world folder is missing from the profile's `saves/`.
+- 422 `unsupported` ("This Minecraft version cannot open a world from the command line."): singleplayer on a version
+  without Quick Play. The version name decides before the job (1.19 and older, snapshots before 23w14a); otherwise the job checks the metadata.
+- These responses are returned synchronously, before the job. A valid body yields 202 with the job as before.
+- Versions with the rule `has_quick_plays_support` (1.20 and newer) get `--quickPlayMultiplayer` or
+  `--quickPlaySingleplayer` via the placeholders; `${quickPlayPath}` points to `<profile folder>/quickPlay/java/quickplay.json`.
+- Older versions get `--server <host> --port <port>` for multiplayer (port 25565 if none is given) after the game arguments.
+- The launch log contains the line `[VoltLauncher] quick play: multiplayer <server>` or `singleplayer <world>`; the command line
+  also contains the argument (access token masked).
 
-## Verantwortlichkeiten der Module (Novus)
+## Module responsibilities (Novus)
 
-- `main` — Argumente lesen, Verzeichnisse anlegen, Server starten.
-- `server/` — TCP-Listener (`std/net`), HTTP/1.1-Parser, Router, JSON-Antworten, Token-Prüfung.
-- `core/` — Settings-Datei, Profile-Store (`profiles.json` plus Ordner pro Profil), Job-Registry.
-- `mods/` — Zip-Lesen (Zentralverzeichnis + Inflate), Jar-Metadaten, SHA-1, Modrinth-Update-Prüfung.
-- `providers/` — Modrinth, CurseForge (über die Bridge), Technic, FTB. Pack-Installation.
-- `launch/` — Versionsmanifest, Libraries, Assets, Natives, Java, Fabric/Quilt-Profile,
-  Forge/NeoForge über den Installer, Prozessstart.
+- `main` — read arguments, create directories, start the server.
+- `server/` — TCP listener (`std/net`), HTTP/1.1 parser, router, JSON responses, token check.
+- `core/` — settings file, profile store (`profiles.json` plus one folder per profile), job registry.
+- `mods/` — zip reading (central directory + inflate), jar metadata, SHA-1, Modrinth update check.
+- `providers/` — Modrinth, CurseForge (via the bridge), Technic, FTB. Pack installation.
+- `launch/` — version manifest, libraries, assets, natives, Java, Fabric/Quilt profiles,
+  Forge/NeoForge via the installer, process launch.
 
-Jedes Feature-Modul exponiert genau eine Routing-Funktion:
+Each feature module exposes exactly one routing function:
 
 ```
 method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object>
 ```
 
-Sie gibt `{"status": 200, "body": <JSON-fähiges Objekt>}` zurück oder wirft über
-`core.fail(status, code, message)`, was der Server in die Fehler-Antwort übersetzt.
-`core` ruft die Module anhand des ersten Pfadsegments nach `/api` auf (bzw. nach
-`/api/profiles/:id/…` anhand des dritten Segments).
+It returns `{"status": 200, "body": <JSON-serializable object>}` or throws via
+`core.fail(status, code, message)`, which the server translates into the error response.
+`core` calls the modules based on the first path segment after `/api` (or, for
+`/api/profiles/:id/…`, based on the third segment).
 
-## Profilverwaltung (P1, `profilemgmt/`)
+## Profile management (P1, `profilemgmt/`)
 
-Zusätzliche Profilfelder (alle optional beim Anlegen; `null` = Standard):
+Additional profile fields (all optional on creation; `null` = default):
 
-| Feld | Typ | Bedeutung |
+| Field | Type | Meaning |
 | --- | --- | --- |
-| `gameDirectory` | `string \| null` | eigenes Spielverzeichnis (absolut); `null` = verwaltetes Verzeichnis |
-| `gameDir` | string | wirksames Spielverzeichnis, nur lesend |
-| `wrapperCommand` | `string \| null` | Befehl vor `java` (z. B. `gamemoderun`) |
-| `preLaunchCommand` | `string \| null` | Shell-Befehl vor dem Start; Exit-Code ≠ 0 bricht den Start ab |
-| `postExitCommand` | `string \| null` | Shell-Befehl nach dem Beenden des Spiels |
-| `envVars` | `{NAME: "wert"}` | Umgebungsvariablen (Namen: Buchstaben, Ziffern, `_`) |
-| `fullscreen` | bool | startet Minecraft mit `--fullscreen` |
-| `hideLauncher` | `bool \| null` | Launcher beim Start ausblenden; `null` = globale Einstellung `closeOnLaunch` |
-| `favourite` | bool | Favorit (sortiert nach vorn) |
-| `group` | `string \| null` | Gruppe, unter der das Profil erscheint |
-| `iconUrl` | `string \| null` | Data-URL (PNG, JPEG, GIF, WebP, höchstens 300 KB) |
-| `totalPlaytimeMs` | int | Spielzeit über alle Sitzungen, nur lesend |
+| `gameDirectory` | `string \| null` | Custom game directory (absolute); `null` = managed directory |
+| `gameDir` | string | Effective game directory, read-only |
+| `wrapperCommand` | `string \| null` | Command placed before `java` (e.g. `gamemoderun`) |
+| `preLaunchCommand` | `string \| null` | Shell command before launch; an exit code ≠ 0 aborts the launch |
+| `postExitCommand` | `string \| null` | Shell command after the game exits |
+| `envVars` | `{NAME: "value"}` | Environment variables (names: letters, digits, `_`) |
+| `fullscreen` | bool | Starts Minecraft with `--fullscreen` |
+| `hideLauncher` | `bool \| null` | Hide the launcher on launch; `null` = global setting `closeOnLaunch` |
+| `favourite` | bool | Favourite (sorted to the front) |
+| `group` | `string \| null` | Group under which the profile appears |
+| `iconUrl` | `string \| null` | Data URL (PNG, JPEG, GIF, WebP, at most 300 KB) |
+| `totalPlaytimeMs` | int | Playtime across all sessions, read-only |
 
-Alle änderbaren Felder gehen über `PATCH /api/profiles/:id`. `GET /api/profiles/:id/game` liefert
-zusätzlich `phase` (`idle | running | stopping | install-game | launch | verify | duplicate`).
+All modifiable fields go through `PATCH /api/profiles/:id`. `GET /api/profiles/:id/game` additionally
+returns `phase` (`idle | running | stopping | install-game | launch | verify | duplicate`).
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/profiles` | Liste; jedes Profil mit `running` und `phase` |
+| GET | `/api/profiles` | List; each profile with `running` and `phase` |
 | GET | `/api/profiles/groups` | `["Modpacks", …]` |
-| POST | `/api/profiles/:id/duplicate` | `{name?}` → Job; Ergebnis `{profileId, name}`; kopiert das Spielverzeichnis |
-| POST | `/api/profiles/:id/icon` | `{dataUrl}` → Profil mit `iconUrl` |
-| POST | `/api/profiles/:id/verify` | `{repair?}` → Job; Ergebnis ist der Bericht |
-| GET | `/api/profiles/:id/verify` | `{report}` der letzten Prüfung, sonst `null` |
-| GET | `/api/versions?includeSnapshots=&includeBetas=&includeAlphas=` | `[{id, type, releaseTime}]` aus dem Mojang-Manifest |
-| GET | `/api/loader-versions?platformId=&minecraftVersionId=` | `[{id, stable}]`, neueste zuerst; leer bei `vanilla` |
+| POST | `/api/profiles/:id/duplicate` | `{name?}` → Job; result `{profileId, name}`; copies the game directory |
+| POST | `/api/profiles/:id/icon` | `{dataUrl}` → Profile with `iconUrl` |
+| POST | `/api/profiles/:id/verify` | `{repair?}` → Job; the result is the report |
+| GET | `/api/profiles/:id/verify` | `{report}` of the last check, otherwise `null` |
+| GET | `/api/versions?includeSnapshots=&includeBetas=&includeAlphas=` | `[{id, type, releaseTime}]` from the Mojang manifest |
+| GET | `/api/loader-versions?platformId=&minecraftVersionId=` | `[{id, stable}]`, newest first; empty for `vanilla` |
 
-Die Plattformliste (`GET /api/platforms`) liefert das Modul `system`.
+The platform list (`GET /api/platforms`) is provided by the `system` module.
 
-Bericht der Prüfung: `{checkedAt, libraries: {checked, brokenBefore, brokenAfter, examples}, client: {okBefore, okAfter}, repaired, ok}`.
+Verification report: `{checkedAt, libraries: {checked, brokenBefore, brokenAfter, examples}, client: {okBefore, okAfter}, repaired, ok}`.
 
-## Entdecken und Oberfläche (P6, `providers/`, `core/settings.nv`)
+## Discover and UI (P6, `providers/`, `core/settings.nv`)
 
-Erweiterungen, alle additiv; ohne die neuen Parameter verhält sich alles wie vorher.
+Extensions, all additive; without the new parameters everything behaves as before.
 
-**Settings** (neue Schlüssel, Standardwerte in Klammern):
+**Settings** (new keys, defaults in parentheses):
 
-| Schlüssel | Typ | Wirkung |
+| Key | Type | Effect |
 | --- | --- | --- |
-| `accentColor` | `"#rrggbb"` (`#00b2ff`) | Akzentfarbe; der Standardwert nutzt die Farben des Designs |
-| `uiScale` | `compact \| default \| comfortable` (`default`) | Oberflächengröße (0,9 / 1 / 1,12, per CSS-Zoom) |
-| `animationsEnabled` | bool (`true`) | Übergänge und Animationen an oder aus |
+| `accentColor` | `"#rrggbb"` (`#00b2ff`) | Accent colour; the default value uses the colours of the theme |
+| `uiScale` | `compact \| default \| comfortable` (`default`) | UI size (0.9 / 1 / 1.12, via CSS zoom) |
+| `animationsEnabled` | bool (`true`) | Turns transitions and animations on or off |
 
 **Discover**
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/providers` | jeder Eintrag zusätzlich mit `sorts`: die Sortierwerte, die der Anbieter wirklich auswertet |
-| GET | `/api/providers/:provider/search?…&categories=&sort=` | `categories`: Modrinth-Kategorien (UND-Verknüpfung) bzw. CurseForge-Kategorie-IDs (eine als `categoryId`, mehrere als `categoryIds`); `sort`: einer der `sorts` des Anbieters, sonst `relevance`. Jeder Anbieter nimmt alle Parameter an; `supports` zeigt, was er wirklich auswertet. |
-| GET | `/api/providers/:provider/filters?kind=` | Filter der Oberfläche: `sorts` (mit Beschriftung), `categories` (`{id, label}`), `gameVersions`, `loaders` und `supports` (`search, kind, sort, categories, gameVersion, loader, paging`). Fehlt `kind`, gilt der Standard des Anbieters (`mod`, bei Technic und FTB `modpack`). |
-| GET | `/api/providers/:provider/categories?kind=` | die IDs aus `/filters` (`["optimization", …]`); nur Modrinth und CurseForge haben Kategorien, sonst `[]` |
+| GET | `/api/providers` | Each entry additionally has `sorts`: the sort values the provider actually evaluates |
+| GET | `/api/providers/:provider/search?…&categories=&sort=` | `categories`: Modrinth categories (AND combination) or CurseForge category IDs (one as `categoryId`, several as `categoryIds`); `sort`: one of the provider's `sorts`, otherwise `relevance`. Every provider accepts all parameters; `supports` shows what it actually evaluates. |
+| GET | `/api/providers/:provider/filters?kind=` | UI filters: `sorts` (with labels), `categories` (`{id, label}`), `gameVersions`, `loaders`, and `supports` (`search, kind, sort, categories, gameVersion, loader, paging`). If `kind` is missing, the provider's default applies (`mod`, for Technic and FTB `modpack`). |
+| GET | `/api/providers/:provider/categories?kind=` | The IDs from `/filters` (`["optimization", …]`); only Modrinth and CurseForge have categories, otherwise `[]` |
 
-Sortierungen und Unterstützung je Anbieter (`filters.nv`, `supports` in der Antwort):
+Sorting and support per provider (`filters.nv`, `supports` in the response):
 
-| Anbieter | `sort` | nicht unterstützt (`supports` = false) |
+| Provider | `sort` | Not supported (`supports` = false) |
 | --- | --- | --- |
-| Modrinth | `relevance, downloads, follows, newest, updated` | nichts |
-| CurseForge (Bridge) | `relevance` (Featured), `follows` (Popularity), `updated`, `name` (A–Z), `downloads`, `newest` (Release date) | alles, solange die Bridge nicht läuft (Antwort: leere Listen, Suche 502). Versionsliste: leer, da die Bridge sie nicht weiterleitet. Loader fest: `fabric, forge, neoforge, quilt` |
-| Technic | `relevance`, `popular` (Reihenfolge von `/trending`), `downloads` (Installs), `follows` (Runs) | `categories`, `loader` (der Loader steht nur im Build-Archiv) |
-| FTB | `relevance`, `downloads` (Installs), `follows` (Plays), `updated` | `categories` (FTB hat keine). Version und Loader kommen aus den `targets` der Packs. |
+| Modrinth | `relevance, downloads, follows, newest, updated` | nothing |
+| CurseForge (bridge) | `relevance` (Featured), `follows` (Popularity), `updated`, `name` (A–Z), `downloads`, `newest` (Release date) | everything, as long as the bridge is not running (response: empty lists, search 502). Version list: empty, because the bridge does not forward it. Loaders fixed: `fabric, forge, neoforge, quilt` |
+| Technic | `relevance`, `popular` (order of `/trending`), `downloads` (installs), `follows` (runs) | `categories`, `loader` (the loader is only in the build archive) |
+| FTB | `relevance`, `downloads` (installs), `follows` (plays), `updated` | `categories` (FTB has none). Version and loader come from the packs' `targets`. |
 
-`hasMore` ist `offset + Anzahl < total`. Jede Sortierung außer `relevance` bei FTB liest die Dokumente der Kandidaten (aus dem Cache) und sortiert sie; FTB-Listen sind nur ungefähr geordnet.
-| POST | `/api/profiles/:id/content/install` | `versionId` darf fehlen: dann wird die neueste passende Version gewählt (Schnell-Hinzufügen). `withDependencies` (bool, Standard `true`) schaltet die Abhängigkeiten ab (nur Mods). |
+`hasMore` is `offset + count < total`. Every sort except `relevance` on FTB reads the candidates' documents (from the cache) and sorts them; FTB lists are only roughly ordered.
+| POST | `/api/profiles/:id/content/install` | `versionId` may be omitted: then the newest matching version is chosen (quick add). `withDependencies` (bool, default `true`) turns off dependencies (mods only). |
 
-Versionen (`GET …/versions`) enthalten `releaseType` (`release | beta | alpha`); das war bereits vorhanden.
+Versions (`GET …/versions`) contain `releaseType` (`release | beta | alpha`); this already existed.
 
-Beispiele:
+Examples:
 
 ```
 GET  /api/providers/modrinth/search?kind=mod&categories=optimization,utility&sort=downloads&limit=20
@@ -340,101 +340,101 @@ GET  /api/providers/technic/search?q=tekkit&sort=popular
 POST /api/profiles/a1b2c3d4e5f6/content/install  {"provider":"modrinth","projectId":"YL57xq9U","kind":"mod","withDependencies":false}
 ```
 
-## Spieldaten (P2, `gamedata/`)
+## Game data (P2, `gamedata/`)
 
-Welten, Serverliste, Screenshots, Logs und Backups eines Profils. Alle Pfade liegen unter `/api/profiles/:id/`.
+Worlds, server list, screenshots, logs, and backups of a profile. All paths are under `/api/profiles/:id/`.
 
-- Welten liegen in `<gameDir>/saves/<Ordner>/`. Der Name steht in `level.dat` (gzip-NBT), nicht im Ordnernamen. Umbenennen schreibt `level.dat` neu; der Ordner bleibt.
-- Serverliste: `<gameDir>/servers.dat` (unkomprimiertes NBT). Ein Eintrag wird über seinen Index angesprochen, wie im Spiel.
-- Backups liegen außerhalb des Profils: `<dataDir>/backups/<profileId>/<Zeitstempel>.zip` mit Sidecar `<Zeitstempel>.json`. Die Anzahl richtet sich nach `backupsToKeep`.
-- Lange Vorgänge (Welt duplizieren, Welt kopieren, Backup erstellen, Backup wiederherstellen) antworten mit `202` und einem Job. Das Ergebnis steht in `result`.
-- Ein Profil ist während eines Vorgangs belegt: andere Änderungen daran antworten mit `409`. Läuft das Spiel des Profils, antworten Änderungen an Welten, Serverliste und Backups ebenfalls mit `409`.
+- Worlds are located in `<gameDir>/saves/<folder>/`. The name is stored in `level.dat` (gzip NBT), not in the folder name. Renaming rewrites `level.dat`; the folder stays.
+- Server list: `<gameDir>/servers.dat` (uncompressed NBT). An entry is addressed by its index, as in the game.
+- Backups are located outside the profile: `<dataDir>/backups/<profileId>/<timestamp>.zip` with sidecar `<timestamp>.json`. The number kept is governed by `backupsToKeep`.
+- Long-running operations (duplicate world, copy world, create backup, restore backup) respond with `202` and a job. The result is in `result`.
+- A profile is locked during an operation: other changes to it respond with `409`. If the profile's game is running, changes to worlds, the server list, and backups also respond with `409`.
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/worlds` | `{"worlds": [World]}`, neueste zuerst |
-| PATCH | `/worlds/:folder` | `{"name"}` benennt um → `{"world"}` |
-| DELETE | `/worlds/:folder` | löscht den Ordner → `{"deleted"}` |
+| GET | `/worlds` | `{"worlds": [World]}`, newest first |
+| PATCH | `/worlds/:folder` | `{"name"}` renames → `{"world"}` |
+| DELETE | `/worlds/:folder` | Deletes the folder → `{"deleted"}` |
 | GET | `/worlds/:folder/icon` | `{"dataUrl": "data:image/png;base64,…" \| null}` |
 | POST | `/worlds/:folder/duplicate` | `{"name"?}` → Job (`result.world`) |
 | POST | `/worlds/:folder/copy` | `{"targetProfileId"}` → Job (`result.world`, `result.profileId`) |
 | GET | `/servers` | `{"servers": [Server]}` |
-| POST | `/servers` | `{"name"?, "address"}` → 201 `{"server"}`; ohne Name gilt die Adresse |
-| PATCH | `/servers/:index` | `{"name"?, "address"?}` → `{"server"}`; nicht gesendete Felder bleiben |
+| POST | `/servers` | `{"name"?, "address"}` → 201 `{"server"}`; without a name, the address is used |
+| PATCH | `/servers/:index` | `{"name"?, "address"?}` → `{"server"}`; fields not sent are kept |
 | DELETE | `/servers/:index` | → `{"deleted"}` |
 | GET | `/screenshots` | `{"screenshots": [Screenshot]}` |
-| GET | `/screenshots/:file/image` | `{"dataUrl", "contentType"}` (JSON, da die API nur JSON liefert) |
+| GET | `/screenshots/:file/image` | `{"dataUrl", "contentType"}` (JSON, since the API only serves JSON) |
 | DELETE | `/screenshots/:file` | → `{"deleted"}` |
-| POST | `/screenshots/open-folder` | `{"path"}`; die App öffnet den Ordner (`openPath`) |
-| GET | `/logs` | `{"logs": [LogSource]}`; ids: `launcher`, `game:<datei>`, `crash:<datei>` |
+| POST | `/screenshots/open-folder` | `{"path"}`; the app opens the folder (`openPath`) |
+| GET | `/logs` | `{"logs": [LogSource]}`; ids: `launcher`, `game:<file>`, `crash:<file>` |
 | GET | `/logs/latest-crash` | `{"log": LogSource \| null}` |
-| GET | `/logs/:logId?offset=&maxBytes=` | `LogChunk`; `offset` negativ = Ende der Datei, Standard 128 KB, höchstens 512 KB |
-| DELETE | `/logs/:logId` | leert nur die Launcher-Konsole (`launcher`) |
+| GET | `/logs/:logId?offset=&maxBytes=` | `LogChunk`; negative `offset` = end of file, default 128 KB, at most 512 KB |
+| DELETE | `/logs/:logId` | Clears only the launcher console (`launcher`) |
 | POST | `/logs/:logId/open-folder` | `{"path"}` |
-| GET | `/backups` | `{"backups": [Backup]}`, neueste zuerst |
+| GET | `/backups` | `{"backups": [Backup]}`, newest first |
 | POST | `/backups` | `{"label"?}` → Job (`result.backupId`) |
-| POST | `/backups/:backupId/restore` | → Job; der Spielordner wird zur Seite geschoben und erst nach Erfolg gelöscht |
+| POST | `/backups/:backupId/restore` | → Job; the game folder is set aside and only deleted after success |
 | DELETE | `/backups/:backupId` | → `{"deleted"}` |
 | POST | `/backups/open-folder` | `{"path"}` |
 
-Datenmodelle (Auszug): **World** `{folderName, name, lastPlayed (ISO), sizeBytes, gameMode, hardcore, versionName, hasIcon, readable, problem}`; **Server** `{index, name, address, icon (data URL oder ""), acceptTextures}`; **LogSource** `{id, label, kind (launcher | game | crash), sizeBytes, modifiedAt, live, compressed}`; **LogChunk** `{id, offset, nextOffset, size, text, truncated}`; **Backup** `{id, label, createdAt, sizeBytes, minecraftVersion, loader, fileCount}`.
+Data models (excerpt): **World** `{folderName, name, lastPlayed (ISO), sizeBytes, gameMode, hardcore, versionName, hasIcon, readable, problem}`; **Server** `{index, name, address, icon (data URL or ""), acceptTextures}`; **LogSource** `{id, label, kind (launcher | game | crash), sizeBytes, modifiedAt, live, compressed}`; **LogChunk** `{id, offset, nextOffset, size, text, truncated}`; **Backup** `{id, label, createdAt, sizeBytes, minecraftVersion, loader, fileCount}`.
 
-Beispiele:
+Examples:
 
 ```
 GET    /api/profiles/a1b2c3d4e5f6/worlds
-PATCH  /api/profiles/a1b2c3d4e5f6/worlds/New%20World          {"name": "Mein Bau"}
+PATCH  /api/profiles/a1b2c3d4e5f6/worlds/New%20World          {"name": "My Build"}
 POST   /api/profiles/a1b2c3d4e5f6/worlds/New%20World/copy     {"targetProfileId": "0f1e2d3c4b5a"}
-POST   /api/profiles/a1b2c3d4e5f6/servers                     {"name": "Freunde", "address": "play.example.org"}
+POST   /api/profiles/a1b2c3d4e5f6/servers                     {"name": "Friends", "address": "play.example.org"}
 GET    /api/profiles/a1b2c3d4e5f6/logs/game%3Alatest.log?offset=-1&maxBytes=65536
-POST   /api/profiles/a1b2c3d4e5f6/backups                     {"label": "vor Modpack-Update"}
+POST   /api/profiles/a1b2c3d4e5f6/backups                     {"label": "before modpack update"}
 POST   /api/profiles/a1b2c3d4e5f6/backups/20261010-120000.zip/restore
 ```
 
-Hinweise: Ein Backup ist ein ZIP (gespeichert oder deflate, UTF-8-Namen, ohne ZIP64), das das Backend selbst schreibt; das Wiederherstellen liest es über den Jar-Leser aus `mods/zip.nv`. Logs werden als ganze Datei gelesen (die Laufzeit hat kein Teil-Lesen); eine Anfrage pro Abruf kostet deshalb die Dateigröße.
+Notes: A backup is a ZIP (stored or deflate, UTF-8 names, no ZIP64) that the backend writes itself; restoring reads it via the jar reader from `mods/zip.nv`. Logs are read as a whole file (the runtime has no partial reads); each request therefore costs the file size.
 
-## System, Einstellungen, Integrationen (P4, `system/`, `core/settings.nv`)
+## System, settings, integrations (P4, `system/`, `core/settings.nv`)
 
-Einstellungen: `core/settings.nv` (Defaults und Regeln); Zurücksetzen über `POST /api/settings/reset`.
-Die Schlüssel der alten Oberfläche sind auf das Modell abgebildet, außerdem neu: `minMemoryMb`, `defaultJvmArgs`,
+Settings: `core/settings.nv` (defaults and rules); reset via `POST /api/settings/reset`.
+The keys of the old UI are mapped onto the model; new additions are: `minMemoryMb`, `defaultJvmArgs`,
 `javaRuntimes` (`[{majorVersion, path}]`), `openLogsOnLaunch`, `offlineModeAllowed`, `backupsToKeep`,
 `backupBeforePackUpdate`, `profileSort` (`lastPlayed | name | createdAt`), `favouritesFirst`, `showFps`,
 `discordPresence`, `discordApplicationId`, `autoUpdate`, `betaUpdates`.
-`bridgeUrl` und `discordApplicationId` sind fest (Standardwert des Launchers): `PATCH /api/settings` mit einem dieser Schlüssel
-antwortet 400 `bad_request` („… is fixed by the launcher“) und ändert nichts; in `settings.json` gespeicherte Werte werden beim Laden
-ignoriert. `GET /api/settings` zeigt beide. Der Schlüssel `updateRepository` ist entfallen; Updates kommen vom CDN (siehe unten).
-Die alte Option „Beim Start ausblenden“ ist in `closeOnLaunch` zusammengeführt.
+`bridgeUrl` and `discordApplicationId` are fixed (launcher default value): `PATCH /api/settings` with either of these keys
+responds with 400 `bad_request` ("… is fixed by the launcher") and changes nothing; values stored in `settings.json` are
+ignored on load. `GET /api/settings` shows both. The key `updateRepository` has been removed; updates come from the CDN (see below).
+The old option "Hide on launch" has been merged into `closeOnLaunch`.
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/settings/reset` | alle Einstellungen auf Standard; antwortet mit den Settings |
+| POST | `/api/settings/reset` | Resets all settings to defaults; responds with the settings |
 | GET | `/api/settings/directories` | `[{id, label, path}]` (`root, profiles, logs, exports, backups, updates, runtimes, cache`) |
-| POST | `/api/settings/directories/:id/open` | legt den Ordner an und antwortet `{path}`; die Oberfläche öffnet ihn über Electron |
-| GET | `/api/updates[?force=1]` | `UpdateInfo` (Cache 10 min); nicht erreichbares oder noch nicht veröffentlichtes Manifest (HTTP 404): `available: false` mit Grund in `reason` |
-| POST | `/api/updates/download` | Job (202); Ergebnis `{path, fileName, directory, verified}`; Ziel `<dataDir>/updates/` |
-| POST | `/api/updates/open-release` | `{url}` der Release-Seite (`https://cdn.volt-launcher.app/download/volt-launcher/version/latest/`) |
+| POST | `/api/settings/directories/:id/open` | Creates the folder and responds with `{path}`; the UI opens it via Electron |
+| GET | `/api/updates[?force=1]` | `UpdateInfo` (cache 10 min); manifest unreachable or not yet published (HTTP 404): `available: false` with the reason in `reason` |
+| POST | `/api/updates/download` | Job (202); result `{path, fileName, directory, verified}`; target `<dataDir>/updates/` |
+| POST | `/api/updates/open-release` | `{url}` of the release page (`https://cdn.volt-launcher.app/download/volt-launcher/version/latest/`) |
 | GET | `/api/integrations/discord` | `{state, message, transport, configured, enabled}`; `state` = `disabled | not_configured | waiting_for_discord | rejected | connected` |
 | GET | `/api/java/runtimes` | `{detected, managed, installable, configured, installing}` |
-| POST | `/api/java/runtimes/:major/install` | Job (202); Ergebnis `{majorVersion, javaPath}`; eine Installation pro Version |
-| GET | `/api/platforms` | `[{id, displayName}]` der Loader |
+| POST | `/api/java/runtimes/:major/install` | Job (202); result `{majorVersion, javaPath}`; one installation per version |
+| GET | `/api/platforms` | `[{id, displayName}]` of the loaders |
 
-`UpdateInfo`: `{available, currentVersion, latestVersion, name, notes, publishedAt, releaseUrl, assetName, downloadable, assetSize, prerelease, reason, checksumSha512}`; `checksumSha512` ist der Hex-Wert.
+`UpdateInfo`: `{available, currentVersion, latestVersion, name, notes, publishedAt, releaseUrl, assetName, downloadable, assetSize, prerelease, reason, checksumSha512}`; `checksumSha512` is the hex value.
 
-Updates kommen aus dem CDN: `https://cdn.volt-launcher.app/download/volt-launcher/version/latest/latest.json` (fest, `system/updates.nv`),
-im Format des Veröffentlichungsskripts von Lumen IDE: `product`, `version`, `releaseDate`, `notes`, `platforms.<plattform>` mit
-`version`, `releaseDate`, `update: {name, size, sha512}` und `files: [{name, size, sha512}]`. Plattformen: `linux_amd64`, `linux_aarch64`,
-`windows_x86_64`, `windows_arm64`, `macos_arm64`; die des Rechners kommt aus `os.platform()` und `uname -m` bzw. `PROCESSOR_ARCHITECTURE`.
-Der Installer ist `update`, sonst die erste Datei von `files`, und liegt unter `<feed>/<plattform>/<name>`. Neuer ist eine größere
-Version nach Lumens `compareVersions` (Vorabversionen nur mit `betaUpdates`). Geprüft werden Größe und SHA-512: der base64-Wert aus dem
-Manifest wird zu Hex dekodiert und mit dem Hex-Digest der Datei verglichen (`sha512sum`, `shasum -a 512` oder `certutil`). Schlägt die
-Prüfung fehl, wird die Datei gelöscht und der Job scheitert.
+Updates come from the CDN: `https://cdn.volt-launcher.app/download/volt-launcher/version/latest/latest.json` (fixed, `system/updates.nv`),
+in the format of Lumen IDE's publishing script: `product`, `version`, `releaseDate`, `notes`, `platforms.<platform>` with
+`version`, `releaseDate`, `update: {name, size, sha512}` and `files: [{name, size, sha512}]`. Platforms: `linux_amd64`, `linux_aarch64`,
+`windows_x86_64`, `windows_arm64`, `macos_arm64`; the machine's platform is derived from `os.platform()` and `uname -m` or `PROCESSOR_ARCHITECTURE`.
+The installer is `update`, otherwise the first entry of `files`, and is located at `<feed>/<platform>/<name>`. A version is newer if it is greater
+according to Lumen's `compareVersions` (prereleases only with `betaUpdates`). Size and SHA-512 are verified: the base64 value from the
+manifest is decoded to hex and compared with the file's hex digest (`sha512sum`, `shasum -a 512`, or `certutil`). If the
+check fails, the file is deleted and the job fails.
 
-Discord: Rich Presence über den lokalen IPC-Socket (Unix-Socket mit `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp` sowie
-Flatpak- und Snap-Unterordner; Windows-Named-Pipe `\\.\pipe\discord-ipc-N`). Die Socket-Aufrufe sind ein kleiner C-Block
-in `system/discord.nv`. Läuft Discord nicht, bleibt der Zustand `waiting_for_discord`; es gibt keinen Fehler.
-Andere Module setzen den angezeigten Status mit `systemDiscordSetActivity(details, state, startedAtMs)`.
+Discord: Rich Presence over the local IPC socket (Unix socket using `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp`, as well as
+Flatpak and Snap subfolders; Windows named pipe `\\.\pipe\discord-ipc-N`). The socket calls are a small C block
+in `system/discord.nv`. If Discord is not running, the state stays `waiting_for_discord`; there is no error.
+Other modules set the displayed status with `systemDiscordSetActivity(details, state, startedAtMs)`.
 
-Beispiele:
+Examples:
 
 ```
 GET  /api/settings/directories
@@ -447,290 +447,290 @@ POST /api/java/runtimes/21/install
 PATCH /api/settings                       {"backupsToKeep": 3}
 ```
 
-## Konten und Skins (P3, `accounts/`)
+## Accounts and skins (P3, `accounts/`)
 
-Das Modul `backend/src/accounts/` besitzt Konten (Microsoft und offline), die Anmeldung und die Skin-Bibliothek.
-Der Launch übernimmt das ausgewählte Konto über `accountsLaunchSession()` (Name, UUID ohne Bindestriche,
-Access-Token, Benutzertyp, XUID); ohne Anmeldung startet das Spiel mit dem offline Standardkonto „Player“.
+The module `backend/src/accounts/` owns accounts (Microsoft and offline), sign-in, and the skin library.
+Launch takes the selected account via `accountsLaunchSession()` (name, UUID without hyphens,
+access token, user type, XUID); without sign-in, the game starts with the offline default account "Player".
 
-**Kontospeicher.** `<dataDir>/accounts/accounts.enc` enthält alle Konten einschließlich Tokens, verschlüsselt.
-`std/crypto` bietet nur AES-128 im CFB-8-Modus (kein GCM, kein AES-256, kein HMAC). Deshalb gilt
-Encrypt-then-MAC: AES-128-CFB8 mit zufälligem 16-Byte-IV je Speichervorgang, HMAC-SHA256 über `iv || ciphertext`
-(aus `crypto.sha256` gebaut). Beide Schlüssel werden per HMAC aus einem 32-Byte-Hauptschlüssel abgeleitet
-(`<dataDir>/accounts/master.key`, base64, nur Eigentümer-Rechte; der Schlüssel wird beim ersten Speichern erzeugt).
-Eine beschädigte Datei oder ein falscher Schlüssel führt zu einem Fehler und wird nie durch einen leeren Speicher ersetzt.
-Tokens erscheinen nie in Logs, in Antworten oder auf der Kommandozeile: Der Authorization-Header wird aus einer
-Datei unter `<dataDir>/accounts/tmp` (nur Eigentümer) an curl übergeben, und die Startzeile im Spiel-Log
-ist maskiert (`launchMaskedCommand`).
+**Account store.** `<dataDir>/accounts/accounts.enc` contains all accounts including tokens, encrypted.
+`std/crypto` offers only AES-128 in CFB-8 mode (no GCM, no AES-256, no HMAC). Therefore
+encrypt-then-MAC applies: AES-128-CFB8 with a random 16-byte IV per save operation, HMAC-SHA256 over `iv || ciphertext`
+(built from `crypto.sha256`). Both keys are derived via HMAC from a 32-byte master key
+(`<dataDir>/accounts/master.key`, base64, owner-only permissions; the key is generated on first save).
+A corrupted file or a wrong key results in an error and is never replaced by an empty store.
+Tokens never appear in logs, in responses, or on the command line: the Authorization header is passed to curl from a
+file under `<dataDir>/accounts/tmp` (owner only), and the launch line in the game log
+is masked (`launchMaskedCommand`).
 
-**Anmeldung.** OAuth 2.0 Authorization Code mit PKCE (S256) über den öffentlichen Xbox-Client; die Weiterleitung geht an
-`https://login.live.com/oauth20_desktop.srf`, die einzige für diesen Client erlaubte URI. Danach folgt die Kette
-Microsoft-Token → Xbox Live → XSTS → Minecraft-Login → Profil (`api.minecraftservices.com/minecraft/profile`).
-Der Browser endet auf `…/oauth20_desktop.srf?code=…&state=…`. Diese Adresse (vollständig) gibt die Oberfläche an
-`POST /api/accounts/callback` weiter, wo der Tausch als Job läuft. Das Backend selbst nimmt keine Weiterleitung entgegen.
-Offene Anmeldungen liegen nur im Speicher (10 Minuten, Einmalverwendung).
+**Sign-in.** OAuth 2.0 Authorization Code with PKCE (S256) via the public Xbox client; the redirect goes to
+`https://login.live.com/oauth20_desktop.srf`, the only URI allowed for this client. The chain follows:
+Microsoft token → Xbox Live → XSTS → Minecraft login → profile (`api.minecraftservices.com/minecraft/profile`).
+The browser ends up at `…/oauth20_desktop.srf?code=…&state=…`. The UI passes this address (in full) on to
+`POST /api/accounts/callback`, where the exchange runs as a job. The backend itself does not accept a redirect.
+Pending sign-ins are kept in memory only (10 minutes, single use).
 
-**Skins.** `<dataDir>/skins/skins.json` (Metadaten, nicht geheim) und `<dataDir>/skins/<id>.png`. Erlaubt sind PNG-Dateien
-mit 64×64 oder 64×32 Pixeln bis 2 MB. Übernehmen lädt das PNG als multipart (`variant`, `file`) an
-`api.minecraftservices.com/minecraft/profile/skins` hoch; erst danach gilt der Skin als ausgewählt. Auch das läuft als Job.
+**Skins.** `<dataDir>/skins/skins.json` (metadata, not secret) and `<dataDir>/skins/<id>.png`. PNG files
+of 64×64 or 64×32 pixels up to 2 MB are allowed. Applying uploads the PNG as multipart (`variant`, `file`) to
+`api.minecraftservices.com/minecraft/profile/skins`; only after that is the skin considered selected. This also runs as a job.
 
-Endpunkte (Pfade mit Konten-IDs als Bindestrich-UUIDs):
+Endpoints (paths with account IDs as hyphenated UUIDs):
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/accounts` | `{accounts: [{id, name, type, selected, default, usable, skinDataUrl, skinError}], selectedId, offlineMode}`; das Standardkonto „Player“ steht immer vorn. `skinDataUrl` ist das PNG des aktuellen Skins (nur Microsoft, sonst `null`), `skinError` ist `null` oder ein kurzer Grund, wenn der Skin nicht geladen werden konnte |
-| GET | `/api/accounts/session` | `{authenticated, id, name, type}` des ausgewählten Kontos (ohne Tokens) |
-| POST | `/api/accounts/login` | `{state, url, expiresAt}`; die Oberfläche öffnet `url` im Browser |
-| POST | `/api/accounts/callback` | `{state, code}` oder `{state, error, error_description}`; 202 mit Job (`kind: account-login`, Ergebnis `{id, name}`) |
-| POST | `/api/accounts/logout` | entfernt alle Microsoft-Konten; Offline-Konten bleiben |
-| POST | `/api/accounts/offline` | `{name}` (3–16 Zeichen, Buchstaben, Ziffern, `_`); 201 mit `{account, …}` |
-| POST | `/api/accounts/offline-mode` | `{enabled}`; an: offline Konto, aus: letztes Microsoft-Konto (409 ohne Microsoft-Konto) |
-| POST | `/api/accounts/:id/select` | Konto auswählen |
-| DELETE | `/api/accounts/:id` | Konto entfernen (das Standardkonto nicht, 409) |
+| GET | `/api/accounts` | `{accounts: [{id, name, type, selected, default, usable, skinDataUrl, skinError}], selectedId, offlineMode}`; the default account "Player" always comes first. `skinDataUrl` is the PNG of the current skin (Microsoft only, otherwise `null`), `skinError` is `null` or a short reason if the skin could not be loaded |
+| GET | `/api/accounts/session` | `{authenticated, id, name, type}` of the selected account (without tokens) |
+| POST | `/api/accounts/login` | `{state, url, expiresAt}`; the UI opens `url` in the browser |
+| POST | `/api/accounts/callback` | `{state, code}` or `{state, error, error_description}`; 202 with job (`kind: account-login`, result `{id, name}`) |
+| POST | `/api/accounts/logout` | Removes all Microsoft accounts; offline accounts remain |
+| POST | `/api/accounts/offline` | `{name}` (3–16 characters, letters, digits, `_`); 201 with `{account, …}` |
+| POST | `/api/accounts/offline-mode` | `{enabled}`; on: offline account, off: last Microsoft account (409 without a Microsoft account) |
+| POST | `/api/accounts/:id/select` | Select account |
+| DELETE | `/api/accounts/:id` | Remove account (not the default account, 409) |
 | GET | `/api/skins` | `{skins: [{id, name, slim, createdAt, selected, imageDataUrl}], selectedSkinId}` |
-| POST | `/api/skins` | `{name, slim, imageBase64}` (data-URL-Präfix erlaubt); 201 mit `{skin}` |
-| GET | `/api/skins/:id` | ein Skin mit Vorschau (`imageDataUrl`) |
+| POST | `/api/skins` | `{name, slim, imageBase64}` (data URL prefix allowed); 201 with `{skin}` |
+| GET | `/api/skins/:id` | One skin with preview (`imageDataUrl`) |
 | PATCH | `/api/skins/:id` | `{name}` |
-| DELETE | `/api/skins/:id` | löscht Metadaten und PNG |
-| POST | `/api/skins/:id/select` | 202 mit Job (`kind: skin-apply`, Ergebnis `{skin}`); 409, wenn kein Microsoft-Konto ausgewählt ist |
+| DELETE | `/api/skins/:id` | Deletes metadata and PNG |
+| POST | `/api/skins/:id/select` | 202 with job (`kind: skin-apply`, result `{skin}`); 409 if no Microsoft account is selected |
 
-Beispiele:
+Examples:
 
 ```
 POST /api/accounts/login                          -> {"state":"5c81…","url":"https://login.live.com/oauth20_authorize.srf?…","expiresAt":"…"}
 POST /api/accounts/callback   {"state":"5c81…","code":"M.R3_BAY…"}   -> 202 Job (kind account-login)
 POST /api/accounts/offline    {"name":"Tester_1"}                    -> 201 {"account":{…},"accounts":[…],"selectedId":"…","offlineMode":true}
-POST /api/accounts/offline-mode {"enabled":false}                    -> 200 Kontenliste (Microsoft-Konto gewählt)
+POST /api/accounts/offline-mode {"enabled":false}                    -> 200 Account list (Microsoft account selected)
 POST /api/skins               {"name":"Night Knight","slim":false,"imageBase64":"data:image/png;base64,…"} -> 201 {"skin":{…}}
 POST /api/skins/2544…/select                                         -> 202 Job (kind skin-apply)
 ```
 
-**Launch.** `launch/command.nv` setzt `auth_player_name`, `auth_uuid`, `auth_access_token`, `auth_session`,
-`auth_xuid` und `user_type` aus der Session. `launch/jobs.nv` schreibt die Startzeile mit `launchMaskedCommand`
-in das Spiel-Log.
+**Launch.** `launch/command.nv` sets `auth_player_name`, `auth_uuid`, `auth_access_token`, `auth_session`,
+`auth_xuid`, and `user_type` from the session. `launch/jobs.nv` writes the launch line with `launchMaskedCommand`
+to the game log.
 
-**Anmeldung im Hauptprozess.** Die Weiterleitung nach `oauth20_desktop.srf` fängt `app/src/main/signin.ts` ab; Code und Status gehen an `/api/accounts/callback`. Die echte Microsoft-Anmeldung ist noch nicht durchgespielt (getestet mit gefälschten Weiterleitungen).
+**Sign-in in the main process.** `app/src/main/signin.ts` intercepts the redirect to `oauth20_desktop.srf`; code and state are sent to `/api/accounts/callback`. The real Microsoft sign-in has not yet been exercised end to end (tested with forged redirects).
 
-**Nur Microsoft-Konten.** Offline-Konten sind deaktiviert: `POST /api/accounts/offline` und `POST /api/accounts/offline-mode` mit `{enabled: true}` antworten 403 `sign_in_required`. Der Launch (`accountsLaunchSession()`) verlangt ein ausgewähltes Microsoft-Konto und scheitert sonst mit 403 `sign_in_required`; `install-game` braucht kein Konto. Die Kontenliste behält Offline-Einträge (auch „Player“) mit `usable: false`, und `offlineMode` ist `true`, solange kein Microsoft-Konto ausgewählt ist. Die Zeilen für `/api/accounts/offline` und `offline-mode` in der Tabelle oben beschreiben den früheren Stand.
+**Microsoft accounts only.** Offline accounts are disabled: `POST /api/accounts/offline` and `POST /api/accounts/offline-mode` with `{enabled: true}` respond with 403 `sign_in_required`. Launch (`accountsLaunchSession()`) requires a selected Microsoft account and otherwise fails with 403 `sign_in_required`; `install-game` needs no account. The account list keeps offline entries (including "Player") with `usable: false`, and `offlineMode` is `true` as long as no Microsoft account is selected. The rows for `/api/accounts/offline` and `offline-mode` in the table above describe the earlier state.
 
-**Aktueller Skin (Startseite).** `GET /api/accounts/skin` (`accounts/current.nv`) liefert den Skin, den das ausgewählte Microsoft-Konto gerade trägt: `{name, uuid (mit Bindestrichen), model: "classic" | "slim", skinUrl, dataUrl, capeDataUrl}`. Die Daten kommen aus dem Mojang-Profil (`api.minecraftservices.com/minecraft/profile`, mit dem Minecraft-Token aus `acSessionOf`, also derselben Kette und Auffrischung wie beim Start). Der Skin mit `state: ACTIVE` wird von `textures.minecraft.net` geladen und als Data-URL beantwortet; die Oberfläche braucht deshalb keinen Netzzugriff auf die Textur-Domain (CSP). Ein aktiver Umhang ist optional und fehlt, wenn er nicht geladen werden kann. Ohne gesetzten Skin sind `skinUrl`, `dataUrl` und `capeDataUrl` `null`, das Modell kommt aus dem ersten Eintrag des Profils. Ohne Microsoft-Konto: 403 `sign_in_required`; Fehler beim Abruf: 502 `upstream`. Die Antwort wird je Konto 5 Minuten im Speicher gehalten (nur Erfolge), und eine Skin-Übernahme leert den Speicher. Tokens und Profil-JSON werden nicht protokolliert. `GET /api/accounts` holt denselben Skin für jedes Microsoft-Konto nacheinander (außerhalb der Kontensperre, mit demselben Cache) und beantwortet ihn als `skinDataUrl`. Schlägt ein Konto fehl, bekommt nur dieses Konto `skinError`; die Liste bleibt erfolgreich.
+**Current skin (home page).** `GET /api/accounts/skin` (`accounts/current.nv`) returns the skin the selected Microsoft account is currently wearing: `{name, uuid (with hyphens), model: "classic" | "slim", skinUrl, dataUrl, capeDataUrl}`. The data comes from the Mojang profile (`api.minecraftservices.com/minecraft/profile`, using the Minecraft token from `acSessionOf`, i.e. the same chain and refresh as on launch). The skin with `state: ACTIVE` is loaded from `textures.minecraft.net` and returned as a data URL; the UI therefore needs no network access to the texture domain (CSP). An active cape is optional and is absent if it cannot be loaded. If no skin is set, `skinUrl`, `dataUrl`, and `capeDataUrl` are `null`, and the model comes from the first entry of the profile. Without a Microsoft account: 403 `sign_in_required`; fetch error: 502 `upstream`. The response is kept in memory for 5 minutes per account (successes only), and applying a skin clears that cache. Tokens and profile JSON are not logged. `GET /api/accounts` fetches the same skin for each Microsoft account one after another (outside the account lock, using the same cache) and returns it as `skinDataUrl`. If an account fails, only that account gets `skinError`; the list still succeeds.
 
-## Inhalte und Modpacks (P5, `mods/`, `providers/`)
+## Content and modpacks (P5, `mods/`, `providers/`)
 
-**Inhalte je Typ.** `mods/` verwaltet Mods, Resource-Packs, Shader-Packs und Datenpakete mit einer Implementierung
-(`ContentLoc` in `mods/store.nv`). Die Mod-Endpunkte bleiben unverändert; die generischen liegen daneben:
+**Content by type.** `mods/` manages mods, resource packs, shader packs, and data packs with a single implementation
+(`ContentLoc` in `mods/store.nv`). The mod endpoints remain unchanged; the generic ones sit alongside them:
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/profiles/:id/content/:type` | `ModFile[]` (`type`: `mods`, `resourcepacks`, `shaderpacks`, `datapacks`); `metadata` ist nur bei Mods gesetzt |
+| GET | `/api/profiles/:id/content/:type` | `ModFile[]` (`type`: `mods`, `resourcepacks`, `shaderpacks`, `datapacks`); `metadata` is only set for mods |
 | POST | `…/content/:type/identify`, `…/check-updates`, `…/update-all` | Job |
 | POST | `…/content/:type/toggle-all` | `{enabled}` → `{changed, enabled, skipped}` |
-| GET | `…/content/:type/dependencies` | `{warnings: [{fileName, projectName, dependencyProjectId, state}]}` (nur Mods, `state`: `missing \| disabled`) |
-| GET | `…/content/:type/:file/versions` | `ProjectRelease[]` (Modrinth, nach Spielversion und Loader gefiltert) |
-| POST | `…/content/:type/:file/version` | `{versionId}` → Job; ersetzt die Datei durch eine beliebige Version (sha1-geprüft, Alt-Datei nach `.volt-backup/`) |
-| POST | `…/content/:type/:file/update` · `…/toggle` · DELETE `…/:file` | wie bei Mods |
+| GET | `…/content/:type/dependencies` | `{warnings: [{fileName, projectName, dependencyProjectId, state}]}` (mods only, `state`: `missing \| disabled`) |
+| GET | `…/content/:type/:file/versions` | `ProjectRelease[]` (Modrinth, filtered by game version and loader) |
+| POST | `…/content/:type/:file/version` | `{versionId}` → Job; replaces the file with any version (sha1-verified, old file to `.volt-backup/`) |
+| POST | `…/content/:type/:file/update` · `…/toggle` · DELETE `…/:file` | as for mods |
 
-- Speicher je Typ: `<gameDir>/.volt/mods.json` (Mods, unverändert), `resourcepacks.json`, `shaderpacks.json`.
-- Datenpakete liegen in Minecraft **in einer Welt**: `<gameDir>/saves/<world>/datapacks/`. Alle Datenpaket-Anfragen
-  brauchen `?world=<Ordner>`; `GET …/content/datapacks/worlds` listet die Welten mit Anzahl. Ihr Speicher heißt
+- Storage per type: `<gameDir>/.volt/mods.json` (mods, unchanged), `resourcepacks.json`, `shaderpacks.json`.
+- In Minecraft, data packs live **in a world**: `<gameDir>/saves/<world>/datapacks/`. All data pack requests
+  need `?world=<folder>`; `GET …/content/datapacks/worlds` lists the worlds with counts. Their storage is named
   `.volt/datapacks-<sha1(world)[0:16]>.json`.
-- Nicht-Mod-Inhalte sind `*.zip` (bzw. `*.zip.disabled`) und tragen keine Jar-Metadaten.
-- Inhaltsinstallation (`POST …/content/install`) akzeptiert `world` (Pflicht für `kind: datapack`) und schreibt die
-  Quelle sofort in den Speicher (kein Identify nötig). Modrinth-Suche filtert Packs nach ihrem Tag
-  (`minecraft` bzw. `datapack`).
+- Non-mod content is `*.zip` (or `*.zip.disabled`) and carries no jar metadata.
+- Content installation (`POST …/content/install`) accepts `world` (required for `kind: datapack`) and writes the
+  source into the storage immediately (no identify needed). Modrinth search filters packs by their tag
+  (`minecraft` or `datapack`).
 
 **Modpack.** `providers/modpack.nv`:
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/profiles/:id/modpack` | `{modpack, updateAvailable, latestVersionId, latestVersionNumber, latestReleaseDate, reason}` |
-| GET | `/api/profiles/:id/modpack/versions` | `{versions: [ProjectRelease]}`, neueste zuerst |
-| POST | `/api/profiles/:id/modpack/update` | `{versionId?}` → Job; Ergebnis `{profileId, versionId, installed, removed}` |
-| POST | `/api/modpacks/import` | `{path, name?}` → Job; Ergebnis `{profileId}`; Format wird aus dem Archiv gelesen (mrpack, CurseForge, Technic) |
+| GET | `/api/profiles/:id/modpack/versions` | `{versions: [ProjectRelease]}`, newest first |
+| POST | `/api/profiles/:id/modpack/update` | `{versionId?}` → Job; result `{profileId, versionId, installed, removed}` |
+| POST | `/api/modpacks/import` | `{path, name?}` → Job; result `{profileId}`; the format is read from the archive (mrpack, CurseForge, Technic) |
 
-Die Dateien, die ein Release installiert hat, stehen in `<gameDir>/.volt/pack-files.json` (`{versionId, files}`).
-Ein Update löscht die Dateien des alten Releases, die das neue nicht mehr enthält; Welten, Konfigurationen und
-eigene Mods bleiben. Profile ohne diese Liste (vor P5 erstellt) löschen beim ersten Update nichts.
-Updates gibt es für Modrinth und CurseForge; Technic und FTB sowie importierte Packs sind nicht aktualisierbar.
+The files a release installed are recorded in `<gameDir>/.volt/pack-files.json` (`{versionId, files}`).
+An update deletes the files of the old release that the new one no longer contains; worlds, configurations, and
+custom mods are kept. Profiles without this list (created before P5) delete nothing on the first update.
+Updates are available for Modrinth and CurseForge; Technic and FTB as well as imported packs cannot be updated.
 
 **Export.** `POST /api/profiles/:id/export` `{format: "mrpack" | "curseforge", name?, version?}` → 201
-`{path, fileName, referenced, bundled, notes}`. Die Datei landet in `<dataDir>/exports/`. Der mrpack referenziert
-Modrinth-Dateien über Hash und Download-URL (Version aus dem Speicher); CurseForge-Dateien nur, wenn ihre Quelle eine
-Projekt- und Datei-ID hat. Alles andere sowie `config/`, `defaultconfigs/`, `kubejs/`, `scripts/`, `options.txt` usw.
-liegt in `overrides/`. Datenpakete (an Welten gebunden) werden nicht exportiert.
+`{path, fileName, referenced, bundled, notes}`. The file ends up in `<dataDir>/exports/`. The mrpack references
+Modrinth files by hash and download URL (version from the storage); CurseForge files only if their source has a
+project and file ID. Everything else as well as `config/`, `defaultconfigs/`, `kubejs/`, `scripts/`, `options.txt`, etc.
+goes into `overrides/`. Data packs (tied to worlds) are not exported.
 
-**Bekannte Lücken.** Keine Sicherung vor einem Pack-Update: weder Backend noch Oberfläche erstellen sie, obwohl
-`backupBeforePackUpdate` gesetzt sein kann (offen; Oberfläche könnte `POST /api/profiles/:id/backups` vorher aufrufen). CurseForge-Pack-Dateien werden
-noch nicht im Speicher erfasst, daher exportiert ein CurseForge-Zip sie in `overrides/`. Die Datei-Auswahl im Import
-erfolgt über einen Pfad (die Oberfläche hat keinen Dateidialog; ein `pickFile`-IPC gehört in den Hauptprozess).
+**Known gaps.** No backup before a pack update: neither the backend nor the UI creates one, even though
+`backupBeforePackUpdate` may be set (open; the UI could call `POST /api/profiles/:id/backups` beforehand). CurseForge pack files are
+not yet recorded in the storage, so a CurseForge zip exports them into `overrides/`. File selection in the import
+is done via a path (the UI has no file dialog; a `pickFile` IPC belongs in the main process).
 
-## Migration der alten Java-Daten (`migration/`)
+## Migration of the old Java data (`migration/`)
 
-Der alte Java-Launcher lag im selben Ordner (`~/.voltlauncher`, Standard von `--data-dir`); `--legacy-dir <pfad>`
-zeigt auf ihn, sonst ist der Datenordner selbst gemeint. Beim Start (nach `core.init`, vor dem Server) läuft die
-Migration, wenn `<legacy>/instances/instances.json` existiert und `<dataDir>/migration.json` fehlt oder
-`"status": "partial"` hat. Bei `"done"` passiert nichts. Die Ergebnisse stehen in `migration.json`
-(`status` done | partial, `profiles` mit `slug`, `profileId`, `status` migrated | failed, Zähler, `notes`);
-`GET /api/migration` liefert den Inhalt (sonst `{"status": "none"}`).
+The old Java launcher lived in the same folder (`~/.voltlauncher`, the default of `--data-dir`); `--legacy-dir <path>`
+points to it, otherwise the data folder itself is meant. At startup (after `core.init`, before the server) the
+migration runs if `<legacy>/instances/instances.json` exists and `<dataDir>/migration.json` is missing or has
+`"status": "partial"`. With `"done"`, nothing happens. The results are stored in `migration.json`
+(`status` done | partial, `profiles` with `slug`, `profileId`, `status` migrated | failed, counters, `notes`);
+`GET /api/migration` returns the contents (otherwise `{"status": "none"}`).
 
-- **Einstellungen:** `config/settings.json` wird auf die Schlüssel von `core/settings.nv` abgebildet (z. B.
+- **Settings:** `config/settings.json` is mapped onto the keys of `core/settings.nv` (e.g.
   `defaultMaxMemoryMb` → `memoryMb`, `maxConcurrentDownloads` → `downloadThreads`,
-  `hideLauncherOnLaunch` → `closeOnLaunch`). Ein Wert wird nur geschrieben, wenn die neue Datei dort den Standard hat
-  oder den Schlüssel nicht kennt. Nicht übernommen: `offlineModeAllowed` (kein Gegenstück); `javaRuntimes`
-  wird nur übernommen, wenn die Einträge das neue Format haben.
-- **Profile:** je Eintrag in `instances.json` ein neues Profil über `core.createProfile`. `versionId`
-  `fabric:<mc>:<loader>` (auch quilt, forge, neoforge) ergibt Loader und Version, sonst ist es Vanilla. Das
-  Spielverzeichnis bleibt der alte Ordner `instances/<slug>/game` (`gameDirectory`); nichts wird kopiert.
-  Modpack-Herkunft aus `content.json` wird als `source` (`kind: "modpack"`) übernommen.
-  Ein fehlgeschlagener Eintrag wird als `failed` mit Meldung vermerkt, die anderen laufen weiter. Ein Neustart
-  versucht nur die fehlgeschlagenen erneut und nutzt ein bereits angelegtes Profil wieder.
-- **Mod-Herkunft:** Aus `instances/<slug>/content.json` wird je Datei `<gameDir>/.volt/<art>.json` über
-  `mods.recordSource` geschrieben, aber nur wenn die sha1 der Datei auf der Platte der gespeicherten entspricht und
-  der Provider Modrinth oder CurseForge ist. Datenpakete (an Welten gebunden) und handgelegte Dateien werden
-  übersprungen und gezählt. Ein vorhandener `.volt`-Cache wird nicht überschrieben.
-- **Backups und Laufzeiten:** nicht verschoben. Das neue Backend liest nur `<dataDir>/backups/<profileId>`; die
-  alten Archive bleiben in `backups/<slug>` und stehen in `backupsLeftInPlace`. `runtimes/` wird nicht bewegt
-  (das Backend nutzt `shared/runtimes`).
-- **Konten:** nicht migriert. `auth/account-session.enc` ist AES-GCM verschlüsselt und vom neuen Backend nicht lesbar;
-  die Anmeldung mit Microsoft muss einmal neu erfolgen.
-- **Altordner:** Außer den `.volt/*.json`-Caches schreibt die Migration nichts in den alten Ordner. Ein
-  `--migration-dry-run --data-dir <scratch> --legacy-dir <alt>` führt alles in einen Scratch-Ordner aus, ohne den
-  alten Ordner zu schreiben. Tests: `backend/tests/migration/run.sh` (`--real-dry-run` gegen die echten Daten).
+  `hideLauncherOnLaunch` → `closeOnLaunch`). A value is only written if the new file has the default there
+  or does not know the key. Not carried over: `offlineModeAllowed` (no counterpart); `javaRuntimes`
+  is only carried over if the entries have the new format.
+- **Profiles:** for each entry in `instances.json`, a new profile via `core.createProfile`. A `versionId`
+  of `fabric:<mc>:<loader>` (also quilt, forge, neoforge) yields loader and version, otherwise it is vanilla. The
+  game directory remains the old folder `instances/<slug>/game` (`gameDirectory`); nothing is copied.
+  Modpack origin from `content.json` is carried over as `source` (`kind: "modpack"`).
+  A failed entry is recorded as `failed` with a message; the others continue. A restart
+  retries only the failed ones and reuses an already created profile.
+- **Mod origin:** From `instances/<slug>/content.json`, `<gameDir>/.volt/<kind>.json` is written for each file via
+  `mods.recordSource`, but only if the sha1 of the file on disk matches the stored one and
+  the provider is Modrinth or CurseForge. Data packs (tied to worlds) and hand-placed files are
+  skipped and counted. An existing `.volt` cache is not overwritten.
+- **Backups and runtimes:** not moved. The new backend only reads `<dataDir>/backups/<profileId>`; the
+  old archives stay in `backups/<slug>` and are listed in `backupsLeftInPlace`. `runtimes/` is not moved
+  (the backend uses `shared/runtimes`).
+- **Accounts:** not migrated. `auth/account-session.enc` is AES-GCM encrypted and cannot be read by the new backend;
+  Microsoft sign-in has to be done again once.
+- **Old folder:** Apart from the `.volt/*.json` caches, the migration writes nothing into the old folder. A
+  `--migration-dry-run --data-dir <scratch> --legacy-dir <old>` runs everything into a scratch folder without writing to the
+  old folder. Tests: `backend/tests/migration/run.sh` (`--real-dry-run` against the real data).
 
-## Modpack verbinden (P5, `providers/connect.nv`)
+## Connecting a modpack (P5, `providers/connect.nv`)
 
-Ein Profil lässt sich mit einer Release-Version eines Modpacks verbinden, ohne dass etwas installiert wird.
+A profile can be linked to a release version of a modpack without anything being installed.
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/profiles/:id/modpack/connect` | `{provider, projectId, versionId}` → 200 Modpack-Status; 409, wenn schon verbunden; 422 `unsupported`, wenn die Dateiliste nicht exakt lesbar ist |
-| POST | `/api/profiles/:id/modpack/disconnect` | ohne Body → 200 Modpack-Status; entfernt Quelle und `.volt/pack-files.json`, die Dateien bleiben |
+| POST | `/api/profiles/:id/modpack/connect` | `{provider, projectId, versionId}` → 200 modpack status; 409 if already connected; 422 `unsupported` if the file list cannot be read exactly |
+| POST | `/api/profiles/:id/modpack/disconnect` | No body → 200 modpack status; removes the source and `.volt/pack-files.json`, the files remain |
 
-- Status (`GET …/modpack`): verbundene Profile liefern `linked: true`, `provider`, `projectId`, `name`, `versionId`,
-  `versionNumber`, `updateAvailable`, `latestVersionId`; sonst `linked: false`.
-- Dateiliste je Anbieter (nur Inhalte in `mods/`, `resourcepacks/`, `shaderpacks/`, `datapacks/`, so wie die Installation
-  sie einträgt): Modrinth liest `modrinth.index.json` aus dem `.mrpack` (Archiv in ein Temp-Verzeichnis, danach gelöscht);
-  CurseForge liest `manifest.json` des Pack-Zips, aufgelöst über die Bridge (ohne Bridge 502); Technic liest die Einträge
-  eines Client-Zips; Solder-Packs werden mit 422 abgelehnt, weil ihre Build-Liste nur Mod-Archive nennt; FTB nimmt die
-  `files` des Release-Dokuments.
-- Eine leere oder geratene Liste wird nie geschrieben. Die Listenregeln spiegeln `install.nv`; bei Änderungen dort
-  mitziehen.
-- Ein Update nach dem Verbinden läuft wie nach einer Installation. Technic und FTB bleiben nicht aktualisierbar.
+- Status (`GET …/modpack`): connected profiles return `linked: true`, `provider`, `projectId`, `name`, `versionId`,
+  `versionNumber`, `updateAvailable`, `latestVersionId`; otherwise `linked: false`.
+- File list per provider (only contents of `mods/`, `resourcepacks/`, `shaderpacks/`, `datapacks/`, as the installation
+  records them): Modrinth reads `modrinth.index.json` from the `.mrpack` (archive into a temp directory, deleted afterwards);
+  CurseForge reads `manifest.json` of the pack zip, resolved via the bridge (502 without the bridge); Technic reads the entries
+  of a client zip; Solder packs are rejected with 422 because their build list only names mod archives; FTB takes the
+  `files` of the release document.
+- An empty or guessed list is never written. The list rules mirror `install.nv`; keep them in sync when
+  changing it.
+- An update after connecting works as it does after an installation. Technic and FTB remain non-updatable.
 
-## Profil-Logo (`logo/`)
+## Profile logo (`logo/`)
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/profiles/:id/logo` | `{kind, loader, dataUrl}`; `kind` ist `custom`, `modpack`, `vanilla` oder `loader`; `dataUrl` ist eine `data:image/…;base64,…`-URL oder `null`. Unbekanntes Profil: 404. |
+| GET | `/api/profiles/:id/logo` | `{kind, loader, dataUrl}`; `kind` is `custom`, `modpack`, `vanilla`, or `loader`; `dataUrl` is a `data:image/…;base64,…` URL or `null`. Unknown profile: 404. |
 
-Die Quellen, in dieser Reihenfolge (die erste, die etwas liefert, gewinnt):
+The sources, in this order (the first one that yields something wins):
 
-1. **custom**: das Profil hat ein eigenes Icon (`POST /api/profiles/:id/icon`); das Icon wird unverändert zurückgegeben.
-2. **modpack**: das Profil ist mit einem Modpack verbunden (`source`). Das Icon kommt aus dem Cache `<dataDir>/cache/logos/<provider>-<projectId>.<ext>`, sonst vom Anbieter: Modrinth `icon_url`, CurseForge `logo.url` (über die Bridge), FTB das `art` vom Typ `square` oder `icon`, Technic `icon.url`. Der Download läuft über den curl-Helfer der Providers; akzeptiert werden PNG, JPEG und WEBP (Magic-Bytes geprüft), höchstens 2 MB. Die Datei landet erst nach vollständigem Download und Prüfung per Umbenennen im Cache. Fehlt das Icon oder schlägt der Abruf fehl, folgt die nächste Quelle; der Endpunkt scheitert nie an einem Logo.
-3. **vanilla**: nur für Profile mit Loader `vanilla`. Die Blocktextur kommt aus dem Client-Jar, das der Launcher bereits geladen hat: `<dataDir>/shared/versions/<mc>/<mc>.jar`. Release (`^\d+\.\d+(\.\d+)?$`, auch `26.1`, `26.1.2`) nimmt `assets/minecraft/textures/block/grass_block_side.png`, jede andere Version (`26w14a`, `1.21.4-pre1`, `1.20-rc1`) `dirt.png`. Die Datei wird mit dem Zip-Leser der Providers gelesen, nicht kopiert und nicht ins Repository geschrieben. Ohne Jar (Spiel nie installiert) ist `dataUrl` `null`. Die Textur wird nach dem ersten Lesen als `<dataDir>/cache/logos/vanilla-grass.png` bzw. `vanilla-dirt.png` gespeichert.
-4. **loader**: alle übrigen Profile; `dataUrl` ist `null`, die Oberfläche zeichnet das Loader-Abzeichen.
+1. **custom**: the profile has its own icon (`POST /api/profiles/:id/icon`); the icon is returned unchanged.
+2. **modpack**: the profile is connected to a modpack (`source`). The icon comes from the cache `<dataDir>/cache/logos/<provider>-<projectId>.<ext>`, otherwise from the provider: Modrinth `icon_url`, CurseForge `logo.url` (via the bridge), FTB the `art` of type `square` or `icon`, Technic `icon.url`. The download goes through the providers' curl helper; PNG, JPEG, and WEBP are accepted (magic bytes checked), at most 2 MB. The file only lands in the cache by renaming, after the download is complete and verified. If the icon is missing or the fetch fails, the next source follows; the endpoint never fails because of a logo.
+3. **vanilla**: only for profiles with loader `vanilla`. The block texture comes from the client jar the launcher has already downloaded: `<dataDir>/shared/versions/<mc>/<mc>.jar`. A release (`^\d+\.\d+(\.\d+)?$`, also `26.1`, `26.1.2`) uses `assets/minecraft/textures/block/grass_block_side.png`, any other version (`26w14a`, `1.21.4-pre1`, `1.20-rc1`) uses `dirt.png`. The file is read with the providers' zip reader, not copied, and not written into the repository. Without a jar (game never installed), `dataUrl` is `null`. After the first read, the texture is stored as `<dataDir>/cache/logos/vanilla-grass.png` or `vanilla-dirt.png`.
+4. **loader**: all other profiles; `dataUrl` is `null`, the UI draws the loader badge.
 
-Hinweise:
+Notes:
 
-- Die Vanilla-Textur wird nur nach Blocktyp (Gras oder Erde) gecacht, nicht nach Version: die zuerst gelesene Jar bestimmt die Textur für alle Versionen. Das folgt der vorgegebenen Cache-Datei; bei abweichenden Texturen zwischen Versionen müsste der Name die Version enthalten.
-- Projekt-IDs aus anderen Zeichen als Buchstaben, Ziffern, `.`, `_` und `-` liefern kein Pack-Icon (sie werden weder geladen noch als Dateiname verwendet); das Profil fällt auf die nächste Quelle zurück.
-- Keine Sperre wird während Netzwerk- oder Dateizugriffen gehalten; temporäre Dateien tragen eine zufällige ID.
-- Tests: `backend/tests/logo/run.sh` (Klassifikation, Priorität mit Fixtures, Cache, 404; das Jar und die Pack-Fixtures entstehen mit Python im temporären Datenordner).
+- The vanilla texture is cached only by block type (grass or dirt), not by version: the first jar read determines the texture for all versions. This follows the prescribed cache file; if textures differ between versions, the name would have to include the version.
+- Project IDs containing characters other than letters, digits, `.`, `_`, and `-` yield no pack icon (they are neither loaded nor used as a file name); the profile falls back to the next source.
+- No lock is held during network or file access; temporary files carry a random ID.
+- Tests: `backend/tests/logo/run.sh` (classification, priority with fixtures, cache, 404; the jar and the pack fixtures are created with Python in the temporary data folder).
 
-## Automatische Profile (`autoprofiles/`)
+## Automatic profiles (`autoprofiles/`)
 
-Ein Hintergrundprüfer legt für jede neue Minecraft-Version ein Profil `<Version> Performance` an, mit einer
-voreingestellten Liste an Performance-Mods (Standard: Fabric). Einstellungen (`core/settings.nv`):
+A background checker creates a profile `<version> Performance` for every new Minecraft version, with a
+preset list of performance mods (default: Fabric). Settings (`core/settings.nv`):
 
-| Schlüssel | Standard | Regel |
+| Key | Default | Rule |
 | --- | --- | --- |
 | `autoProfilesEnabled` | `false` | bool |
 | `autoProfileLoader` | `fabric` | `fabric \| quilt \| forge \| neoforge` |
-| `autoProfileVersions` | `release` | `release \| snapshots` (mit `snapshots` auch Snapshots) |
-| `autoProfileMods` | Fabric-Voreinstellung, 7 Modrinth-Projekte | Liste aus `{provider: "modrinth", projectId, name}`, höchstens 32 Einträge; `projectId` aus Buchstaben, Ziffern, `-`, `_` und `.` (höchstens 64 Zeichen) |
+| `autoProfileVersions` | `release` | `release \| snapshots` (with `snapshots`, snapshots are included too) |
+| `autoProfileMods` | Fabric preset, 7 Modrinth projects | List of `{provider: "modrinth", projectId, name}`, at most 32 entries; `projectId` made of letters, digits, `-`, `_`, and `.` (at most 64 characters) |
 
-Die Voreinstellung: Sodium `AANobbMI`, Lithium `gvQqBUqZ`, FerriteCore `uXXizFIs`, ImmediatelyFast `5ZwdcRci`,
-Entity Culling `NNAgCjsB`, ModernFix `nmDcB62a`, Krypton `fQEb0iXm`. Iris ist nicht enthalten. Der Slug
-`memory-leak-fix` existiert bei Modrinth nicht (404) und fehlt deshalb.
+The preset: Sodium `AANobbMI`, Lithium `gvQqBUqZ`, FerriteCore `uXXizFIs`, ImmediatelyFast `5ZwdcRci`,
+Entity Culling `NNAgCjsB`, ModernFix `nmDcB62a`, Krypton `fQEb0iXm`. Iris is not included. The slug
+`memory-leak-fix` does not exist on Modrinth (404) and is therefore omitted.
 
-| Methode | Pfad | Beschreibung |
+| Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/autoprofiles` | `{enabled, loader, versions, mods, seen, lastCheck, lastError, results}`; `seen` ist die Anzahl der gesehenen Versionen, `lastCheck` und `lastError` sind ISO-Zeit bzw. Text oder `null`; `results` sind die letzten 50 Ergebnisse, neueste zuerst, je `{minecraftVersion, status, reason, profileId}` mit `status` = `created`, `skipped` oder `failed`. |
-| POST | `/api/autoprofiles/create` | Body `{minecraftVersion}`; Job (202, Art `autoprofile`) für genau diese Version. 400 bei unbekannter Version, 409 wenn der Profilname schon existiert. |
-| POST | `/api/autoprofiles/check` | Job (202): eine Prüfung wie beim Timer. Läuft auch bei ausgeschaltetem Feature. 409, solange eine Prüfung läuft. |
+| GET | `/api/autoprofiles` | `{enabled, loader, versions, mods, seen, lastCheck, lastError, results}`; `seen` is the number of versions seen, `lastCheck` and `lastError` are an ISO time or text, respectively, or `null`; `results` are the last 50 results, newest first, each `{minecraftVersion, status, reason, profileId}` with `status` = `created`, `skipped`, or `failed`. |
+| POST | `/api/autoprofiles/create` | Body `{minecraftVersion}`; Job (202, kind `autoprofile`) for exactly this version. 400 for an unknown version, 409 if the profile name already exists. |
+| POST | `/api/autoprofiles/check` | Job (202): one check, as with the timer. Also runs when the feature is switched off. 409 while a check is running. |
 
-Ablauf:
+Flow:
 
-- Ein Timer-Thread (`autoprofiles.startBackground()` in `main.nv`) prüft 30 s nach dem Start und 30 s nachdem das Feature
-  eingeschaltet wurde, danach alle 60 Minuten, solange es an ist. Jede Prüfung läuft als Job.
-- Die erste Prüfung (nach dem Einschalten oder nach dem ersten Start mit Feature an) erfasst nur: alle Versionen im Mojang-Manifest
-  werden als gesehen eingetragen, es entsteht kein Profil.
-- Spätere Prüfungen behandeln jede Version, die nicht gesehen ist. Passt ihr Typ zur Einstellung (`release`, bei `snapshots`
-  auch `snapshot`), entsteht das Profil; andere Versionen werden nur als gesehen vermerkt. Ein Wechsel von `release` auf
-  `snapshots` legt deshalb keine alten Snapshots nach.
-- Name: `<Version> Performance`. Existiert der Name, endet die Version als `skipped` mit „already exists“.
-- Loader: hat der Loader für die Version keinen Build (Fabric-Meta 400, Quilt-Meta 404, Forge/NeoForge: leere Liste), endet
-  die Version als `skipped` mit dem Grund. Andere Fehler (nicht erreichbar) enden als `failed`; die Version bleibt ungesehen
-  und wird bei der nächsten Prüfung erneut versucht.
-- Mods: jeder Eintrag wird wie eine Inhalts-Installation behandelt (`providers.installContent`, neueste passende Version,
-  Pflicht-Abhängigkeiten an). Ein Mod, der nicht installiert werden kann, steht im `reason` des Ergebnisses; das Profil
-  bleibt `created`.
-- Standard für Quilt, Forge und NeoForge: es gibt noch keine Voreinstellung. Die Liste ist ein einziger Schlüssel; solange
-  sie unverändert der Fabric-Voreinstellung entspricht, bekommt ein anderer Loader keine Mods, und das Ergebnis nennt den Grund.
-  Eigene Mods für diesen Loader setzt man in `autoProfileMods`.
-- Fehler stoppen den Prüfer nicht: ein nicht erreichbares Manifest setzt `lastError`, die nächste Prüfung versucht es erneut.
-- Zustand: `<dataDir>/autoprofiles.json` (`baselined`, `seen`, `lastCheck`, `lastError`, `results`; die letzten 200 Ergebnisse).
-- Test-Schalter: nur mit `--enable-test-routes` liest der Prüfer `manifest.json` und `loaders.json` aus dem Ordner in
-  `VOLT_AUTOPROFILES_FIXTURES` statt aus dem Netz. Die Tests verwenden das.
-- Tests: `backend/tests/autoprofiles/run.sh` (Erfassung, neue Versionen, Filter Release/Snapshot, Namensregel, fehlender Loader,
-  Quilt-Regel, Validierung der Mod-Liste, Endpunkte, Fehlerpfad, Timer; etwa 50 s, ohne Netz, im temporären Datenordner).
+- A timer thread (`autoprofiles.startBackground()` in `main.nv`) checks 30 s after startup and 30 s after the feature
+  was switched on, then every 60 minutes as long as it is on. Each check runs as a job.
+- The first check (after switching on, or after the first start with the feature on) only records: all versions in the Mojang manifest
+  are entered as seen, and no profile is created.
+- Later checks handle every version that has not been seen. If its type matches the setting (`release`, with `snapshots`
+  also `snapshot`), the profile is created; other versions are only noted as seen. Switching from `release` to
+  `snapshots` therefore does not backfill old snapshots.
+- Name: `<version> Performance`. If the name exists, the version ends as `skipped` with "already exists".
+- Loader: if the loader has no build for the version (Fabric meta 400, Quilt meta 404, Forge/NeoForge: empty list), the
+  version ends as `skipped` with the reason. Other errors (unreachable) end as `failed`; the version stays unseen
+  and is retried on the next check.
+- Mods: each entry is handled like a content installation (`providers.installContent`, newest matching version,
+  required dependencies on). A mod that cannot be installed is listed in the result's `reason`; the profile
+  remains `created`.
+- Default for Quilt, Forge, and NeoForge: there is no preset yet. The list is a single key; as long as
+  it is unchanged from the Fabric preset, another loader gets no mods, and the result states the reason.
+  Custom mods for that loader are set in `autoProfileMods`.
+- Errors do not stop the checker: an unreachable manifest sets `lastError`, and the next check tries again.
+- State: `<dataDir>/autoprofiles.json` (`baselined`, `seen`, `lastCheck`, `lastError`, `results`; the last 200 results).
+- Test switch: only with `--enable-test-routes` does the checker read `manifest.json` and `loaders.json` from the folder in
+  `VOLT_AUTOPROFILES_FIXTURES` instead of from the network. The tests use this.
+- Tests: `backend/tests/autoprofiles/run.sh` (baseline recording, new versions, release/snapshot filter, naming rule, missing loader,
+  Quilt rule, mod list validation, endpoints, error path, timer; about 50 s, no network, in the temporary data folder).
 
 
-## Profil-Import (`imports/`)
+## Profile import (`imports/`)
 
-Importiert Profile anderer Launcher als **Kopien**: die Quelle wird nur gelesen, nie verschoben oder gelöscht. Pfade und Felder stammen aus `docs/IMPORT-FORMATS.md`; abgebildet wird nur, was dort als verifiziert oder dokumentiert steht.
+Imports profiles from other launchers as **copies**: the source is only read, never moved or deleted. Paths and fields come from `docs/IMPORT-FORMATS.md`; only what is listed there as verified or documented is mapped.
 
-Endpunkte (`server/router.nv` leitet `/api/imports` hierher):
+Endpoints (`server/router.nv` routes `/api/imports` here):
 
-| Methode | Pfad | Antwort |
+| Method | Path | Response |
 |---|---|---|
-| GET | `/api/imports/scan` | `{"launchers": [...]}`. Je Launcher: `id`, `name`, `status` (`found`, `none`, `unavailable`), `reason`, `confidence` (`verified`, `documented`, `community`), `profiles`. Je Profil: `key` (stabil, aus Launcher und Pfad), `name`, `minecraftVersion`, `loader`, `loaderVersion`, `sizeBytes`, `sizeComplete`, `path`, `importable`, `reason`, `notes`. |
-| POST | `/api/imports` | Body `{"items": [{"launcher", "key"}]}` (1 bis 200 Einträge), Antwort 202 mit einem Job (`kind: "import"`). Das Ergebnis hat `items` (je Eintrag `result` = `done`, `partial` oder `failed`, `profileId`, `copiedFiles`, `notCopied` mit Pfad und Grund, `notes`, `message`) sowie die Zähler `done`, `partial`, `failed`. |
+| GET | `/api/imports/scan` | `{"launchers": [...]}`. Per launcher: `id`, `name`, `status` (`found`, `none`, `unavailable`), `reason`, `confidence` (`verified`, `documented`, `community`), `profiles`. Per profile: `key` (stable, derived from launcher and path), `name`, `minecraftVersion`, `loader`, `loaderVersion`, `sizeBytes`, `sizeComplete`, `path`, `importable`, `reason`, `notes`. |
+| POST | `/api/imports` | Body `{"items": [{"launcher", "key"}]}` (1 to 200 entries), responds 202 with a job (`kind: "import"`). The result has `items` (per entry `result` = `done`, `partial`, or `failed`, `profileId`, `copiedFiles`, `notCopied` with path and reason, `notes`, `message`) as well as the counters `done`, `partial`, `failed`. |
 
-Alle Prüfungen laufen vor dem ersten Kopieren, für die ganze Anfrage: 400 `bad_request` (Body ungültig, Eintrag nicht importierbar, Eintrag doppelt, Datenordner liegt im Spielordner), 404 `not_found` (Launcher oder Schlüssel unbekannt; dann den Scan wiederholen), 409 `conflict` (Spielordner größer als 40 GB; die Zählung bricht bei Überschreitung ab).
+All checks run before the first copy, for the whole request: 400 `bad_request` (invalid body, entry not importable, duplicate entry, data folder lies inside the game folder), 404 `not_found` (launcher or key unknown; then repeat the scan), 409 `conflict` (game folder larger than 40 GB; counting stops when the limit is exceeded).
 
-Zuordnung: `name`, `minecraftVersion`, `loader` (`vanilla`, `fabric`, `quilt`, `forge`, `neoforge`; andere werden übersprungen und begründet), `loaderVersion`, `javaPath`, `jvmArgs`. Arbeitsspeicher wird nicht übernommen, weil keine Quelle die Einheit verifiziert hat; einzige Ausnahme ist NoRisk, dessen Code `memory` in MB angibt (`memory.max`, mindestens 256). Gruppen, Icons, Spielzeit, Modpack-Herkunft und Konten werden nicht übernommen und in `notes` genannt.
+Mapping: `name`, `minecraftVersion`, `loader` (`vanilla`, `fabric`, `quilt`, `forge`, `neoforge`; others are skipped and the reason is given), `loaderVersion`, `javaPath`, `jvmArgs`. Memory is not carried over because no source has verified the unit; the only exception is NoRisk, whose code specifies `memory` in MB (`memory.max`, at least 256). Groups, icons, playtime, modpack origin, and accounts are not carried over and are mentioned in `notes`.
 
-Launcher und Konfidenz: Prism Launcher, FTB App (verifiziert); MultiMC (verifiziert, Pfade aus Fremdimporteuren); Modrinth App (dokumentiert, nur über SQLite); Vanilla-Launcher (dokumentiert); ATLauncher, GDLauncher, CurseForge, NoRisk, HMCL (community oder abgeleitete Pfade). SQLite-Launcher (Modrinth, NoRisk) brauchen `sqlite3` im PATH; fehlt es, ist der Launcher `unavailable` mit dem Grund `sqlite3 is not installed`.
+Launchers and confidence: Prism Launcher, FTB App (verified); MultiMC (verified, paths from third-party importers); Modrinth App (documented, via SQLite only); Vanilla launcher (documented); ATLauncher, GDLauncher, CurseForge, NoRisk, HMCL (community or derived paths). SQLite launchers (Modrinth, NoRisk) need `sqlite3` in the PATH; if it is missing, the launcher is `unavailable` with the reason `sqlite3 is not installed`.
 
-Kopie: Der Spielordner wird rekursiv in den Profilordner `<dataDir>/profiles/<id>` kopiert. Links werden nie verfolgt; ein Link im Spielordner steht in `notCopied`, ein Spielordner, der selbst ein Link ist, macht das Profil nicht importierbar. Ein nicht kopierbarer Eintrag macht den Eintrag `partial`; ein Fehler vor oder während der Kopie macht ihn `failed`, das angelegte Profil bleibt. Namen: bei Kollision „Name (2)“, „Name (3)“ usw.
+Copy: The game folder is copied recursively into the profile folder `<dataDir>/profiles/<id>`. Links are never followed; a link in the game folder is listed in `notCopied`, and a game folder that is itself a link makes the profile not importable. An entry that cannot be copied makes the item `partial`; an error before or during the copy makes it `failed`, and the profile that was created remains. Names: on collision "Name (2)", "Name (3)", etc.
 
-Scan und Lesen: Launcher-Ordner werden nie beschrieben. SQLite-Datenbanken werden in einen Arbeitsordner unter `<dataDir>/cache/imports/` kopiert und dort mit `sqlite3 -readonly` gelesen, weil ein Lesezugriff auf eine WAL-Datenbank im Launcher-Ordner `-wal`- und `-shm`-Dateien anlegen kann. Die Größe wird je Ordner bis 50 000 Einträge gezählt (`sizeComplete: false` bei Abbruch). Der Scan liest nur, Pfade von Links werden gemeldet, nicht verfolgt.
+Scan and reading: Launcher folders are never written to. SQLite databases are copied into a working folder under `<dataDir>/cache/imports/` and read there with `sqlite3 -readonly`, because a read access to a WAL database in the launcher folder can create `-wal` and `-shm` files. The size is counted per folder up to 50,000 entries (`sizeComplete: false` if it stops early). The scan only reads; paths of links are reported, not followed.
 
-Bewusste Grenzen: HMCL-Profile werden gelistet, sind aber nicht importierbar, weil `versions/<id>/<id>.json` nicht gelesen wurde (ein Versionsordner zählt nur mit `.hmcl`). Bei Modrinth ist die Verknüpfung `instances.applied_content_set_id` zu `instance_content_sets` nicht dokumentiert und angenommen; `instance_launch_overrides` (Java, JVM-Argumente) wird nicht gelesen. Bei ATLauncher, GDLauncher, FTB und CurseForge werden Loader-Namen nur für die bekannten vier Loader abgebildet, alle anderen Werte werden übersprungen. Windows- und macOS-Pfade sind nur insoweit vorhanden, wie die Doku sie nennt. Abbrechen ist zwischen den Dateien möglich; bereits angelegte Profile bleiben bestehen.
+Deliberate limits: HMCL profiles are listed but not importable, because `versions/<id>/<id>.json` has not been read (a version folder only counts with `.hmcl`). For Modrinth, the link `instances.applied_content_set_id` to `instance_content_sets` is undocumented and assumed; `instance_launch_overrides` (Java, JVM arguments) is not read. For ATLauncher, GDLauncher, FTB, and CurseForge, loader names are only mapped for the four known loaders; all other values are skipped. Windows and macOS paths are only present to the extent the documentation lists them. Cancelling is possible between files; profiles already created remain.
 
-Testoption: `VOLT_IMPORT_HOME=<Ordner>` ersetzt das Home-Verzeichnis und schaltet `APPDATA`, `XDG_DATA_HOME`, `PRISMLAUNCHER_DATA_DIR`, `THESEUS_CONFIG_DIR` ab. Sie wirkt nur zusammen mit `--enable-test-routes`. Tests: `backend/tests/imports/run.sh` (baut das Backend, erzeugt die Fixtures mit `fixtures.py`, prüft mit `check.py` Scan, Ablehnungen, Kopien, Namen und Prüfsummen der Quellen; danach ein zweiter Lauf ohne `sqlite3` im PATH).
+Test option: `VOLT_IMPORT_HOME=<folder>` replaces the home directory and disables `APPDATA`, `XDG_DATA_HOME`, `PRISMLAUNCHER_DATA_DIR`, `THESEUS_CONFIG_DIR`. It only takes effect together with `--enable-test-routes`. Tests: `backend/tests/imports/run.sh` (builds the backend, creates the fixtures with `fixtures.py`, uses `check.py` to verify scan, rejections, copies, names, and checksums of the sources; then a second run without `sqlite3` in the PATH).
 
 
-## Synchronisierte Ordner (`core/synced.nv`)
+## Synced folders (`core/synced.nv`)
 
-Beim Anlegen eines Profils wird gewählt, welche Ordner und Dateien zwischen Profilen geteilt werden. Erlaubt sind die Ordner `shaderpacks`, `resourcepacks`, `saves`, `screenshots` und `config` sowie die Dateien `options` (`options.txt`) und `servers` (`servers.dat`). Mods nicht, sie unterscheiden sich je Version. Standard ist nichts; die automatisch angelegten Profile (`autoprofiles/create.nv`) bekommen `["options", "servers"]`, `POST /api/profiles` bleibt bei nichts.
+When a profile is created, you choose which folders and files are shared between profiles. The allowed folders are `shaderpacks`, `resourcepacks`, `saves`, `screenshots`, and `config`, and the allowed files are `options` (`options.txt`) and `servers` (`servers.dat`). Mods are not allowed, because they differ per version. The default is nothing; the automatically created profiles (`autoprofiles/create.nv`) get `["options", "servers"]`, while `POST /api/profiles` stays at nothing.
 
-- `POST /api/profiles` nimmt das optionale Feld `"synced": ["saves"]` (Array, ohne Doppelte; leer oder `null` heißt nichts geteilt). Unbekannter Schlüssel, doppelter Eintrag oder kein Array: 400 `bad_request`.
-- Gespeichert wird es als `synced` (Array). Ältere Profile ohne das Feld lesen `[]`. `GET` liefert es.
-- Ändern: `PATCH /api/profiles/:id` mit `{"synced": ["saves", ...]}` setzt die ganze Menge (Array, erlaubte Schlüssel, ohne Doppelte; sonst 400 `bad_request`, auch bei `null`). Zusammen mit `gameDirectory` in derselben Anfrage: 400. Die Antwort ist das Profil mit `syncReport`. Läuft das Spiel des Profils, antwortet PATCH mit 409 `conflict` („stop the game before changing shared folders“); das Startmodul meldet dies über `markGameRunning(id, true|false)` in `core/synced.nv` (Stand: noch nicht angebunden, siehe unten). Alle Prüfungen (Links, die nicht auf den geteilten Ordner zeigen: 409; Ordner an Stelle eines Links beim Deaktivieren: 409) laufen vor der ersten Änderung.
-- Aktivieren (Schlüssel neu): `<dataDir>/synced/<key>/` wird bei Bedarf angelegt. Fehlt der Eintrag `<folder>` im Spielordner, wird nur der Link angelegt. Ist er ein Ordner, wird er zusammengeführt: Namen, die der geteilte Ordner nicht hat, werden dorthin verschoben (umbenennen; schlägt das fehl, kopieren und erst danach das Original löschen). Namen, die der geteilte Ordner schon hat, werden nach `<gameDir>/.volt-sync-conflicts/<key>/` verschoben (mit Zusatz „name (2)“, falls dort schon belegt); nichts geht verloren. Danach wird der leere Ordner entfernt und der Link angelegt. Ein Link, der schon auf den geteilten Ordner zeigt, bleibt unverändert. `syncReport`: `{"key": "saves", "action": "enable", "status": "ok", "moved": 1, "conflicts": 1}`.
-- Deaktivieren (Schlüssel entfernt): der Link wird entfernt (nie verfolgt), ein leerer Ordner angelegt und der Inhalt des geteilten Ordners hineinkopiert (kopieren, nicht verschieben). Schlägt das Kopieren für einen Eintrag fehl (z. B. ein Link im geteilten Ordner, der nicht kopiert wird), bleibt der geteilte Ordner unverändert, die Kopie wird entfernt, der Link wiederhergestellt und der Schlüssel bleibt aktiv. Die Antwort ist dann 200 mit `syncReport`: `{"key": "saves", "action": "disable", "status": "failed", "copied": 0, "failed": [{"name": "…", "reason": "…"}]}`. Ohne Fehler: `{"key": …, "action": "disable", "status": "ok", "copied": n}`.
-- Fehler: schlägt ein Link oder ein Verschieben fehl, antwortet PATCH mit 500 `internal`. Alle Schritte der Anfrage werden in einem Journal festgehalten und in umgekehrter Reihenfolge rückgängig gemacht; was nicht rückgängig gemacht werden kann, nennt die Meldung (`could not undo`). Die Anfrage wird als Ganzes gespeichert oder nicht.
-- Anlegen: der geteilte Ordner ist `<dataDir>/synced/<key>/` (bei Bedarf angelegt). Im Spielordner des neuen Profils entsteht der Eintrag `<folder>` als Link darauf: `ln -s` unter Linux und macOS, eine Verzeichnis-Junction per `cmd /c mklink /J` unter Windows (ohne Adminrechte). Ist der Eintrag schon vorhanden (Ordner, Datei oder Link), wird nichts ersetzt: 409 `conflict` mit „the folder <name> already exists in the new profile“. Schlägt ein Link fehl, antwortet die Anlage mit 500 `internal`; das Profil wird zurückgerollt (Links und Profilordner werden entfernt).
-- Dateien (`options` → `options.txt`, `servers` → `servers.dat`): der geteilte Eintrag ist `<dataDir>/synced/options.txt` bzw. `servers.dat` (mit dem Namen des Spiels). Link: `ln -s` unter Linux und macOS; unter Windows ein Hardlink per `cmd /c mklink /H <Profildatei> <geteilte Datei>` (ohne Adminrechte, nur auf demselben Laufwerk). Entfernt wird ein Hardlink mit `del`, das nur diesen Namen löscht; die Datei bleibt. Aktivieren: fehlt die geteilte Datei, wird die Datei des Profils dorthin verschoben; ist sie schon da, wird die Datei des Profils nach `<gameDir>/.volt-sync-conflicts/<name>` verschoben (nicht überschrieben, bei belegtem Namen mit Zusatz „(2)“). Hat das Profil keine Datei und fehlt die geteilte, wird eine leere angelegt (`"createdEmpty": true`). `syncReport`: `{"key": "options", "action": "enable", "status": "ok", "moved": 1, "conflicts": 0, "createdEmpty": false}`. Deaktivieren: der Link wird entfernt, die geteilte Datei in den Spielordner kopiert (das Profil behält eine Kopie, die geteilte bleibt); `{"key": "options", "action": "disable", "status": "ok", "copied": 1}`. Schlägt die Kopie fehl, wird wie bei Ordnern rückgängig gemacht (Status `failed`). Anlegen: existiert der Eintrag im Spielordner, 409 mit „the file options.txt already exists in the new profile“. Das 409 bei laufendem Spiel, das Journal und die Löschregeln gelten unverändert.
-- Löschen: entfernt werden nur die Links des Profils, im verwalteten Ordner und im Spielordner (falls per `PATCH` geändert). Unter Linux entfernt `removeAll` einen Link selbst, ohne ihm zu folgen. Unter Windows wird eine Junction vor dem Löschen des Profilordners mit `cmd /c rmdir` entfernt, damit `removeAll` nicht in das Ziel läuft. Bleibt ein Link stehen, bleibt der Profilordner erhalten (Warnung im Log). Geteilte Inhalte löscht der Launcher nie.
-- Tests: `backend/tests/synced/run.sh` (Link und Ziel, gemeinsame Dateien, Löschen mit erhaltenem Inhalt, 400/409/500, PATCH aktivieren mit Zusammenführen und Konflikten, PATCH deaktivieren mit Kopie, fehlgeschlagene Kopie, Undo nach fehlgeschlagenem Link, Neustart, Profil ohne Feld; Dateien: aktivieren mit Verschieben, zweites Profil über denselben Link, deaktivieren mit Kopie, Konflikt in `.volt-sync-conflicts`, leere Datei, fehlgeschlagene Kopie, Undo, Anlegen mit 409 und mit beiden Dateien; im temporären Datenordner). `backend/tests/autoprofiles/run.sh` prüft, dass automatisch angelegte Profile `["options", "servers"]` mit Links haben. Nicht getestet: das 409 bei laufendem Spiel (kein Laufzeit-Hook angebunden), die Junction und der Hardlink unter Windows und macOS zur Laufzeit.
+- `POST /api/profiles` accepts the optional field `"synced": ["saves"]` (array, no duplicates; empty or `null` means nothing is shared). Unknown key, duplicate entry, or not an array: 400 `bad_request`.
+- It is stored as `synced` (array). Older profiles without the field read `[]`. `GET` returns it.
+- Changing: `PATCH /api/profiles/:id` with `{"synced": ["saves", ...]}` sets the whole set (array, allowed keys, no duplicates; otherwise 400 `bad_request`, also for `null`). Together with `gameDirectory` in the same request: 400. The response is the profile with `syncReport`. If the profile's game is running, PATCH responds with 409 `conflict` ("stop the game before changing shared folders"); the launch module reports this via `markGameRunning(id, true|false)` in `core/synced.nv` (status: not yet wired up, see below). All checks (links that do not point to the shared folder: 409; a folder in place of a link on deactivation: 409) run before the first change.
+- Enabling (key is new): `<dataDir>/synced/<key>/` is created if needed. If the entry `<folder>` is missing from the game folder, only the link is created. If it is a folder, it is merged: names the shared folder does not have are moved there (rename; if that fails, copy and only then delete the original). Names the shared folder already has are moved to `<gameDir>/.volt-sync-conflicts/<key>/` (with the suffix "name (2)" if already taken there); nothing is lost. Afterwards the empty folder is removed and the link is created. A link that already points to the shared folder stays unchanged. `syncReport`: `{"key": "saves", "action": "enable", "status": "ok", "moved": 1, "conflicts": 1}`.
+- Disabling (key removed): the link is removed (never followed), an empty folder is created, and the contents of the shared folder are copied into it (copied, not moved). If copying fails for an entry (e.g. a link in the shared folder, which is not copied), the shared folder stays unchanged, the copy is removed, the link is restored, and the key stays active. The response is then 200 with `syncReport`: `{"key": "saves", "action": "disable", "status": "failed", "copied": 0, "failed": [{"name": "…", "reason": "…"}]}`. Without errors: `{"key": …, "action": "disable", "status": "ok", "copied": n}`.
+- Errors: if a link or a move fails, PATCH responds with 500 `internal`. All steps of the request are recorded in a journal and undone in reverse order; whatever cannot be undone is named in the message (`could not undo`). The request is saved as a whole or not at all.
+- Creating: the shared folder is `<dataDir>/synced/<key>/` (created if needed). In the new profile's game folder, the entry `<folder>` is created as a link to it: `ln -s` on Linux and macOS, a directory junction via `cmd /c mklink /J` on Windows (without admin rights). If the entry already exists (folder, file, or link), nothing is replaced: 409 `conflict` with "the folder <name> already exists in the new profile". If a link fails, creation responds with 500 `internal`; the profile is rolled back (links and profile folder are removed).
+- Files (`options` → `options.txt`, `servers` → `servers.dat`): the shared entry is `<dataDir>/synced/options.txt` or `servers.dat` (with the game's name). Link: `ln -s` on Linux and macOS; on Windows a hard link via `cmd /c mklink /H <profile file> <shared file>` (without admin rights, only on the same drive). A hard link is removed with `del`, which deletes only that name; the file remains. Enabling: if the shared file is missing, the profile's file is moved there; if it is already there, the profile's file is moved to `<gameDir>/.volt-sync-conflicts/<name>` (not overwritten, with the suffix "(2)" if the name is taken). If the profile has no file and the shared one is missing, an empty one is created (`"createdEmpty": true`). `syncReport`: `{"key": "options", "action": "enable", "status": "ok", "moved": 1, "conflicts": 0, "createdEmpty": false}`. Disabling: the link is removed and the shared file is copied into the game folder (the profile keeps a copy, the shared one remains); `{"key": "options", "action": "disable", "status": "ok", "copied": 1}`. If the copy fails, it is undone as with folders (status `failed`). Creating: if the entry exists in the game folder, 409 with "the file options.txt already exists in the new profile". The 409 when the game is running, the journal, and the deletion rules apply unchanged.
+- Deleting: only the profile's links are removed, in the managed folder and in the game folder (if changed via `PATCH`). On Linux, `removeAll` removes a link itself without following it. On Windows, a junction is removed with `cmd /c rmdir` before the profile folder is deleted, so that `removeAll` does not descend into the target. If a link remains, the profile folder is kept (warning in the log). The launcher never deletes shared content.
+- Tests: `backend/tests/synced/run.sh` (link and target, shared files, deletion with content preserved, 400/409/500, PATCH enable with merging and conflicts, PATCH disable with copy, failed copy, undo after a failed link, restart, profile without the field; files: enable with move, second profile via the same link, disable with copy, conflict in `.volt-sync-conflicts`, empty file, failed copy, undo, creation with 409 and with both files; in the temporary data folder). `backend/tests/autoprofiles/run.sh` verifies that automatically created profiles have `["options", "servers"]` with links. Not tested: the 409 when the game is running (no runtime hook wired up), the junction and the hard link on Windows and macOS at runtime.
 
-## Forge bis 1.12.2 (`launch/legacyforge.nv`)
+## Forge up to 1.12.2 (`launch/legacyforge.nv`)
 
-Forge-Installer für Minecraft unter 1.13 werden nicht ausgeführt, weil sie `--installClient` nicht kennen (ihr `SimpleInstaller` bricht mit `UnrecognizedOptionException` ab). Der Launcher liest das Installer-JAR stattdessen als ZIP, wie frühere Launcher es taten: `install_profile.json` nennt in `install.filePath` das Universal-JAR, das nach `libraries/<Maven-Pfad von install.path>` geschrieben wird (atomar, übersprungen bei gleicher Größe). `versionInfo` wird als `versions/<id>/<id>.json` geschrieben. Die `id` muss der Versions-Id des Profils entsprechen, sonst 500. Die Bibliotheken holt der normale Schritt (`launchPlanLibraries`), Prozessoren gibt es in diesen Installern keine. Fehlt `install_profile.json` oder das Universal-JAR, endet die Installation mit 500 `internal` und dem Namen des Installers. Ab 1.13 bleibt der Headless-Lauf unverändert (`launchRunInstaller`).
+Forge installers for Minecraft below 1.13 are not executed, because they do not know `--installClient` (their `SimpleInstaller` aborts with `UnrecognizedOptionException`). Instead, the launcher reads the installer JAR as a ZIP, as earlier launchers did: `install_profile.json` names the universal JAR in `install.filePath`, which is written to `libraries/<Maven path from install.path>` (atomically, skipped if the size is the same). `versionInfo` is written as `versions/<id>/<id>.json`. The `id` must match the profile's version ID, otherwise 500. The libraries are fetched by the normal step (`launchPlanLibraries`); there are no processors in these installers. If `install_profile.json` or the universal JAR is missing, the installation ends with 500 `internal` and the name of the installer. From 1.13 on, the headless run remains unchanged (`launchRunInstaller`).
 
-Grenze: Ein Installer ohne `version.json` und ohne `install_profile.json` scheitert schon bei der Auflösung (`versions.nv`, 422), vor diesem Schritt.
+Limit: An installer without `version.json` and without `install_profile.json` already fails during resolution (`versions.nv`, 422), before this step.
 
-Tests: `backend/tests/launch/legacyforge-test.sh` (lädt den echten 1.12.2-14.23.5.2847-Installer, prüft die SHA-1 des Universal-JAR gegen den ZIP-Eintrag, die Versions-JSON und die Verzweigung, dazu zwei Fehlerfälle; braucht Netz).
+Tests: `backend/tests/launch/legacyforge-test.sh` (downloads the real 1.12.2-14.23.5.2847 installer, checks the SHA-1 of the universal JAR against the ZIP entry, the version JSON, and the branching, plus two error cases; needs network).

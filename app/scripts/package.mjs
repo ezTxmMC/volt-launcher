@@ -61,7 +61,8 @@ for (const target of selected) {
     continue
   }
   const args = ['exec', 'electron-builder', ...TARGETS[target]]
-  const result = spawnSync('pnpm', args, { cwd: appDir, stdio: 'inherit' })
+  // On Windows pnpm is a .cmd shim, which spawnSync only starts through a shell.
+  const result = spawnSync('pnpm', args, { cwd: appDir, stdio: 'inherit', shell: process.platform === 'win32' })
   if (result.status !== 0) {
     failures.push(target)
   }

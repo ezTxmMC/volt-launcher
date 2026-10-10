@@ -7,13 +7,13 @@ The local HTTP service of VoltLauncher, written in [Novus](https://github.com/ez
 
 ```sh
 scripts/build.sh                 # -> dist/volt-backend (works from any directory; NOVUSC=... overrides the compiler)
-dist/volt-backend --port 38911 --token <hex> --data-dir ~/.volt-launcher-next
+dist/volt-backend --port 38911 --token <hex> --data-dir ~/.voltlauncher
 scripts/smoke.sh [--build]       # starts the binary on a free port with a temp data dir, checks the core API with curl
 ```
 
 - Listens on `127.0.0.1:<port>` only and prints `VOLT_BACKEND_READY port=<port>` to stdout once it accepts requests.
   Logs go to stderr with ISO timestamps.
-- `--port` and `--token` are required (exit code 2 otherwise). `--data-dir` defaults to `~/.volt-launcher-next`.
+- `--port` and `--token` are required (exit code 2 otherwise). `--data-dir` defaults to `~/.voltlauncher`.
 - Every `/api/*` request needs `X-Volt-Token`; only `GET /api/health` works without it.
 - `--enable-test-routes` mounts `POST /api/_test/jobs` (a counting job for the smoke test). Electron never passes it.
 

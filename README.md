@@ -1,73 +1,73 @@
 # VoltLauncher
 
-Ein moderner Minecraft-Launcher: mehrere Konten, alle gängigen Mod-Loader und Inhalte von Modrinth,
-CurseForge, Technic und FTB.
+A modern Minecraft launcher: multiple accounts, all common mod loaders, and content from Modrinth,
+CurseForge, Technic and FTB.
 
-Der Launcher besteht aus zwei Teilen, die über einen lokalen HTTP-Dienst reden. Die Architektur und
-der API-Vertrag stehen in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), der Stand des Funktionsumfangs
-in [docs/FEATURE-PORT.md](docs/FEATURE-PORT.md).
+The launcher consists of two parts that talk to each other over a local HTTP service. The architecture
+and the API contract are described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the state of the
+feature set in [docs/FEATURE-PORT.md](docs/FEATURE-PORT.md).
 
-| Teil | Inhalt |
+| Part | Contents |
 | --- | --- |
-| `app/` | Electron-App mit React, TypeScript, react-router, Tailwind und Iconify. Startet das Backend als Subprozess. |
-| `backend/` | Backend in [Novus](https://github.com/ezTxmMC/novus): Profile, Mods, Inhalte, Launch, Konten, Spieldaten, System. |
-| `bridge/` | Node-Dienst, der den CurseForge-API-Schlüssel hält (siehe unten). |
-| `docs/` | Architektur, API-Vertrag, Feature-Stand. |
+| `app/` | Electron app with React, TypeScript, react-router, Tailwind and Iconify. Starts the backend as a subprocess. |
+| `backend/` | Backend written in [Novus](https://github.com/ezTxmMC/novus): profiles, mods, content, launch, accounts, game data, system. |
+| `bridge/` | Node service that holds the CurseForge API key (see below). |
+| `docs/` | Architecture, API contract, feature state. |
 
-## Entwicklung
+## Development
 
-Voraussetzungen: Node mit pnpm, und der Novus-Compiler `novusc` im `PATH`.
+Requirements: Node with pnpm, and the Novus compiler `novusc` on the `PATH`.
 
 ```bash
-# 1. Backend bauen (erzeugt backend/dist/volt-backend)
+# 1. Build the backend (creates backend/dist/volt-backend)
 cd backend && scripts/build.sh && scripts/smoke.sh && cd ..
 
-# 2. App starten (startet das Backend selbst)
+# 2. Start the app (it starts the backend itself)
 cd app && pnpm install && pnpm dev
 
-# Oberfläche im Browser mit Mock-Daten, ohne Backend
+# UI in the browser with mock data, without a backend
 cd app && pnpm dev:web
 ```
 
-Tests der einzelnen Module liegen in `backend/tests/` (zum Teil mit Netzwerkzugriff, siehe Skriptkopf).
+Tests for the individual modules are in `backend/tests/` (some need network access, see the script header).
 
-## Paketieren
+## Packaging
 
-Ein Lauf erzeugt alle Ziele. Die Backend-Binaries werden vorher für jedes Ziel gebaut:
+One run builds all targets. The backend binaries are built beforehand for each target:
 
 ```bash
-cd backend && scripts/build-release.sh     # alle Ziele nach backend/dist/<os>-<arch>/
-cd app && pnpm package                     # alle Linux-, Windows- und macOS-Ziele nach app/release/
-cd app && node scripts/package.mjs win-x64 # nur ein Ziel
+cd backend && scripts/build-release.sh     # all targets into backend/dist/<os>-<arch>/
+cd app && pnpm package                     # all Linux, Windows and macOS targets into app/release/
+cd app && node scripts/package.mjs win-x64 # a single target only
 ```
 
-| Ziel | Formate | Gebaut auf |
+| Target | Formats | Built on |
 | --- | --- | --- |
-| `linux-x64`, `linux-arm64` | AppImage, deb, rpm, zip, tar.gz, flatpak | Linux (deb/rpm über Docker, siehe unten) |
-| `win-x64`, `win-arm64` | exe (NSIS), msi, zip | Linux mit Wine, oder Windows |
-| `mac-arm64` | dmg, zip | macOS für das DMG (`app/scripts/package-mac.sh`), ZIP auch unter Linux |
+| `linux-x64`, `linux-arm64` | AppImage, deb, rpm, zip, tar.gz, flatpak | Linux (deb/rpm via Docker, see below) |
+| `win-x64`, `win-arm64` | exe (NSIS), msi, zip | Linux with Wine, or Windows |
+| `mac-arm64` | dmg, zip | macOS for the DMG (`app/scripts/package-mac.sh`); ZIP also on Linux |
 
-Hinweise:
-- **deb und rpm** brauchen `dpkg-deb` und `rpmbuild`. Auf Systemen ohne diese Werkzeuge läuft der Build im Container
-  `electronuserland/builder` (mit `docker run`, Projekt und Electron-Cache einbinden).
-- **flatpak** braucht `flatpak-builder` und die Laufzeiten `org.freedesktop.Platform//24.08`,
-  `org.freedesktop.Sdk//24.08` und `org.electronjs.Electron2.BaseApp//24.08` (pro Architektur).
-- **macOS-DMG** lässt sich nur auf macOS erstellen (`hdiutil`, `sips`). Die Builds sind nicht signiert und nicht notarisiert.
-- Prüfsummen aller Artefakte stehen in `app/release/SHA256SUMS.txt`.
+Notes:
+- **deb and rpm** need `dpkg-deb` and `rpmbuild`. On systems without these tools, the build runs in the
+  container `electronuserland/builder` (start it with `docker run`, mounting the project and the Electron cache).
+- **flatpak** needs `flatpak-builder` and the runtimes `org.freedesktop.Platform//24.08`,
+  `org.freedesktop.Sdk//24.08` and `org.electronjs.Electron2.BaseApp//24.08` (per architecture).
+- **macOS DMG** can only be created on macOS (`hdiutil`, `sips`). The builds are neither signed nor notarized.
+- Checksums of all artifacts are in `app/release/SHA256SUMS.txt`.
 
 ## CurseForge
 
-CurseForge verlangt einen Entwicklerschlüssel, der nicht in einen Client gehört. Der `bridge/`-Dienst
-hält den Schlüssel und leitet Anfragen weiter. Schlüssel in `bridge/.env` eintragen und mit `npm start`
-im Ordner `bridge/` starten. Standardadresse: `http://localhost:8787` (unter den Einstellungen änderbar).
-Ohne Bridge bleiben Modrinth, Technic und FTB voll nutzbar, CurseForge wird als nicht verfügbar angezeigt.
+CurseForge requires a developer key, which does not belong in a client. The `bridge/` service
+holds the key and forwards requests. Put the key in `bridge/.env` and start the service with `npm start`
+in the `bridge/` folder. Default address: `http://localhost:8787` (can be changed in the settings).
+Without the bridge, Modrinth, Technic and FTB remain fully usable, and CurseForge is shown as unavailable.
 
-## Discord-Präsenz
+## Discord presence
 
-Dafür braucht es eine Discord-Application-ID, die unter den Einstellungen eingetragen wird. Ohne sie
-meldet der Launcher den Status „nicht konfiguriert“.
+This requires a Discord application ID, which is entered in the settings. Without it,
+the launcher reports the status "not configured".
 
-## Hinweise zum Stand
+## Notes on the current state
 
-Die Java-Version (`volt-*`, `ui/`) wurde durch dieses Projekt ersetzt. Sie ist in der Git-Historie unter
-Commit `03a34ad` erhalten.
+The Java version (`volt-*`, `ui/`) has been replaced by this project. It is preserved in the Git history
+at commit `03a34ad`.

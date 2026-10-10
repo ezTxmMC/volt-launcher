@@ -1,0 +1,277 @@
+# Release workflow: runs on every tag push like v0.2.0 and publishes the installers as a GitHub release.
+#
+# Jobs:
+#   check-version  the tag must match the version in app/package.json
+#   backend        builds and tests the Novus backend for all targets (zig cross compile)
+#   linux          packages linux-x64 and linux-arm64 (native runners)
+#   windows        packages win-x64 and win-arm64
+#   mac            packages mac-arm64 (unsigned DMG and ZIP)
+#   release        collects the installers, writes SHA256SUMS.txt and creates or updates the GitHub release
+#
+# The CDN publish (app/scripts/publish-cdn.mjs) is not part of this workflow; it needs server credentials.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NOVUS_VERSION: v0.1.0-pre.alpha.8
+  ZIG_VERSION: 0.16.0
+  NODE_VERSION: 22
+  PNPM_VERSION: 10
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag with app/package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./app/package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match app/package.json version $PKG. Bump the version first." >&2
+            exit 1
+          fi
+          echo "Releasing $PKG"
+
+  backend:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download novusc
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/novusc" \
+            "https://github.com/ezTxmMC/novus/releases/download/${NOVUS_VERSION}/novusc-x86_64-linux-musl"
+          chmod +x "$RUNNER_TEMP/bin/novusc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          novusc version
+
+      - name: Smoke test the host build
+        run: backend/scripts/smoke.sh --build
+
+      - name: Cross compile all targets
+        run: backend/scripts/build-release.sh
+
+      - name: Pack backend binaries
+        run: tar -C backend -czf backend-dist.tar.gz dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist
+          path: backend-dist.tar.gz
+          if-no-files-found: error
+
+  linux:
+    needs: backend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm flatpak flatpak-builder
+          # Ubuntu 24.04 blocks the unprivileged user namespaces flatpak-builder needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --noninteractive flathub \
+            org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 org.electronjs.Electron2.BaseApp//24.08
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs ${{ matrix.target }}
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.zip' -o -name '*.tar.gz' -o -name '*.flatpak' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.target }}
+          path: upload/*
+          if-no-files-found: error
+
+  windows:
+    needs: backend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs win-x64 win-arm64
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-windows
+          path: upload/*
+          if-no-files-found: error
+
+  mac:
+    needs: backend
+    runs-on: macos-14
+    env:
+      # Builds are unsigned. Add signing and notarization secrets to this job to change that.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs mac-arm64
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-mac
+          path: upload/*
+          if-no-files-found: error
+
+  release:
+    needs: [linux, windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          path: assets
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PRERELEASE=()
+          case "$GITHUB_REF_NAME" in
+            *-*) PRERELEASE=(--prerelease) ;;
+          esac
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* \
+              --verify-tag --title "Volt Launcher $GITHUB_REF_NAME" --generate-notes "${PRERELEASE[@]}"
+          fi
