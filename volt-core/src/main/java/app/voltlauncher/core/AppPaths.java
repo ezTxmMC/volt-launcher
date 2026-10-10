@@ -125,6 +125,32 @@ public final class AppPaths {
         return baseDirectory().resolve("logs");
     }
 
+    /** Per-profile game logs the launcher captured, one file per profile. */
+    public static Path instanceLogPath(String slug) {
+        return logsDirectory().resolve(slug + ".log");
+    }
+
+    // ── backups ───────────────────────────────────────────────────────────────
+
+    /**
+     * Snapshots of whole profiles. Kept outside the instance directory so deleting a profile
+     * does not take its backups with it — restoring after an accidental delete is the point.
+     */
+    public static Path backupsDirectory() {
+        return baseDirectory().resolve("backups");
+    }
+
+    public static Path instanceBackupsDirectory(String slug) {
+        return backupsDirectory().resolve(slug);
+    }
+
+    // ── launcher updates ──────────────────────────────────────────────────────
+
+    /** Where a downloaded launcher update is staged before the user runs it. */
+    public static Path updatesDirectory() {
+        return baseDirectory().resolve("updates");
+    }
+
     // ── exports ───────────────────────────────────────────────────────────────
 
     /** Where exported modpack archives are written, so the user has one place to find them. */

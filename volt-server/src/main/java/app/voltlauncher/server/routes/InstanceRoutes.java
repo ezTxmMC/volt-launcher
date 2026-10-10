@@ -2,6 +2,7 @@ package app.voltlauncher.server.routes;
 
 import app.voltlauncher.auth.MinecraftAccountSession;
 import app.voltlauncher.auth.session.MicrosoftAuth;
+import app.voltlauncher.core.config.SettingsStore;
 import app.voltlauncher.core.util.SystemOpener;
 import app.voltlauncher.game.MinecraftLauncherService;
 import app.voltlauncher.game.instance.Instance;
@@ -9,7 +10,9 @@ import app.voltlauncher.game.instance.InstanceBusyRegistry;
 import app.voltlauncher.game.instance.InstanceSettings;
 import app.voltlauncher.game.instance.ModpackOrigin;
 import app.voltlauncher.game.instance.RunningInstanceStatus;
+import app.voltlauncher.game.install.InstallationVerifier;
 import app.voltlauncher.game.launch.InstanceLauncher;
+import app.voltlauncher.game.launch.LaunchOptions;
 import app.voltlauncher.game.platform.IPlatform;
 import app.voltlauncher.game.platform.version.AvailableVersion;
 import app.voltlauncher.server.route.RequestBody;
@@ -29,10 +32,12 @@ public final class InstanceRoutes implements RouteModule {
 
     private final MinecraftLauncherService launcher;
     private final MicrosoftAuth auth;
+    private final SettingsStore settings;
 
-    public InstanceRoutes(MinecraftLauncherService launcher, MicrosoftAuth auth) {
+    public InstanceRoutes(MinecraftLauncherService launcher, MicrosoftAuth auth, SettingsStore settings) {
         this.launcher = launcher;
         this.auth = auth;
+        this.settings = settings;
     }
 
     @Override
@@ -42,11 +47,19 @@ public final class InstanceRoutes implements RouteModule {
         routes.get("/api/instances/loader-versions", this::listLoaderVersions);
 
         routes.get("/api/instances", this::listInstances);
+        routes.get("/api/instances/groups", this::listGroups);
         routes.post("/api/instances", this::createInstance);
         routes.patch("/api/instances/{name}", this::renameInstance);
         routes.delete("/api/instances/{name}", this::deleteInstance);
         routes.patch("/api/instances/{name}/settings", this::updateSettings);
+        routes.post("/api/instances/{name}/duplicate", this::duplicateInstance);
+        routes.post("/api/instances/{name}/favourite", this::setFavourite);
+        routes.post("/api/instances/{name}/group", this::setGroup);
+        routes.post("/api/instances/{name}/icon", this::setIcon);
         routes.post("/api/instances/{name}/open-folder", this::openFolder);
+
+        routes.post("/api/instances/{name}/verify", this::verify);
+        routes.get("/api/instances/{name}/verify", this::lastVerifyReport);
 
         routes.post("/api/instances/{name}/launch", this::launch);
         routes.get("/api/instances/{name}/launch-status", this::launchStatus);
@@ -90,6 +103,10 @@ public final class InstanceRoutes implements RouteModule {
         return new JSONObject().put("instances", array);
     }
 
+    private JSONObject listGroups(Context ctx) throws Exception {
+        return new JSONObject().put("groups", new JSONArray(launcher.listGroups()));
+    }
+
     private JSONObject createInstance(Context ctx) throws Exception {
         JSONObject body = RequestBody.json(ctx);
         Instance instance = launcher.createInstance(
@@ -117,6 +134,47 @@ public final class InstanceRoutes implements RouteModule {
         return new JSONObject().put("instance", toJson(instance));
     }
 
+    /** Copying a profile can move gigabytes, so it runs as a task the UI follows. */
+    private JSONObject duplicateInstance(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        String taskId = launcher.duplicateInstanceAsync(ctx.pathParam("name"), body.optString("name", ""));
+        return new JSONObject().put("taskId", taskId);
+    }
+
+    private JSONObject setFavourite(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        Instance instance = launcher.setFavourite(ctx.pathParam("name"), body.optBoolean("favourite", true));
+        return new JSONObject().put("instance", toJson(instance));
+    }
+
+    private JSONObject setGroup(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        Instance instance = launcher.setGroup(ctx.pathParam("name"), body.optString("group", ""));
+        return new JSONObject().put("instance", toJson(instance));
+    }
+
+    private JSONObject setIcon(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        Instance instance = launcher.setIconUrl(ctx.pathParam("name"), body.optString("iconUrl", ""));
+        return new JSONObject().put("instance", toJson(instance));
+    }
+
+    // ── verify and repair ─────────────────────────────────────────────────────
+
+    private JSONObject verify(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        String taskId = launcher.verifyInstanceAsync(
+                ctx.pathParam("name"),
+                body.optBoolean("deep", false),
+                body.optBoolean("repair", false));
+        return new JSONObject().put("taskId", taskId);
+    }
+
+    private JSONObject lastVerifyReport(Context ctx) {
+        InstallationVerifier.Report report = launcher.lastVerifyReport(ctx.pathParam("name"));
+        return new JSONObject().put("report", report == null ? JSONObject.NULL : report.toJson());
+    }
+
     private JSONObject openFolder(Context ctx) throws Exception {
         Path folder = launcher.getInstanceFolder(ctx.pathParam("name"));
         openInFileManager(folder);
@@ -132,8 +190,14 @@ public final class InstanceRoutes implements RouteModule {
         launcher.findInstance(name);
         launcher.busyRegistry().requireIdle(name);
 
-        MinecraftAccountSession session = auth.getLaunchSession();
-        launcher.launchInstanceAsync(session, name);
+        // Quick play travels with the launch rather than being stored on the profile: joining a
+        // particular server is a property of this launch, not of the profile.
+        LaunchOptions options = LaunchOptions.fromJson(RequestBody.json(ctx));
+
+        // With offline mode allowed, an unreachable Microsoft falls back to the cached session
+        // rather than blocking the launch entirely.
+        MinecraftAccountSession session = auth.getLaunchSession(settings.get().offlineModeAllowed());
+        launcher.launchInstanceAsync(session, name, options);
         return new JSONObject().put("instanceName", name);
     }
 
@@ -175,6 +239,12 @@ public final class InstanceRoutes implements RouteModule {
                 .put("versionType", instance.versionType())
                 .put("createdAt", instance.createdAt())
                 .put("lastPlayedAt", instance.lastPlayedAt())
+                .put("totalPlaytimeMs", instance.totalPlaytimeMs())
+                .put("favourite", instance.favourite())
+                .put("groupName", instance.groupName())
+                .put("iconUrl", instance.iconUrl())
+                .put("gameDirectory", instance.gameDirectory().toString())
+                .put("customGameDirectory", instance.hasCustomGameDirectory())
                 .put("javaMajorVersion", instance.javaMajorVersion())
                 .put("javaComponent", instance.javaComponent())
                 .put("settings", instance.settings().toJson())

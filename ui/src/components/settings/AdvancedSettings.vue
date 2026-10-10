@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue";
 import { Icon } from "@iconify/vue";
 import { useLauncher } from "@/composables/useLauncher";
 import SettingsPanel from "./SettingsPanel.vue";
+import SettingsToggle from "./SettingsToggle.vue";
 
 const {
   t,
@@ -57,6 +58,24 @@ const performReset = async () => {
         :step="1"
         :label="t('settings.concurrentDownloads')"
       />
+    </SettingsPanel>
+
+    <SettingsPanel :title="t('settings.backups')" :description="t('settings.backupsHint')" icon="lucide:archive">
+      <div class="flex flex-col gap-3">
+        <VoltSlider
+          v-model="settings.backupsToKeep"
+          :min="0"
+          :max="20"
+          :step="1"
+          :label="t('settings.backupsToKeep')"
+        />
+        <span class="text-[length:var(--text-2xs)] text-white/30">{{ t("settings.backupsToKeepHint") }}</span>
+        <SettingsToggle
+          v-model="settings.backupBeforePackUpdate"
+          :label="t('settings.backupBeforePackUpdate')"
+          :description="t('settings.backupBeforePackUpdateHint')"
+        />
+      </div>
     </SettingsPanel>
 
     <SettingsPanel

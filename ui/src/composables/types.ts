@@ -19,7 +19,18 @@ export interface InstanceSettings {
   jvmArgs: string | null;
   resolutionWidth: number | null;
   resolutionHeight: number | null;
+  fullscreen: boolean | null;
   javaPath: string | null;
+  /** Extra environment variables for the game process. */
+  envVars: Record<string, string>;
+  preLaunchCommand: string | null;
+  postExitCommand: string | null;
+  /** Command the java invocation is passed to, e.g. `gamemoderun`. */
+  wrapperCommand: string | null;
+  /** Absolute path to run the game in instead of the managed directory. */
+  gameDirectory: string | null;
+  /** Per-profile override of the launcher-wide "hide on launch" preference. */
+  hideLauncher: boolean | null;
 }
 
 export type LaunchPhase = "idle" | "installing" | "launching" | "running" | "failed";
@@ -31,6 +42,16 @@ export interface LauncherInstance {
   versionType: string;
   createdAt: number;
   lastPlayedAt: number;
+  /** Time spent in the game across every session. */
+  totalPlaytimeMs: number;
+  favourite: boolean;
+  /** User-defined folder; blank means ungrouped. */
+  groupName: string;
+  /** Artwork the user picked; blank falls back to the pack icon or the version emoji. */
+  iconUrl: string;
+  /** Where the game actually runs, override included. */
+  gameDirectory: string;
+  customGameDirectory: boolean;
   javaMajorVersion: number;
   javaComponent: string;
   settings: InstanceSettings;
@@ -156,7 +177,7 @@ export interface SavedSkin {
 
 // ── Content providers ─────────────────────────────────────────────────────────
 
-export type ProviderId = "modrinth" | "curseforge";
+export type ProviderId = "modrinth" | "curseforge" | "technic" | "ftb";
 
 export type ContentKind = "mod" | "modpack" | "resourcepack" | "shader" | "datapack";
 
@@ -258,10 +279,20 @@ export interface LauncherSettings {
   openLogsOnLaunch: boolean;
   autoUpdate: boolean;
   betaUpdates: boolean;
+  /** `owner/repo` the update check reads releases from. */
+  updateRepository: string;
+  /** Blank until the user registers a Discord application; presence stays off until then. */
+  discordApplicationId: string;
   defaultMaxMemoryMb: number;
   defaultMinMemoryMb: number;
   defaultJvmArgs: string;
   maxConcurrentDownloads: number;
+  /** How many snapshots to keep per profile; 0 keeps every one. */
+  backupsToKeep: number;
+  backupBeforePackUpdate: boolean;
+  profileSort: ProfileSort;
+  favouritesFirst: boolean;
+  offlineModeAllowed: boolean;
   curseForgeBridgeUrl: string;
   javaRuntimes: JavaRuntimeEntry[];
 }
@@ -282,6 +313,155 @@ export type SettingsSectionId =
   | "advanced";
 
 export type MainTab = "home" | "profiles" | "skins" | "discover" | "settings";
+
+export type ProfileSort = "lastPlayed" | "name" | "playtime" | "created";
+
+// ── Worlds, servers and screenshots ───────────────────────────────────────────
+
+export interface GameWorld {
+  /** The directory under `saves/`, which is also the quick-play target. */
+  folderName: string;
+  name: string;
+  lastPlayed: number;
+  sizeBytes: number;
+  gameMode: string;
+  hardcore: boolean;
+  versionName: string;
+  hasIcon: boolean;
+  /** False when level.dat could not be parsed; the world is still listed. */
+  readable: boolean;
+  problem: string;
+}
+
+export interface ServerEntry {
+  index: number;
+  name: string;
+  address: string;
+  /** Base64 PNG the server sent, empty until it has been pinged in-game. */
+  icon: string;
+  acceptTextures: boolean;
+}
+
+export interface Screenshot {
+  fileName: string;
+  takenAt: number;
+  sizeBytes: number;
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+
+export type LogKind = "launcher" | "game" | "crash";
+
+export interface LogSource {
+  id: string;
+  label: string;
+  kind: LogKind;
+  sizeBytes: number;
+  modifiedAt: number;
+  /** True for the file a running game is still writing to. */
+  live: boolean;
+  compressed: boolean;
+}
+
+export interface LogChunk {
+  id: string;
+  offset: number;
+  /** Where a follow-up read should continue from. */
+  nextOffset: number;
+  size: number;
+  text: string;
+  truncated: boolean;
+}
+
+// ── Backups ───────────────────────────────────────────────────────────────────
+
+export interface ProfileBackup {
+  /** The archive's file name, which is how it is addressed. */
+  id: string;
+  label: string;
+  createdAt: number;
+  sizeBytes: number;
+  versionId: string;
+  fileCount: number;
+}
+
+// ── Verification ──────────────────────────────────────────────────────────────
+
+export interface VerifyReport {
+  checked: number;
+  missing: number;
+  corrupt: number;
+  repaired: number;
+  healthy: boolean;
+  problems: string[];
+}
+
+// ── Tasks ─────────────────────────────────────────────────────────────────────
+
+export type TaskState = "running" | "done" | "failed" | "cancelled";
+
+export interface LauncherTask {
+  id: string;
+  /** Stable identifier of the operation type, used to pick an icon. */
+  kind: string;
+  title: string;
+  subject: string;
+  stage: string | null;
+  completed: number;
+  total: number;
+  /** Completion percentage, or -1 when the work cannot be counted. */
+  percent: number;
+  state: TaskState;
+  message: string | null;
+  startedAt: number;
+  finishedAt: number;
+  cancellable: boolean;
+}
+
+// ── Launcher updates ──────────────────────────────────────────────────────────
+
+export interface UpdateInfo {
+  available: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  name: string;
+  notes: string;
+  publishedAt: string;
+  releaseUrl: string;
+  assetName: string;
+  downloadable: boolean;
+  assetSize: number;
+  prerelease: boolean;
+  /** Why no update is on offer, when that needs explaining. */
+  reason: string;
+}
+
+export type DiscordState = "disabled" | "not_configured" | "waiting_for_discord" | "connected";
+
+export interface DiscordStatus {
+  state: DiscordState;
+  message: string;
+  transport: string;
+  configured: boolean;
+}
+
+// ── Quick play ────────────────────────────────────────────────────────────────
+
+export type QuickPlayKind = "singleplayer" | "multiplayer" | "realms";
+
+export interface LaunchOptions {
+  quickPlay?: QuickPlayKind;
+  quickPlayTarget?: string;
+  demo?: boolean;
+}
+
+/** A required dependency that is missing or switched off. */
+export interface DependencyWarning {
+  fileName: string;
+  projectName: string;
+  dependencyProjectId: string;
+  state: "missing" | "disabled";
+}
 
 // ── Notifications ─────────────────────────────────────────────────────────────
 

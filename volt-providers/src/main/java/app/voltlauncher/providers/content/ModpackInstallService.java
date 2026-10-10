@@ -10,9 +10,13 @@ import app.voltlauncher.game.store.ContentManifestStore;
 import app.voltlauncher.providers.ProviderRegistry;
 import app.voltlauncher.providers.curseforge.CurseForgePackInstaller;
 import app.voltlauncher.providers.curseforge.CurseForgeProvider;
+import app.voltlauncher.providers.ftb.FtbPackInstaller;
+import app.voltlauncher.providers.ftb.FtbProvider;
 import app.voltlauncher.providers.model.ProjectVersion;
 import app.voltlauncher.providers.model.ProviderId;
 import app.voltlauncher.providers.modrinth.ModrinthPackInstaller;
+import app.voltlauncher.providers.technic.TechnicPackInstaller;
+import app.voltlauncher.providers.technic.TechnicProvider;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -71,6 +75,7 @@ public final class ModpackInstallService {
 
     private final MinecraftLauncherService launcher;
     private final ProviderRegistry providers;
+    private final SettingsStore settings;
     private final Map<ProviderId, AbstractModpackInstaller> installers = new EnumMap<>(ProviderId.class);
     private final ConcurrentHashMap<String, Job> jobs = new ConcurrentHashMap<>();
 
@@ -78,12 +83,24 @@ public final class ModpackInstallService {
                                  CurseForgeProvider curseForge, SettingsStore settings) {
         this.launcher = launcher;
         this.providers = providers;
+        this.settings = settings;
         register(new ModrinthPackInstaller(http));
         register(new CurseForgePackInstaller(http, curseForge, settings));
+        register(new TechnicPackInstaller(http, (TechnicProvider) providers.require(ProviderId.TECHNIC),
+                this::newestLoaderVersion));
+        register(new FtbPackInstaller(http, (FtbProvider) providers.require(ProviderId.FTB)));
     }
 
     private void register(AbstractModpackInstaller installer) {
         installers.put(installer.provider(), installer);
+    }
+
+    /** The newest build of a loader for a Minecraft version, as a launcher version id. */
+    private String newestLoaderVersion(String platformId, String minecraftVersion) throws Exception {
+        return launcher.listLoaderVersions(platformId, minecraftVersion).stream()
+                .findFirst()
+                .map(app.voltlauncher.game.platform.version.AvailableVersion::id)
+                .orElse("");
     }
 
     // ── install from a provider ───────────────────────────────────────────────
@@ -121,6 +138,10 @@ public final class ModpackInstallService {
             throw new IllegalArgumentException("Pack file not found: " + archive);
         }
         AbstractModpackInstaller installer = installerFor(archive);
+        if (!installer.supportsImport()) {
+            throw new IllegalArgumentException(
+                    installer.provider().displayName() + " packs cannot be imported from a file.");
+        }
         String sourceFile = archive.getFileName().toString();
 
         return startJob(jobId -> {
@@ -139,7 +160,12 @@ public final class ModpackInstallService {
         });
     }
 
-    /** Picks the installer for an archive by the manifest it carries. */
+    /**
+     * Picks the installer for an archive by the manifest it carries.
+     *
+     * <p>The format is read out of the file rather than taken from its extension, because all
+     * three importable formats are zips and users regularly rename them.
+     */
     public AbstractModpackInstaller installerFor(Path archive) {
         if (AbstractModpackInstaller.hasEntry(archive, ModrinthPackInstaller.indexEntry())) {
             return require(ProviderId.MODRINTH);
@@ -147,9 +173,20 @@ public final class ModpackInstallService {
         if (AbstractModpackInstaller.hasEntry(archive, CurseForgePackInstaller.manifestEntry())) {
             return require(ProviderId.CURSEFORGE);
         }
+        if (AbstractModpackInstaller.hasEntryEndingWith(archive, TechnicPackInstaller.versionJsonEntry())) {
+            return require(ProviderId.TECHNIC);
+        }
+        if (AbstractModpackInstaller.hasEntryEndingWith(archive, TechnicPackInstaller.modpackJarEntry())) {
+            // A Technic zip whose bin/ holds only the merged jar cannot state its Forge build, and
+            // guessing it would produce a profile that launches the wrong loader.
+            throw new IllegalArgumentException(
+                    "This looks like a Technic pack, but it carries no bin/version.json, so the "
+                            + "launcher cannot tell which Forge build it needs. Install it from "
+                            + "Discover \u2192 Technic instead.");
+        }
         throw new IllegalArgumentException(
                 "Not a supported modpack: " + archive.getFileName()
-                        + ". Expected a Modrinth .mrpack or a CurseForge .zip export.");
+                        + ". Expected a Modrinth .mrpack, a CurseForge .zip export or a Technic client zip.");
     }
 
     // ── update an installed pack ──────────────────────────────────────────────
@@ -216,6 +253,10 @@ public final class ModpackInstallService {
             }
 
             AbstractModpackInstaller.PackInfo info = installer.fetchPackInfo(versionId);
+            // Taken before anything is touched: an update deletes the files the new release no
+            // longer ships, and that is exactly the change people want to be able to undo.
+            backUpBeforeUpdate(instance.name());
+
             launcher.busyRegistry().begin(instance.name(), "updating modpack");
             try {
                 jobs.put(jobId, new Job(Phase.INSTALLING, "installing", 0, 0, null, instance));
@@ -233,7 +274,7 @@ public final class ModpackInstallService {
 
                 Instance populated = target;
                 jobs.put(jobId, new Job(Phase.DOWNLOADING_CONTENT, "downloading", 0, 0, null, populated));
-                List<ContentSource> installed = installer.applyPackContents(populated, info.archiveFile(),
+                List<ContentSource> installed = installer.applyPackContents(populated, info,
                         (stage, completed, total) -> {
                             jobs.put(jobId, new Job(Phase.DOWNLOADING_CONTENT, stage, completed, total, null, populated));
                             launcher.busyRegistry().progress(populated.name(), stage, completed, total);
@@ -299,7 +340,7 @@ public final class ModpackInstallService {
         try {
             jobs.put(jobId, new Job(Phase.DOWNLOADING_CONTENT, "downloading", 0, 0, null, instance));
 
-            List<ContentSource> installed = installer.applyPackContents(instance, info.archiveFile(),
+            List<ContentSource> installed = installer.applyPackContents(instance, info,
                     (stage, completed, total) -> {
                         jobs.put(jobId, new Job(Phase.DOWNLOADING_CONTENT, stage, completed, total, null, instance));
                         launcher.busyRegistry().progress(instance.name(), stage, completed, total);
@@ -328,6 +369,23 @@ public final class ModpackInstallService {
             Path file = instance.gameDirectory().resolve(stale.contentType()).resolve(stale.fileName());
             Files.deleteIfExists(file);
             Files.deleteIfExists(file.resolveSibling(stale.fileName() + ".disabled"));
+        }
+    }
+
+    /**
+     * Snapshots the profile before a pack update, when the user asked for that.
+     *
+     * <p>A failure here is reported but not fatal: refusing to update because the safety net
+     * could not be built would be a worse outcome than updating without it, and the user is told
+     * either way.
+     */
+    private void backUpBeforeUpdate(String instanceName) {
+        try {
+            if (!settings.get().backupBeforePackUpdate()) return;
+            launcher.backups().create(instanceName, "Before a modpack update");
+        } catch (Exception e) {
+            System.err.println("[Modpack] Could not back up '" + instanceName + "' before the update: "
+                    + e.getMessage());
         }
     }
 
@@ -375,6 +433,7 @@ public final class ModpackInstallService {
     }
 
     private void deleteQuietly(Path path) {
+        if (path == null) return;
         try {
             Files.deleteIfExists(path);
         } catch (Exception ignored) {

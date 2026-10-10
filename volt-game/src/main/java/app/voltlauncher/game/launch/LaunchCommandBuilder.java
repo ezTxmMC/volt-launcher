@@ -1,6 +1,7 @@
 package app.voltlauncher.game.launch;
 
 import app.voltlauncher.auth.MinecraftAccountSession;
+import app.voltlauncher.core.AppPaths;
 import app.voltlauncher.core.config.LauncherSettings;
 import app.voltlauncher.core.config.SettingsStore;
 import app.voltlauncher.game.install.AssetInstaller;
@@ -42,11 +43,17 @@ public final class LaunchCommandBuilder {
 
     public List<String> build(MinecraftAccountSession session, AssetInstaller.Installation install,
                               JavaRuntimeResolver.JavaRuntime runtime) {
+        return build(session, install, runtime, LaunchOptions.none());
+    }
 
+    public List<String> build(MinecraftAccountSession session, AssetInstaller.Installation install,
+                              JavaRuntimeResolver.JavaRuntime runtime, LaunchOptions options) {
+
+        LaunchOptions launchOptions = options == null ? LaunchOptions.none() : options;
         InstanceSettings settings = install.instance().settings();
         LauncherSettings global = globalSettings();
-        Map<String, String> vars = buildVars(session, install, settings);
-        Map<String, Boolean> features = buildFeatures(settings);
+        Map<String, String> vars = buildVars(session, install, settings, launchOptions);
+        Map<String, Boolean> features = buildFeatures(settings, launchOptions, install.launchMetadata());
         JSONObject meta = install.launchMetadata();
         boolean legacy = !meta.has("arguments") && meta.has("minecraftArguments");
 
@@ -58,6 +65,9 @@ public final class LaunchCommandBuilder {
                 settings.minMemoryMb(), global == null ? null : global.defaultMinMemoryMb(), DEFAULT_MIN_MEMORY_MB);
 
         List<String> command = new ArrayList<>();
+        // A wrapper such as `gamemoderun` or `prime-run` has to sit in front of the java binary,
+        // because it execs what follows rather than being read as an argument.
+        command.addAll(wrapperPrefix(settings));
         command.add(runtime.javaExecutable().toString());
 
         // Heap sizing is owned by the launcher, so any -Xmx/-Xms coming from version metadata
@@ -85,9 +95,12 @@ public final class LaunchCommandBuilder {
 
         command.add(install.mainClass());
 
+        List<String> gameArgs = new ArrayList<>();
         for (String arg : collectArgs(meta, "game", features)) {
-            command.add(apply(arg, vars));
+            gameArgs.add(apply(arg, vars));
         }
+        appendExtraGameArgs(gameArgs, settings, launchOptions);
+        command.addAll(gameArgs);
 
         return List.copyOf(command);
     }
@@ -97,18 +110,89 @@ public final class LaunchCommandBuilder {
     }
 
     /**
-     * Launcher features the version metadata can gate arguments on. Declaring a custom
-     * resolution is what makes Mojang's metadata emit {@code --width}/{@code --height}.
+     * Adds the flags the version metadata did not emit itself.
+     *
+     * <p>Fullscreen has no rule block in any version's metadata, and quick play only exists from
+     * 1.20 onwards — so for older builds the multiplayer case falls back to {@code --server} and
+     * {@code --port}, which every version since 1.6 understands. Anything the metadata already
+     * produced is left alone rather than passed twice.
      */
-    private Map<String, Boolean> buildFeatures(InstanceSettings settings) {
+    private void appendExtraGameArgs(List<String> gameArgs, InstanceSettings settings, LaunchOptions options) {
+        if (settings.isFullscreen() && !gameArgs.contains("--fullscreen")) {
+            gameArgs.add("--fullscreen");
+        }
+        if (options.demo() && !gameArgs.contains("--demo")) {
+            gameArgs.add("--demo");
+        }
+        if (!options.hasQuickPlay()) return;
+
+        switch (options.quickPlay()) {
+            case SINGLEPLAYER -> {
+                if (!gameArgs.contains("--quickPlaySingleplayer")) {
+                    gameArgs.add("--quickPlaySingleplayer");
+                    gameArgs.add(options.quickPlayTarget());
+                }
+            }
+            case MULTIPLAYER -> {
+                if (!gameArgs.contains("--quickPlayMultiplayer") && !gameArgs.contains("--server")) {
+                    gameArgs.add("--server");
+                    gameArgs.add(options.serverHost());
+                    gameArgs.add("--port");
+                    gameArgs.add(options.serverPort());
+                }
+            }
+            case REALMS -> {
+                if (!gameArgs.contains("--quickPlayRealms")) {
+                    gameArgs.add("--quickPlayRealms");
+                    gameArgs.add(options.quickPlayTarget());
+                }
+            }
+            case NONE -> { /* nothing to add */ }
+        }
+    }
+
+    /** Splits a wrapper command into its own argument list; blank means no wrapper. */
+    private List<String> wrapperPrefix(InstanceSettings settings) {
+        String wrapper = settings.wrapperCommand();
+        if (wrapper == null || wrapper.isBlank()) return List.of();
+        List<String> parts = new ArrayList<>();
+        for (String part : wrapper.trim().split("\\s+")) {
+            if (!part.isBlank()) parts.add(part);
+        }
+        return parts;
+    }
+
+    /**
+     * Launcher features the version metadata can gate arguments on. Declaring a custom
+     * resolution is what makes Mojang's metadata emit {@code --width}/{@code --height}, and the
+     * quick-play flags are what make it emit the corresponding {@code --quickPlay*} arguments.
+     */
+    private Map<String, Boolean> buildFeatures(InstanceSettings settings, LaunchOptions options,
+                                               JSONObject meta) {
         boolean customResolution = settings.resolutionWidth() != null && settings.resolutionHeight() != null;
+        boolean quickPlaySupported = supportsQuickPlay(meta);
         return Map.of(
                 "has_custom_resolution", customResolution,
-                "is_demo_user", false,
-                "has_quick_plays_support", false,
-                "is_quick_play_singleplayer", false,
-                "is_quick_play_multiplayer", false,
-                "is_quick_play_realms", false);
+                "is_demo_user", options.demo(),
+                "has_quick_plays_support", quickPlaySupported && options.hasQuickPlay(),
+                "is_quick_play_singleplayer",
+                quickPlaySupported && options.quickPlay() == LaunchOptions.QuickPlay.SINGLEPLAYER,
+                "is_quick_play_multiplayer",
+                quickPlaySupported && options.quickPlay() == LaunchOptions.QuickPlay.MULTIPLAYER,
+                "is_quick_play_realms",
+                quickPlaySupported && options.quickPlay() == LaunchOptions.QuickPlay.REALMS);
+    }
+
+    /**
+     * Whether this version's metadata knows about quick play at all. Claiming the feature on a
+     * version that does not declare it changes nothing — the arguments simply never appear — so
+     * this is checked to decide whether the legacy {@code --server} fallback is needed.
+     */
+    static boolean supportsQuickPlay(JSONObject meta) {
+        JSONObject arguments = meta == null ? null : meta.optJSONObject("arguments");
+        JSONArray game = arguments == null ? null : arguments.optJSONArray("game");
+        if (game == null) return false;
+        return game.toString().contains("quickPlay");
     }
 
     /**
@@ -148,7 +232,7 @@ public final class LaunchCommandBuilder {
     }
 
     private Map<String, String> buildVars(MinecraftAccountSession session, AssetInstaller.Installation install,
-                                          InstanceSettings settings) {
+                                          InstanceSettings settings, LaunchOptions options) {
         Map<String, String> vars = new HashMap<>();
         vars.put("auth_player_name", session.username());
         vars.put("version_name", install.launchVersionId());
@@ -175,6 +259,18 @@ public final class LaunchCommandBuilder {
                 settings.resolutionHeight() != null ? settings.resolutionHeight() : DEFAULT_HEIGHT));
         vars.put("game_assets", install.assetsDirectory().resolve("virtual")
                 .resolve(install.assetIndexId()).toString());
+
+        // Quick play: the game writes a log of what it joined to quickPlayPath, and reads the
+        // target from whichever of the three placeholders its feature rule enabled.
+        vars.put("quickPlayPath", AppPaths.logsDirectory()
+                .resolve(install.instance().slug() + "-quickplay.json").toString());
+        vars.put("quickPlaySingleplayer",
+                options.quickPlay() == LaunchOptions.QuickPlay.SINGLEPLAYER ? options.quickPlayTarget() : "");
+        vars.put("quickPlayMultiplayer",
+                options.quickPlay() == LaunchOptions.QuickPlay.MULTIPLAYER ? options.quickPlayTarget() : "");
+        vars.put("quickPlayRealms",
+                options.quickPlay() == LaunchOptions.QuickPlay.REALMS ? options.quickPlayTarget() : "");
+
         if (install.loggingConfigPath() != null) {
             vars.put("path", install.loggingConfigPath().toString());
         }

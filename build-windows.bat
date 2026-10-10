@@ -54,6 +54,22 @@ mkdir "%OUTPUT_DIR%\electron"
 REM Copy native binary
 copy "target\%BINARY_NAME%.exe" "%OUTPUT_DIR%\%BINARY_NAME%.exe"
 
+REM Embed the app icon - GraalVM native-image leaves the exe with a default icon
+if exist "packaging\windows\voltlauncher.ico" (
+    where rcedit >nul 2>nul
+    if errorlevel 1 (
+        echo WARNING: rcedit not found in PATH - %BINARY_NAME%.exe keeps the default icon.
+        echo   Install it with: npm install -g rcedit
+    ) else (
+        rcedit "%OUTPUT_DIR%\%BINARY_NAME%.exe" --set-icon "packaging\windows\voltlauncher.ico"
+        echo Icon embedded into %BINARY_NAME%.exe
+    )
+) else (
+    echo WARNING: No icon found at packaging\windows\voltlauncher.ico
+)
+
+copy "packaging\windows\voltlauncher.ico" "%OUTPUT_DIR%\voltlauncher.ico" >nul 2>nul
+
 REM Copy electron binary alongside main binary
 xcopy /e /i /q "volt-app\src\main\resources\electron-bin\%ELECTRON_DIR%" "%OUTPUT_DIR%\electron\%ELECTRON_DIR%\"
 

@@ -49,12 +49,52 @@ public final class SessionManager {
     }
 
     public synchronized MinecraftAccountSession getLaunchSession() throws Exception {
+        return getLaunchSession(false);
+    }
+
+    /**
+     * The session to launch with, refreshing an expired token first.
+     *
+     * @param allowOffline when the refresh fails because the network is unreachable, launch with
+     *                     the cached session anyway. The stale token means servers will refuse the
+     *                     account, but single-player works — which beats not starting at all when
+     *                     Microsoft is down. A token the servers <em>rejected</em> is never
+     *                     accepted this way: that needs a real sign-in, and saying so is the only
+     *                     useful answer.
+     */
+    public synchronized MinecraftAccountSession getLaunchSession(boolean allowOffline) throws Exception {
         ensureLoaded();
         if (selectedUuid == null) throw new IllegalStateException("Not logged in");
         MinecraftAccountSession session = sessionCache.get(selectedUuid);
         if (session == null) throw new IllegalStateException("Not logged in");
         if (!needsRefresh(session)) return session;
-        return refresh(session);
+
+        try {
+            return refresh(session);
+        } catch (Exception e) {
+            if (!allowOffline || !isNetworkFailure(e)) throw e;
+            System.err.println("[Auth] Could not reach Microsoft; launching offline with the cached session: "
+                    + e.getMessage());
+            return session;
+        }
+    }
+
+    /**
+     * Whether a failure was the network rather than the credentials. Walks the cause chain,
+     * because the HTTP client wraps the real cause several layers deep.
+     */
+    static boolean isNetworkFailure(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof java.net.UnknownHostException
+                    || current instanceof java.net.ConnectException
+                    || current instanceof java.net.SocketTimeoutException
+                    || current instanceof java.net.http.HttpTimeoutException
+                    || current instanceof java.net.NoRouteToHostException) {
+                return true;
+            }
+            if (current.getCause() == current) break;
+        }
+        return false;
     }
 
     public synchronized AuthResult getStoredSummary() throws Exception {

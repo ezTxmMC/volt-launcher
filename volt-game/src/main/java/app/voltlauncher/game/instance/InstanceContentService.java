@@ -7,8 +7,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Stream;
 
 /**
@@ -126,6 +128,86 @@ public final class InstanceContentService {
         ContentSource source = manifests.read(instance.slug()).find(type.folder(), fileName);
         return new ContentEntry(fileName, Files.size(target), nowEnabled, source);
     }
+
+    /**
+     * Enables or disables every file of one kind in a single pass.
+     *
+     * <p>Turning all mods off and the game on is the standard way to find out whether a crash
+     * comes from the mods or the profile, and doing it one file at a time through the UI is
+     * unusable once a pack has two hundred of them.
+     *
+     * @return how many files actually changed state
+     */
+    public int setAllEnabled(String instanceName, ContentType type, boolean enabled) throws Exception {
+        Instance instance = instanceManager.findByName(instanceName);
+        Path dir = instance.gameDirectory().resolve(type.folder());
+        if (!Files.isDirectory(dir)) return 0;
+
+        int changed = 0;
+        List<Path> files;
+        try (Stream<Path> stream = Files.list(dir)) {
+            files = stream.filter(Files::isRegularFile).toList();
+        }
+        for (Path file : files) {
+            String name = file.getFileName().toString();
+            boolean currentlyEnabled = !name.endsWith(DISABLED_SUFFIX);
+            if (currentlyEnabled == enabled) continue;
+
+            Path target = enabled
+                    ? file.resolveSibling(name.substring(0, name.length() - DISABLED_SUFFIX.length()))
+                    : file.resolveSibling(name + DISABLED_SUFFIX);
+            try {
+                Files.move(file, target, StandardCopyOption.REPLACE_EXISTING);
+                changed++;
+            } catch (Exception e) {
+                // One locked file must not stop the sweep; the rest still switch over.
+                System.err.println("[Content] Could not toggle " + name + ": " + e.getMessage());
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * Required dependencies that are missing or switched off.
+     *
+     * <p>Disabling a library mod that six other mods need produces a crash on the next launch with
+     * no obvious cause, so the launcher points at it before the game does.
+     */
+    public List<DependencyWarning> checkDependencies(String instanceName, ContentType type) throws Exception {
+        List<ContentEntry> entries = list(instanceName, type);
+
+        // A dependency is satisfied by any installed file of the same kind belonging to that
+        // project, regardless of which file name it happens to carry.
+        Map<String, Boolean> enabledByProject = new HashMap<>();
+        for (ContentEntry entry : entries) {
+            ContentSource source = entry.source();
+            if (source == null || source.projectId().isEmpty()) continue;
+            enabledByProject.merge(source.projectId(), entry.enabled(), (a, b) -> a || b);
+        }
+
+        List<DependencyWarning> warnings = new ArrayList<>();
+        for (ContentEntry entry : entries) {
+            ContentSource source = entry.source();
+            if (source == null || !entry.enabled()) continue;
+            for (String dependency : source.requiredDependencies()) {
+                if (dependency == null || dependency.isBlank()) continue;
+                Boolean enabled = enabledByProject.get(dependency);
+                if (Boolean.TRUE.equals(enabled)) continue;
+                warnings.add(new DependencyWarning(
+                        entry.fileName(),
+                        source.projectName().isEmpty() ? entry.fileName() : source.projectName(),
+                        dependency,
+                        enabled == null ? "missing" : "disabled"));
+            }
+        }
+        return warnings;
+    }
+
+    /**
+     * @param state {@code missing} when nothing provides the dependency, {@code disabled} when it
+     *              is installed but switched off
+     */
+    public record DependencyWarning(String fileName, String projectName, String dependencyProjectId, String state) {}
 
     /** Absolute path of a tracked file, whether it is currently enabled or disabled. */
     public Path resolve(String instanceName, ContentType type, String fileName) throws Exception {

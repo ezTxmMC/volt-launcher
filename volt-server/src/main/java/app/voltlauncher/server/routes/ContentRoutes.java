@@ -33,12 +33,39 @@ public final class ContentRoutes implements RouteModule {
         routes.post("/api/instances/{name}/content/{type}", this::addFromDisk);
         routes.delete("/api/instances/{name}/content/{type}/{file}", this::remove);
         routes.post("/api/instances/{name}/content/{type}/{file}/toggle", this::toggle);
+        routes.post("/api/instances/{name}/content/{type}/toggle-all", this::toggleAll);
+        routes.get("/api/instances/{name}/content/{type}/dependencies", this::dependencyWarnings);
 
         // Version management for individual installed files.
         routes.post("/api/instances/{name}/content/{type}/identify", this::identify);
         routes.get("/api/instances/{name}/content/{type}/updates", this::checkUpdates);
         routes.get("/api/instances/{name}/content/{type}/{file}/versions", this::fileVersions);
         routes.post("/api/instances/{name}/content/{type}/{file}/version", this::changeVersion);
+    }
+
+    /**
+     * Switches every file of one kind on or off in a single call — the bisecting move when a
+     * modded profile crashes and the question is whether the mods are to blame.
+     */
+    private JSONObject toggleAll(Context ctx) throws Exception {
+        JSONObject body = RequestBody.json(ctx);
+        boolean enabled = body.optBoolean("enabled", false);
+        int changed = launcher.setAllContentEnabled(ctx.pathParam("name"), type(ctx), enabled);
+        return new JSONObject().put("changed", changed).put("enabled", enabled);
+    }
+
+    /** Required dependencies that are missing or switched off among the installed files. */
+    private JSONObject dependencyWarnings(Context ctx) throws Exception {
+        JSONArray array = new JSONArray();
+        for (InstanceContentService.DependencyWarning warning
+                : launcher.contentService().checkDependencies(ctx.pathParam("name"), type(ctx))) {
+            array.put(new JSONObject()
+                    .put("fileName", warning.fileName())
+                    .put("projectName", warning.projectName())
+                    .put("dependencyProjectId", warning.dependencyProjectId())
+                    .put("state", warning.state()));
+        }
+        return new JSONObject().put("warnings", array);
     }
 
     private JSONObject list(Context ctx) throws Exception {

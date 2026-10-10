@@ -2,18 +2,22 @@ import { computed, ref, watch, type WatchStopHandle } from "vue";
 import { apiGet, apiSend, buildQuery, errorMessage } from "./api";
 import { error, launcherMessage } from "./state";
 import { t } from "@/i18n";
+import { useTasks } from "./useTasks";
 import type {
   AvailableVersion,
   ContentEntry,
   ContentType,
   ContentUpdate,
+  DependencyWarning,
   ExportFormat,
   ExportResult,
   InstanceSettings,
   LauncherInstance,
   ModpackStatus,
   Platform,
+  ProfileSort,
   ProjectVersion,
+  VerifyReport,
 } from "./types";
 
 /** A profile whose creation is still running, shown as a placeholder card. */
@@ -49,6 +53,11 @@ const isLoadingVersions = ref(false);
 const isLoadingLoaderVersions = ref(false);
 
 const profileFilter = ref("ALL");
+const profileSearch = ref("");
+const profileSort = ref<ProfileSort>("lastPlayed");
+const favouritesFirst = ref(true);
+const groupBy = ref(false);
+const instanceGroups = ref<string[]>([]);
 const pendingInstances = ref<PendingInstance[]>([]);
 
 const showCreateModal = ref(false);
@@ -75,12 +84,66 @@ const selectedVersion = computed(
   () => availableVersions.value.find((version) => version.id === selectedVersionId.value) ?? null,
 );
 
-const filteredInstances = computed(() => {
-  const visible = instances.value;
-  if (profileFilter.value === "ALL") return visible;
-  return visible.filter((instance) =>
-    instance.versionType.toLowerCase().includes(profileFilter.value.toLowerCase()),
+const SORTERS: Record<ProfileSort, (a: LauncherInstance, b: LauncherInstance) => number> = {
+  // A profile that has never been played falls back to when it was created, so a fresh install
+  // does not sink to the bottom of the grid.
+  lastPlayed: (a, b) => (b.lastPlayedAt || b.createdAt) - (a.lastPlayedAt || a.createdAt),
+  name: (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+  playtime: (a, b) => b.totalPlaytimeMs - a.totalPlaytimeMs,
+  created: (a, b) => b.createdAt - a.createdAt,
+};
+
+/** Matches a profile against the search box across the fields a user would type. */
+const matchesSearch = (instance: LauncherInstance, term: string): boolean => {
+  if (!term) return true;
+  const needle = term.toLowerCase();
+  return (
+    instance.name.toLowerCase().includes(needle) ||
+    instance.versionId.toLowerCase().includes(needle) ||
+    instance.packName.toLowerCase().includes(needle) ||
+    instance.groupName.toLowerCase().includes(needle)
   );
+};
+
+const filteredInstances = computed(() => {
+  const term = profileSearch.value.trim();
+  const filter = profileFilter.value;
+
+  const visible = instances.value.filter((instance) => {
+    if (filter !== "ALL" && !instance.versionType.toLowerCase().includes(filter.toLowerCase())) {
+      return false;
+    }
+    return matchesSearch(instance, term);
+  });
+
+  const sorted = [...visible].sort(SORTERS[profileSort.value] ?? SORTERS.lastPlayed);
+  if (!favouritesFirst.value) return sorted;
+  // A stable partition rather than a compound comparator: the chosen sort still decides the
+  // order inside each half.
+  return [...sorted.filter((i) => i.favourite), ...sorted.filter((i) => !i.favourite)];
+});
+
+/**
+ * The visible profiles bucketed by group, ungrouped last. Only used when grouping is switched
+ * on; the flat list stays the default because most people have a handful of profiles.
+ */
+const groupedInstances = computed(() => {
+  const buckets = new Map<string, LauncherInstance[]>();
+  for (const instance of filteredInstances.value) {
+    const key = instance.groupName || "";
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(instance);
+    else buckets.set(key, [instance]);
+  }
+
+  return [...buckets.entries()]
+    .sort(([a], [b]) => {
+      if (a === b) return 0;
+      if (a === "") return 1;
+      if (b === "") return -1;
+      return a.localeCompare(b, undefined, { sensitivity: "base" });
+    })
+    .map(([name, members]) => ({ name, instances: members }));
 });
 
 /**
@@ -95,6 +158,15 @@ const visiblePendingInstances = computed(() => {
 });
 
 // ── Data loading ──────────────────────────────────────────────────────────────
+
+const loadGroups = async () => {
+  try {
+    const response = await apiGet<{ success: boolean; groups: string[] }>("/api/instances/groups");
+    instanceGroups.value = response.groups;
+  } catch {
+    // Groups are a convenience for the picker; failing to load them is not worth a toast.
+  }
+};
 
 const loadPlatforms = async () => {
   try {
@@ -289,6 +361,135 @@ const handleUpdateInstanceSettings = async (
   }
 };
 
+/**
+ * Copies a profile. Runs as a backend task because a modpack profile is gigabytes of files, far
+ * more than an HTTP request should be held open for.
+ */
+const handleDuplicateInstance = async (name: string, newName = ""): Promise<boolean> => {
+  const { trackTask } = useTasks();
+  try {
+    const response = await apiSend<{ success: boolean; taskId: string }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/duplicate`,
+      { name: newName },
+    );
+
+    const finished = await trackTask(response.taskId);
+    await loadInstances();
+    if (finished?.state === "done") {
+      launcherMessage.value = t("profiles.duplicated_toast", { name: finished.message ?? newName });
+      return true;
+    }
+    error.value = finished?.message ?? t("profiles.duplicateFailed");
+    return false;
+  } catch (e) {
+    error.value = errorMessage(e, t("profiles.duplicateFailed"));
+    return false;
+  }
+};
+
+const handleToggleFavourite = async (name: string): Promise<boolean> => {
+  const current = instances.value.find((instance) => instance.name === name);
+  try {
+    const response = await apiSend<{ success: boolean; instance: LauncherInstance }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/favourite`,
+      { favourite: !current?.favourite },
+    );
+    replaceInstance(response.instance);
+    return true;
+  } catch (e) {
+    error.value = errorMessage(e, t("profiles.favouriteFailed"));
+    return false;
+  }
+};
+
+const handleSetGroup = async (name: string, group: string): Promise<boolean> => {
+  try {
+    const response = await apiSend<{ success: boolean; instance: LauncherInstance }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/group`,
+      { group },
+    );
+    replaceInstance(response.instance);
+    await loadGroups();
+    return true;
+  } catch (e) {
+    error.value = errorMessage(e, t("profiles.groupFailed"));
+    return false;
+  }
+};
+
+const handleSetIcon = async (name: string, iconUrl: string): Promise<boolean> => {
+  try {
+    const response = await apiSend<{ success: boolean; instance: LauncherInstance }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/icon`,
+      { iconUrl },
+    );
+    replaceInstance(response.instance);
+    return true;
+  } catch (e) {
+    error.value = errorMessage(e, t("profiles.iconFailed"));
+    return false;
+  }
+};
+
+/** Writes an updated profile back into the shared list without a full reload. */
+const replaceInstance = (updated: LauncherInstance) => {
+  const index = instances.value.findIndex((instance) => instance.slug === updated.slug);
+  if (index !== -1) instances.value[index] = updated;
+};
+
+// ── Verify and repair ─────────────────────────────────────────────────────────
+
+const isVerifying = ref(false);
+const verifyProgress = ref(-1);
+const verifyReport = ref<VerifyReport | null>(null);
+
+/**
+ * Checks a profile's game files and optionally re-downloads the damaged ones.
+ *
+ * @param deep   also hash every asset object; slow, but the only way to catch silent corruption
+ * @param repair delete what is wrong and let the installer fetch it again
+ */
+const verifyInstance = async (name: string, deep: boolean, repair: boolean): Promise<VerifyReport | null> => {
+  const { trackTask } = useTasks();
+  try {
+    isVerifying.value = true;
+    verifyProgress.value = -1;
+    verifyReport.value = null;
+
+    const response = await apiSend<{ success: boolean; taskId: string }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/verify`,
+      { deep, repair },
+    );
+
+    const finished = await trackTask(response.taskId, (task) => {
+      verifyProgress.value = task.percent;
+    });
+    if (finished?.state !== "done") {
+      error.value = finished?.message ?? t("verify.failed");
+      return null;
+    }
+
+    const report = await apiGet<{ success: boolean; report: VerifyReport | null }>(
+      `/api/instances/${encodeURIComponent(name)}/verify`,
+    );
+    verifyReport.value = report.report;
+    launcherMessage.value = report.report?.healthy ? t("verify.healthy") : t("verify.repaired");
+    await loadInstances();
+    return report.report;
+  } catch (e) {
+    error.value = errorMessage(e, t("verify.failed"));
+    return null;
+  } finally {
+    isVerifying.value = false;
+    verifyProgress.value = -1;
+  }
+};
+
 const handleOpenInstanceFolder = async (name: string) => {
   try {
     await apiSend("POST", `/api/instances/${encodeURIComponent(name)}/open-folder`);
@@ -350,6 +551,37 @@ const toggleInstanceContent = async (
   } catch (e) {
     error.value = errorMessage(e, t("content.toggleFailed"));
     return null;
+  }
+};
+
+/**
+ * Switches every file of one kind on or off at once — the fastest way to find out whether a
+ * crash comes from the mods or from the profile itself.
+ */
+const toggleAllContent = async (name: string, type: ContentType, enabled: boolean): Promise<number> => {
+  try {
+    const response = await apiSend<{ success: boolean; changed: number }>(
+      "POST",
+      `/api/instances/${encodeURIComponent(name)}/content/${type}/toggle-all`,
+      { enabled },
+    );
+    return response.changed;
+  } catch (e) {
+    error.value = errorMessage(e, t("content.toggleFailed"));
+    return 0;
+  }
+};
+
+/** Required dependencies that are missing or switched off among the installed files. */
+const loadDependencyWarnings = async (name: string, type: ContentType): Promise<DependencyWarning[]> => {
+  try {
+    const response = await apiGet<{ success: boolean; warnings: DependencyWarning[] }>(
+      `/api/instances/${encodeURIComponent(name)}/content/${type}/dependencies`,
+    );
+    return response.warnings;
+  } catch {
+    // Dependency data only exists for files installed through a provider; its absence is normal.
+    return [];
   }
 };
 
@@ -532,6 +764,11 @@ export function useInstances() {
     isLoadingVersions,
     isLoadingLoaderVersions,
     profileFilter,
+    profileSearch,
+    profileSort,
+    favouritesFirst,
+    groupBy,
+    instanceGroups,
     pendingInstances,
     visiblePendingInstances,
     showCreateModal,
@@ -545,9 +782,15 @@ export function useInstances() {
     requiresLoaderSelection,
     selectedVersion,
     filteredInstances,
+    groupedInstances,
+
+    isVerifying,
+    verifyProgress,
+    verifyReport,
 
     loadPlatforms,
     loadInstances,
+    loadGroups,
     loadVersions,
     loadLoaderVersions,
     dismissPending,
@@ -555,13 +798,20 @@ export function useInstances() {
     handleCreateInstance,
     handleDeleteInstance,
     handleRenameInstance,
+    handleDuplicateInstance,
+    handleToggleFavourite,
+    handleSetGroup,
+    handleSetIcon,
     handleOpenInstanceFolder,
     handleUpdateInstanceSettings,
+    verifyInstance,
 
     loadInstanceContent,
     addInstanceContent,
     removeInstanceContent,
     toggleInstanceContent,
+    toggleAllContent,
+    loadDependencyWarnings,
 
     identifyContent,
     checkContentUpdates,

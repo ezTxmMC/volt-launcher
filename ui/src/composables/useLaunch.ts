@@ -2,10 +2,12 @@ import { ref } from "vue";
 import { apiGet, apiSend, errorMessage } from "./api";
 import { error, launcherMessage } from "./state";
 import { t } from "@/i18n";
-import type { LaunchPhase } from "./types";
+import type { LaunchOptions, LaunchPhase } from "./types";
 import { useInstances } from "./useInstances";
+import { useSettings } from "./useSettings";
 
-const { selectedInstance, loadInstances } = useInstances();
+const { selectedInstance, instances, loadInstances } = useInstances();
+const { settings } = useSettings();
 
 const isLaunching = ref(false);
 const launchPhase = ref<LaunchPhase>("idle");
@@ -43,6 +45,9 @@ const pollLaunchStatus = async (instanceName: string) => {
       isLaunching.value = false;
       launcherMessage.value = t("launch.started", { name: status.instanceName ?? instanceName });
       stopLaunchPolling();
+      // Hiding is deferred until the game is actually up: minimising while the launcher is still
+      // downloading would leave the user staring at a desktop with no idea what is happening.
+      if (shouldHideLauncher(instanceName)) handleWindowMinimize();
       await loadInstances();
     } else if (status.phase === "failed") {
       isLaunching.value = false;
@@ -56,11 +61,27 @@ const pollLaunchStatus = async (instanceName: string) => {
   }
 };
 
+/**
+ * Whether the launcher window should get out of the way. The profile's own preference wins over
+ * the launcher-wide one, so a single profile can opt in or out.
+ */
+const shouldHideLauncher = (instanceName: string): boolean => {
+  const instance = instances.value.find((entry) => entry.name === instanceName);
+  const override = instance?.settings.hideLauncher;
+  return override === null || override === undefined ? settings.value.hideLauncherOnLaunch : override;
+};
+
 /** Accepts an explicit profile name, or nothing when wired directly to a click handler. */
 const resolveInstanceName = (candidate?: unknown): string | undefined =>
   typeof candidate === "string" && candidate ? candidate : selectedInstance.value?.name;
 
-const handleLaunch = async (instanceName?: unknown) => {
+/**
+ * Starts a profile.
+ *
+ * @param options quick play travels with the launch rather than being stored on the profile:
+ *                joining one particular server is a property of this launch, not of the profile
+ */
+const handleLaunch = async (instanceName?: unknown, options?: LaunchOptions) => {
   const name = resolveInstanceName(instanceName);
   if (!name) return;
 
@@ -70,7 +91,7 @@ const handleLaunch = async (instanceName?: unknown) => {
     launchMessage.value = t("launch.preparing");
     error.value = null;
 
-    await apiSend("POST", `/api/instances/${encodeURIComponent(name)}/launch`);
+    await apiSend("POST", `/api/instances/${encodeURIComponent(name)}/launch`, options ?? {});
     stopLaunchPolling();
     launchPollInterval = window.setInterval(() => void pollLaunchStatus(name), 1500);
   } catch (e) {
@@ -80,6 +101,14 @@ const handleLaunch = async (instanceName?: unknown) => {
     stopLaunchPolling();
   }
 };
+
+/** Launches straight into a world, skipping the main menu. */
+const handleLaunchWorld = (instanceName: string, worldFolder: string) =>
+  handleLaunch(instanceName, { quickPlay: "singleplayer", quickPlayTarget: worldFolder });
+
+/** Launches straight onto a server. */
+const handleLaunchServer = (instanceName: string, address: string) =>
+  handleLaunch(instanceName, { quickPlay: "multiplayer", quickPlayTarget: address });
 
 const handleStop = async (instanceName?: unknown) => {
   const name = resolveInstanceName(instanceName);
@@ -135,6 +164,8 @@ export function useLaunch() {
     launchPhase,
     launchMessage,
     handleLaunch,
+    handleLaunchWorld,
+    handleLaunchServer,
     handleStop,
     stopLaunchPolling,
     handleWindowMinimize,

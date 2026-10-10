@@ -1,6 +1,7 @@
 package app.voltlauncher.game.instance;
 
 import app.voltlauncher.core.AppPaths;
+import app.voltlauncher.core.util.archive.Archives;
 import app.voltlauncher.core.util.async.NamedLock;
 import app.voltlauncher.game.platform.IPlatform;
 import app.voltlauncher.game.platform.PlatformRegistry;
@@ -11,14 +12,19 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.stream.Stream;
+import java.util.Locale;
+import java.util.Set;
+import java.util.function.UnaryOperator;
 
 public final class InstanceManager {
 
     private static final String STORE_KEY = "instance-store";
+    private static final String CONTENT_MANIFEST = "content.json";
 
     private final LauncherInstanceStore store;
     private final VanillaVersionResolver versionResolver;
@@ -34,6 +40,17 @@ public final class InstanceManager {
 
     public List<Instance> listInstances() throws Exception {
         return upgradeJavaRequirements(store.listInstances());
+    }
+
+    /** Every group name in use, alphabetically, so the UI can offer them without inventing one. */
+    public List<String> listGroups() throws Exception {
+        Set<String> groups = new LinkedHashSet<>();
+        for (Instance instance : listInstances()) {
+            if (!instance.groupName().isBlank()) groups.add(instance.groupName());
+        }
+        List<String> sorted = new ArrayList<>(groups);
+        sorted.sort(String.CASE_INSENSITIVE_ORDER);
+        return sorted;
     }
 
     public Instance createInstance(String name, String versionId) throws Exception {
@@ -55,10 +72,8 @@ public final class InstanceManager {
                 throw new IllegalStateException("An instance with this name already exists");
             }
             String slug = InstanceNamePolicy.uniqueSlug(normalized, instances);
-            long now = System.currentTimeMillis();
-            Instance instance = new Instance(
-                    normalized, slug, versionId, versionType, now, 0L,
-                    req.majorVersion(), req.component(), InstanceSettings.defaults());
+            Instance instance = Instance.create(normalized, slug, versionId, versionType,
+                    System.currentTimeMillis(), req.majorVersion(), req.component());
             Files.createDirectories(instance.gameDirectory());
             instances.add(instance);
             store.saveInstances(instances);
@@ -79,6 +94,9 @@ public final class InstanceManager {
 
             instances.removeIf(i -> i.name().equalsIgnoreCase(normalized));
             store.saveInstances(instances);
+            // Only the launcher's own directory is deleted. A profile pointed at a game directory
+            // the user chose keeps that directory: the launcher did not create it and must not
+            // take a world collection down with the profile.
             deleteRecursively(AppPaths.instanceDirectory(removed.slug()));
             return null;
         });
@@ -115,24 +133,76 @@ public final class InstanceManager {
         });
     }
 
-    public Instance updateSettings(String name, InstanceSettings settings) throws Exception {
-        String normalized = InstanceNamePolicy.normalize(name);
-        return lock.withLock(STORE_KEY, () -> {
+    /**
+     * Copies a profile, its game directory and its content manifest under a new name.
+     *
+     * <p>The copy always gets its own managed directory, even when the original ran from a
+     * directory the user chose — two profiles silently sharing one game directory would corrupt
+     * each other's worlds, which is precisely what a duplicate is meant to avoid.
+     *
+     * @param progress receives copied-file counts; may be {@code null}
+     */
+    public Instance duplicateInstance(String name, String newName, Archives.Progress progress) throws Exception {
+        String normalizedSource = InstanceNamePolicy.normalize(name);
+        Instance source = findByName(normalizedSource);
+        String normalizedNew = InstanceNamePolicy.normalize(
+                newName == null || newName.isBlank() ? source.name() + " (copy)" : newName);
+        InstanceNamePolicy.validate(normalizedNew);
+
+        Instance created = lock.withLock(STORE_KEY, () -> {
             List<Instance> instances = listInstances();
-            List<Instance> updated = new ArrayList<>(instances.size());
-            Instance result = null;
-            for (Instance i : instances) {
-                if (i.name().equalsIgnoreCase(normalized)) {
-                    result = i.withSettings(settings);
-                    updated.add(result);
-                } else {
-                    updated.add(i);
-                }
+            if (instances.stream().anyMatch(i -> i.name().equalsIgnoreCase(normalizedNew))) {
+                throw new IllegalStateException("An instance with this name already exists");
             }
-            if (result == null) throw new IllegalStateException("Instance not found: " + normalized);
-            store.saveInstances(updated);
-            return result;
+            String slug = InstanceNamePolicy.uniqueSlug(normalizedNew, instances);
+            Instance copy = new Instance(
+                    normalizedNew, slug, source.versionId(), source.versionType(),
+                    System.currentTimeMillis(), 0L, 0L,
+                    source.javaMajorVersion(), source.javaComponent(),
+                    false, source.groupName(), source.iconUrl(),
+                    // The directory override is dropped; everything else carries over.
+                    withoutGameDirectory(source.settings()));
+            Files.createDirectories(copy.managedGameDirectory());
+            instances.add(copy);
+            store.saveInstances(instances);
+            return copy;
         });
+
+        try {
+            copyTree(source.gameDirectory(), created.managedGameDirectory(), progress);
+            Path manifest = AppPaths.instanceDirectory(source.slug()).resolve(CONTENT_MANIFEST);
+            if (Files.exists(manifest)) {
+                Path target = AppPaths.instanceDirectory(created.slug()).resolve(CONTENT_MANIFEST);
+                Files.createDirectories(target.getParent());
+                Files.copy(manifest, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return created;
+        } catch (Exception e) {
+            // A half-copied duplicate is worse than none: roll it back so the grid stays honest.
+            try { removeInstance(created.name()); } catch (Exception ignored) { /* best effort */ }
+            throw e;
+        }
+    }
+
+    public Instance updateSettings(String name, InstanceSettings settings) throws Exception {
+        return mutate(name, instance -> instance.withSettings(settings));
+    }
+
+    public Instance setFavourite(String name, boolean favourite) throws Exception {
+        return mutate(name, instance -> instance.withFavourite(favourite));
+    }
+
+    public Instance setGroup(String name, String group) throws Exception {
+        String normalized = group == null ? "" : group.trim();
+        if (normalized.length() > 48) {
+            throw new IllegalArgumentException("Group names must be 48 characters or shorter");
+        }
+        return mutate(name, instance -> instance.withGroup(normalized));
+    }
+
+    public Instance setIconUrl(String name, String iconUrl) throws Exception {
+        String normalized = iconUrl == null ? "" : iconUrl.trim();
+        return mutate(name, instance -> instance.withIconUrl(normalized));
     }
 
     /**
@@ -142,25 +212,9 @@ public final class InstanceManager {
      */
     public Instance updateVersion(String name, String versionId, String versionType, JSONObject meta)
             throws Exception {
-        String normalized = InstanceNamePolicy.normalize(name);
         RequiredJava req = resolveRequiredJava(meta, versionId);
-
-        return lock.withLock(STORE_KEY, () -> {
-            List<Instance> instances = listInstances();
-            List<Instance> updated = new ArrayList<>(instances.size());
-            Instance result = null;
-            for (Instance i : instances) {
-                if (i.name().equalsIgnoreCase(normalized)) {
-                    result = i.withVersion(versionId, versionType, req.majorVersion(), req.component());
-                    updated.add(result);
-                } else {
-                    updated.add(i);
-                }
-            }
-            if (result == null) throw new IllegalStateException("Instance not found: " + normalized);
-            store.saveInstances(updated);
-            return result;
-        });
+        return mutate(name, instance ->
+                instance.withVersion(versionId, versionType, req.majorVersion(), req.component()));
     }
 
     public void markPlayed(Instance launched, long startedAt) throws Exception {
@@ -169,6 +223,20 @@ public final class InstanceManager {
             List<Instance> updated = new ArrayList<>(instances.size());
             for (Instance i : instances) {
                 updated.add(i.name().equalsIgnoreCase(launched.name()) ? i.withLastPlayedAt(startedAt) : i);
+            }
+            store.saveInstances(updated);
+            return null;
+        });
+    }
+
+    /** Adds a finished session's duration to the profile's running total. */
+    public void recordSession(String name, long sessionMs) throws Exception {
+        if (sessionMs <= 0) return;
+        lock.withLock(STORE_KEY, () -> {
+            List<Instance> instances = listInstances();
+            List<Instance> updated = new ArrayList<>(instances.size());
+            for (Instance i : instances) {
+                updated.add(i.name().equalsIgnoreCase(name) ? i.withAddedPlaytime(sessionMs) : i);
             }
             store.saveInstances(updated);
             return null;
@@ -192,6 +260,61 @@ public final class InstanceManager {
     }
 
     // ── internals ─────────────────────────────────────────────────────────────
+
+    /** Applies a change to one profile under the store lock and persists the result. */
+    private Instance mutate(String name, UnaryOperator<Instance> change) throws Exception {
+        String normalized = InstanceNamePolicy.normalize(name);
+        return lock.withLock(STORE_KEY, () -> {
+            List<Instance> instances = listInstances();
+            List<Instance> updated = new ArrayList<>(instances.size());
+            Instance result = null;
+            for (Instance i : instances) {
+                if (i.name().equalsIgnoreCase(normalized)) {
+                    result = change.apply(i);
+                    updated.add(result);
+                } else {
+                    updated.add(i);
+                }
+            }
+            if (result == null) throw new IllegalStateException("Instance not found: " + normalized);
+            store.saveInstances(updated);
+            return result;
+        });
+    }
+
+    private static InstanceSettings withoutGameDirectory(InstanceSettings settings) {
+        return new InstanceSettings(
+                settings.maxMemoryMb(), settings.minMemoryMb(), settings.jvmArgs(),
+                settings.resolutionWidth(), settings.resolutionHeight(), settings.fullscreen(),
+                settings.javaPath(), settings.envVars(), settings.preLaunchCommand(),
+                settings.postExitCommand(), settings.wrapperCommand(), null, settings.hideLauncher());
+    }
+
+    private void copyTree(Path source, Path target, Archives.Progress progress) throws IOException {
+        if (!Files.isDirectory(source)) {
+            Files.createDirectories(target);
+            return;
+        }
+        List<Path> entries;
+        try (var walk = Files.walk(source)) {
+            entries = walk.toList();
+        }
+        // Only files are counted towards the total: including directories made the progress bar
+        // stop short of the end, which reads as a stall rather than as a finished copy.
+        int total = (int) entries.stream().filter(Files::isRegularFile).count();
+
+        int completed = 0;
+        for (Path path : entries) {
+            Path destination = target.resolve(source.relativize(path).toString());
+            if (Files.isDirectory(path)) {
+                Files.createDirectories(destination);
+                continue;
+            }
+            Files.createDirectories(destination.getParent());
+            Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
+            if (progress != null) progress.update(++completed, total);
+        }
+    }
 
     private List<Instance> upgradeJavaRequirements(List<Instance> instances) throws Exception {
         boolean changed = false;
@@ -237,7 +360,7 @@ public final class InstanceManager {
 
     private void deleteRecursively(Path root) throws IOException {
         if (!Files.exists(root)) return;
-        try (Stream<Path> walk = Files.walk(root)) {
+        try (var walk = Files.walk(root)) {
             for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
                 Files.deleteIfExists(path);
             }
@@ -245,4 +368,9 @@ public final class InstanceManager {
     }
 
     public record RequiredJava(int majorVersion, String component) {}
+
+    /** Exposed so the manager's own locale handling is testable without a live store. */
+    static String key(String name) {
+        return name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+    }
 }

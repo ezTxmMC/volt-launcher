@@ -3,8 +3,10 @@ package app.voltlauncher.providers;
 import app.voltlauncher.core.config.SettingsStore;
 import app.voltlauncher.core.util.HttpFetcher;
 import app.voltlauncher.providers.curseforge.CurseForgeProvider;
+import app.voltlauncher.providers.ftb.FtbProvider;
 import app.voltlauncher.providers.model.ProviderId;
 import app.voltlauncher.providers.modrinth.ModrinthProvider;
+import app.voltlauncher.providers.technic.TechnicProvider;
 
 import java.util.Collection;
 import java.util.EnumMap;
@@ -18,6 +20,8 @@ public final class ProviderRegistry {
     public ProviderRegistry(HttpFetcher http, SettingsStore settings) {
         register(new ModrinthProvider(http));
         register(new CurseForgeProvider(http, settings));
+        register(new TechnicProvider(http));
+        register(new FtbProvider(http));
     }
 
     public void register(ContentProvider provider) {

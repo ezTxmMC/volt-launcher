@@ -5,7 +5,9 @@ import java.util.Locale;
 public enum ProviderId {
 
     MODRINTH("modrinth", "Modrinth"),
-    CURSEFORGE("curseforge", "CurseForge");
+    CURSEFORGE("curseforge", "CurseForge"),
+    TECHNIC("technic", "Technic"),
+    FTB("ftb", "FTB");
 
     private final String id;
     private final String displayName;
@@ -31,6 +33,11 @@ public enum ProviderId {
         for (ProviderId provider : values()) {
             if (provider.id.equals(normalized)) return provider;
         }
-        throw new IllegalArgumentException("Unknown provider: " + value);
+        // Both platforms are widely written out in full, and older manifests store either form.
+        return switch (normalized) {
+            case "technicpack", "technic-platform" -> TECHNIC;
+            case "feed-the-beast", "feedthebeast", "modpacks.ch" -> FTB;
+            default -> throw new IllegalArgumentException("Unknown provider: " + value);
+        };
     }
 }

@@ -45,7 +45,19 @@ const KIND_TABS: Array<{ id: ContentKind; icon: string }> = [
 const PROVIDER_STYLE: Record<ProviderId, { icon: string; colour: string }> = {
   modrinth: { icon: "simple-icons:modrinth", colour: "#00C853" },
   curseforge: { icon: "simple-icons:curseforge", colour: "#FF6D00" },
+  technic: { icon: "lucide:hammer", colour: "#F0A500" },
+  ftb: { icon: "lucide:box", colour: "#3AA9F5" },
 };
+
+/**
+ * Technic and FTB only publish whole modpacks, so their tabs collapse to that one kind rather
+ * than showing four tabs that can never return a result.
+ */
+const availableKindTabs = computed(() => {
+  const supported = activeProvider.value?.kinds;
+  if (!supported || supported.length === 0) return KIND_TABS;
+  return KIND_TABS.filter((tab) => supported.includes(tab.id));
+});
 
 const SORT_OPTIONS: Array<{ id: SortIndex; labelKey: string }> = [
   { id: "relevance", labelKey: "discover.sortRelevance" },
@@ -66,6 +78,12 @@ const hasFilters = computed(() => Boolean(gameVersionFilter.value || loaderFilte
 
 /** Loaders only narrow mods and modpacks; packs and shaders are loader-independent. */
 const supportsLoaderFilter = computed(() => kind.value === "mod" || kind.value === "modpack");
+
+watch(availableKindTabs, (tabs) => {
+  if (tabs.length > 0 && !tabs.some((tab) => tab.id === kind.value)) {
+    kind.value = tabs[0]!.id;
+  }
+});
 
 watch(supportsLoaderFilter, (supported) => {
   if (!supported) loaderFilter.value = "";
@@ -108,7 +126,7 @@ const closeInstall = () => {
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap gap-2">
           <button
-            v-for="tab in KIND_TABS"
+            v-for="tab in availableKindTabs"
             :key="tab.id"
             type="button"
             class="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[length:var(--text-sm)] font-semibold tracking-[0.07em] transition-all duration-200"

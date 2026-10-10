@@ -1,6 +1,10 @@
 package app.voltlauncher.game.instance;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Where one installed file came from.
@@ -12,7 +16,10 @@ import org.json.JSONObject;
  * <p>{@code provider}, {@code projectId} and {@code versionId} are blank for files the user added
  * by hand — those are still tracked, so export knows to carry them as overrides.
  *
- * @param origin one of {@link #ORIGIN_PROVIDER}, {@link #ORIGIN_MODPACK} or {@link #ORIGIN_MANUAL}
+ * @param origin               one of {@link #ORIGIN_PROVIDER}, {@link #ORIGIN_MODPACK} or
+ *                             {@link #ORIGIN_MANUAL}
+ * @param requiredDependencies project ids this file needs to work, recorded at install time so
+ *                             the launcher can warn when one of them is removed or switched off
  */
 public record ContentSource(
         String contentType,
@@ -26,7 +33,8 @@ public record ContentSource(
         String sha1,
         long fileSize,
         String origin,
-        String iconUrl) {
+        String iconUrl,
+        List<String> requiredDependencies) {
 
     /** Installed from a provider by explicit user choice. */
     public static final String ORIGIN_PROVIDER = "provider";
@@ -45,6 +53,15 @@ public record ContentSource(
         sha1 = blankToEmpty(sha1);
         origin = blankToEmpty(origin).isEmpty() ? ORIGIN_MANUAL : origin;
         iconUrl = blankToEmpty(iconUrl);
+        requiredDependencies = requiredDependencies == null ? List.of() : List.copyOf(requiredDependencies);
+    }
+
+    /** Convenience for the many call sites that record no dependency information. */
+    public ContentSource(String contentType, String fileName, String provider, String projectId,
+                         String versionId, String projectName, String versionNumber, String downloadUrl,
+                         String sha1, long fileSize, String origin, String iconUrl) {
+        this(contentType, fileName, provider, projectId, versionId, projectName, versionNumber,
+                downloadUrl, sha1, fileSize, origin, iconUrl, List.of());
     }
 
     public static ContentSource manual(String contentType, String fileName, long fileSize) {
@@ -62,18 +79,25 @@ public record ContentSource(
 
     public ContentSource withFileName(String newFileName) {
         return new ContentSource(contentType, newFileName, provider, projectId, versionId,
-                projectName, versionNumber, downloadUrl, sha1, fileSize, origin, iconUrl);
+                projectName, versionNumber, downloadUrl, sha1, fileSize, origin, iconUrl, requiredDependencies);
     }
 
     public ContentSource withOrigin(String newOrigin) {
         return new ContentSource(contentType, fileName, provider, projectId, versionId,
-                projectName, versionNumber, downloadUrl, sha1, fileSize, newOrigin, iconUrl);
+                projectName, versionNumber, downloadUrl, sha1, fileSize, newOrigin, iconUrl, requiredDependencies);
     }
 
     /** Fills in the display details a later project lookup discovered. */
     public ContentSource withProjectDetails(String newProjectName, String newIconUrl) {
         return new ContentSource(contentType, fileName, provider, projectId, versionId,
-                newProjectName, versionNumber, downloadUrl, sha1, fileSize, origin, newIconUrl);
+                newProjectName, versionNumber, downloadUrl, sha1, fileSize, origin, newIconUrl,
+                requiredDependencies);
+    }
+
+    /** Records the projects this release declares as required. */
+    public ContentSource withRequiredDependencies(List<String> dependencies) {
+        return new ContentSource(contentType, fileName, provider, projectId, versionId,
+                projectName, versionNumber, downloadUrl, sha1, fileSize, origin, iconUrl, dependencies);
     }
 
     public JSONObject toJson() {
@@ -89,7 +113,8 @@ public record ContentSource(
                 .put("sha1", sha1)
                 .put("fileSize", fileSize)
                 .put("origin", origin)
-                .put("iconUrl", iconUrl);
+                .put("iconUrl", iconUrl)
+                .put("requiredDependencies", new JSONArray(requiredDependencies));
     }
 
     public static ContentSource fromJson(JSONObject json) {
@@ -105,7 +130,18 @@ public record ContentSource(
                 json.optString("sha1", ""),
                 json.optLong("fileSize", 0L),
                 json.optString("origin", ORIGIN_MANUAL),
-                json.optString("iconUrl", ""));
+                json.optString("iconUrl", ""),
+                readStrings(json.optJSONArray("requiredDependencies")));
+    }
+
+    private static List<String> readStrings(JSONArray array) {
+        if (array == null) return List.of();
+        List<String> values = new ArrayList<>(array.length());
+        for (int i = 0; i < array.length(); i++) {
+            String value = array.optString(i, "");
+            if (!value.isBlank()) values.add(value);
+        }
+        return values;
     }
 
     private static String blankToEmpty(String value) {

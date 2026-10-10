@@ -1,17 +1,26 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch } from "vue";
+import { ref, reactive, computed, nextTick, watch } from "vue";
 import { Icon } from "@iconify/vue";
 import { useLauncher } from '@/composables/useLauncher';
 import InstallProgress from '@/components/discover/InstallProgress.vue';
+import ProfileCard from '@/components/profile/ProfileCard.vue';
+import WorldsPanel from '@/components/profile/WorldsPanel.vue';
+import ServersPanel from '@/components/profile/ServersPanel.vue';
+import ScreenshotsPanel from '@/components/profile/ScreenshotsPanel.vue';
+import LogsPanel from '@/components/profile/LogsPanel.vue';
+import BackupsPanel from '@/components/profile/BackupsPanel.vue';
+import { useShortcuts } from '@/composables/useShortcuts';
 import type {
   LauncherInstance,
   ContentEntry,
   ContentType,
   ContentUpdate,
+  DependencyWarning,
   ExportFormat,
   ExportResult,
   InstanceSettings,
   ModpackStatus,
+  ProfileSort,
   ProjectVersion,
 } from '@/composables/useLauncher';
 
@@ -26,10 +35,17 @@ const {
   editNewName,
   deleteTargetInstance,
   profileFilter,
+  profileSearch,
+  profileSort,
+  favouritesFirst,
+  groupBy,
+  instanceGroups,
   selectedInstanceName,
   instances,
   filteredInstances,
+  groupedInstances,
   settings,
+  patchSettings,
   pendingInstances,
   visiblePendingInstances,
   isLoadingInstances,
@@ -41,13 +57,23 @@ const {
   handleImgError,
   handleDeleteInstance,
   handleRenameInstance,
+  handleDuplicateInstance,
+  handleToggleFavourite,
+  handleSetGroup,
+  handleSetIcon,
   handleOpenInstanceFolder,
   handleLaunch,
   handleUpdateInstanceSettings,
+  verifyInstance,
+  isVerifying,
+  verifyProgress,
+  verifyReport,
   loadInstanceContent,
   addInstanceContent,
   removeInstanceContent,
   toggleInstanceContent,
+  toggleAllContent,
+  loadDependencyWarnings,
   identifyContent,
   checkContentUpdates,
   loadContentVersions,
@@ -59,8 +85,11 @@ const {
   importModpack,
   trackModpackJob,
   loadInstances,
+  loadGroups,
   openDirectory,
   launcherMessage,
+  formatPlaytime,
+  formatBytes,
   error,
 } = useLauncher();
 
@@ -106,12 +135,115 @@ function playInstance(inst: LauncherInstance) {
   // Belt and braces: the button is hidden while busy, but this is also reachable by keyboard.
   if (inst.busy) return;
   selectInstance(inst);
+
+  // "Open logs on launch" means exactly that: the console is what someone wants in front of them
+  // when they are watching a modded profile start.
+  if (settings.value.openLogsOnLaunch) {
+    managingInstanceName.value = inst.name;
+    void nextTick(() => openPanel('logs'));
+  }
   void handleLaunch(inst.name);
 }
 
 // ── Select action ───────────────────────────────────────────────────────────────
 function selectInstance(inst: LauncherInstance) {
   selectedInstanceName.value = inst.name;
+}
+
+// ── Grid controls ─────────────────────────────────────────────────────────────
+const searchInput = ref<HTMLInputElement | null>(null);
+
+const SORT_OPTIONS: Array<{ id: ProfileSort; labelKey: string }> = [
+  { id: 'lastPlayed', labelKey: 'profiles.sortLastPlayed' },
+  { id: 'name', labelKey: 'profiles.sortName' },
+  { id: 'playtime', labelKey: 'profiles.sortPlaytime' },
+  { id: 'created', labelKey: 'profiles.sortCreated' },
+];
+
+/** Sort order and the favourites toggle are preferences, so they are persisted. */
+function changeSort(next: ProfileSort) {
+  profileSort.value = next;
+  void patchSettings({ profileSort: next });
+}
+
+function toggleFavouritesFirst() {
+  favouritesFirst.value = !favouritesFirst.value;
+  void patchSettings({ favouritesFirst: favouritesFirst.value });
+}
+
+// Escape clears the search rather than closing the manage view, which is what a user pressing it
+// with text in the box actually means.
+useShortcuts([
+  {
+    key: 'f',
+    ctrl: true,
+    run: () => {
+      if (activeTab.value !== 'profiles') return;
+      managingInstanceName.value = null;
+      void nextTick(() => searchInput.value?.focus());
+    },
+  },
+  {
+    key: 'Escape',
+    allowInInput: true,
+    run: () => {
+      if (activeTab.value !== 'profiles') return;
+      if (profileSearch.value) { profileSearch.value = ''; return; }
+      if (activePanel.value) { activePanel.value = null; return; }
+      if (managingInstanceName.value) closeManage();
+    },
+  },
+]);
+
+// ── Duplicate, folder and verify ──────────────────────────────────────────────
+const duplicateTarget = ref<LauncherInstance | null>(null);
+const duplicateName = ref('');
+const isDuplicating = ref(false);
+
+function startDuplicate(inst: LauncherInstance) {
+  duplicateTarget.value = inst;
+  duplicateName.value = `${inst.name} (copy)`;
+  closeMenu();
+}
+
+async function confirmDuplicate() {
+  const target = duplicateTarget.value;
+  if (!target) return;
+  isDuplicating.value = true;
+  await handleDuplicateInstance(target.name, duplicateName.value.trim());
+  isDuplicating.value = false;
+  duplicateTarget.value = null;
+}
+
+const groupTarget = ref<LauncherInstance | null>(null);
+const groupValue = ref('');
+
+function startGroup(inst: LauncherInstance) {
+  groupTarget.value = inst;
+  groupValue.value = inst.groupName;
+  closeMenu();
+}
+
+async function confirmGroup() {
+  const target = groupTarget.value;
+  if (!target) return;
+  await handleSetGroup(target.name, groupValue.value.trim());
+  groupTarget.value = null;
+}
+
+const showVerifyModal = ref(false);
+const verifyDeep = ref(false);
+
+function openVerify() {
+  verifyReport.value = null;
+  verifyDeep.value = false;
+  showVerifyModal.value = true;
+  closeMenu();
+}
+
+async function runVerify(repair: boolean) {
+  if (!managingInstance.value) return;
+  await verifyInstance(managingInstance.value.name, verifyDeep.value, repair);
 }
 
 // ── 3-dot menu ────────────────────────────────────────────────────────────────
@@ -144,12 +276,15 @@ function openFolder(inst: LauncherInstance) {
 }
 
 // ── Manage view panels (content + settings) ────────────────────────────────────
-type Panel = ContentType | 'settings' | null;
+/** Everything the manage view can show on its right-hand side. */
+type Panel = ContentType | 'settings' | 'worlds' | 'servers' | 'screenshots' | 'logs' | 'backups' | null;
 const activePanel = ref<Panel>(null);
 const contentItems = ref<ContentEntry[]>([]);
 const isLoadingContent = ref(false);
 const isDragging = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
+
+const CONTENT_PANEL_IDS: ContentType[] = ['mods', 'resourcepacks', 'shaderpacks', 'datapacks'];
 
 const CONTENT_LABELS: Record<ContentType, string> = {
   mods: 'Mods',
@@ -163,16 +298,26 @@ const isLoaderInstance = computed(() => {
   return t === 'fabric' || t === 'forge' || t === 'neoforge' || t === 'quilt';
 });
 
-const isContentPanel = computed(() => activePanel.value !== null && activePanel.value !== 'settings');
+const isContentPanel = computed(
+  () => activePanel.value !== null && CONTENT_PANEL_IDS.includes(activePanel.value as ContentType),
+);
 const activeContentType = computed(() => (isContentPanel.value ? (activePanel.value as ContentType) : null));
 
 // Reset panels only when switching to a *different* profile, not on in-place updates.
-watch(() => managingInstance.value?.name, () => { activePanel.value = null; contentItems.value = []; });
+watch(() => managingInstance.value?.name, () => {
+  activePanel.value = null;
+  contentItems.value = [];
+  contentSearch.value = '';
+  dependencyWarnings.value = [];
+});
+
+const CONTENT_PANELS: Panel[] = ['mods', 'resourcepacks', 'shaderpacks', 'datapacks'];
 
 async function openPanel(panel: Panel) {
   activePanel.value = panel;
   if (panel === 'settings') { loadSettingsForm(); return; }
-  if (panel) await refreshContent(panel);
+  // The dedicated panels load their own data through their own watchers.
+  if (panel && CONTENT_PANELS.includes(panel)) await refreshContent(panel as ContentType);
 }
 
 async function refreshContent(type: ContentType) {
@@ -183,6 +328,45 @@ async function refreshContent(type: ContentType) {
   // Update state belongs to the file list that produced it.
   contentUpdates.value = [];
   hasCheckedUpdates.value = false;
+  await refreshDependencyWarnings();
+}
+
+// ── Content filtering and bulk actions ────────────────────────────────────────
+const contentSearch = ref('');
+const isTogglingAll = ref(false);
+const dependencyWarnings = ref<DependencyWarning[]>([]);
+
+const visibleContentItems = computed(() => {
+  const needle = contentSearch.value.trim().toLowerCase();
+  if (!needle) return contentItems.value;
+  return contentItems.value.filter((item) =>
+    item.fileName.toLowerCase().includes(needle)
+    || (item.source?.projectName ?? '').toLowerCase().includes(needle),
+  );
+});
+
+const enabledContentCount = computed(() => contentItems.value.filter((item) => item.enabled).length);
+
+/** Warnings keyed by the file that declared the dependency, for the row-level badge. */
+const warningsFor = (fileName: string) =>
+  dependencyWarnings.value.filter((warning) => warning.fileName === fileName);
+
+async function onToggleAll(enabled: boolean) {
+  const type = activeContentType.value;
+  if (!managingInstance.value || !type) return;
+  isTogglingAll.value = true;
+  const changed = await toggleAllContent(managingInstance.value.name, type, enabled);
+  isTogglingAll.value = false;
+  if (changed > 0) await refreshContent(type);
+}
+
+async function refreshDependencyWarnings() {
+  const type = activeContentType.value;
+  if (!managingInstance.value || !type) {
+    dependencyWarnings.value = [];
+    return;
+  }
+  dependencyWarnings.value = await loadDependencyWarnings(managingInstance.value.name, type);
 }
 
 // ── Content version management ────────────────────────────────────────────────
@@ -340,12 +524,6 @@ async function onDeleteContent(item: ContentEntry) {
   if (ok) contentItems.value = contentItems.value.filter(c => c.fileName !== item.fileName);
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 // ── Modpack import ────────────────────────────────────────────────────────────
 const packFileInput = ref<HTMLInputElement | null>(null);
 const isImportingPack = ref(false);
@@ -459,7 +637,15 @@ interface SettingsForm {
   jvmArgs: string;
   resolutionWidth: string | number;
   resolutionHeight: string | number;
+  fullscreen: boolean;
   javaPath: string;
+  /** One `KEY=value` per line, which is how people are used to writing an environment. */
+  envVars: string;
+  preLaunchCommand: string;
+  postExitCommand: string;
+  wrapperCommand: string;
+  gameDirectory: string;
+  hideLauncher: boolean;
 }
 
 const settingsForm = reactive<SettingsForm>({
@@ -468,10 +654,44 @@ const settingsForm = reactive<SettingsForm>({
   jvmArgs: '',
   resolutionWidth: '',
   resolutionHeight: '',
+  fullscreen: false,
   javaPath: '',
+  envVars: '',
+  preLaunchCommand: '',
+  postExitCommand: '',
+  wrapperCommand: '',
+  gameDirectory: '',
+  hideLauncher: false,
 });
+
+/** Whether the advanced block is unfolded; it is noise for most profiles. */
+const showAdvancedProfileSettings = ref(false);
+
+/** `KEY=value` lines to a map, ignoring blanks and comments. */
+function parseEnvVars(raw: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) continue;
+    const key = trimmed.slice(0, separator).trim();
+    if (key) result[key] = trimmed.slice(separator + 1).trim();
+  }
+  return result;
+}
+
+function formatEnvVars(values: Record<string, string> | null | undefined): string {
+  if (!values) return '';
+  return Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n');
+}
 const isSavingSettings = ref(false);
 const settingsSaved = ref(false);
+/**
+ * The card image is stored on the profile itself, not in its launch settings, so it is edited
+ * here but saved through its own endpoint.
+ */
+const iconForm = ref('');
 
 /**
  * What an empty field falls back to at launch, so the placeholders tell the truth about what the
@@ -492,7 +712,22 @@ function loadSettingsForm() {
   settingsForm.jvmArgs = s?.jvmArgs ?? '';
   settingsForm.resolutionWidth = s?.resolutionWidth != null ? String(s.resolutionWidth) : '';
   settingsForm.resolutionHeight = s?.resolutionHeight != null ? String(s.resolutionHeight) : '';
+  settingsForm.fullscreen = s?.fullscreen === true;
   settingsForm.javaPath = s?.javaPath ?? '';
+  settingsForm.envVars = formatEnvVars(s?.envVars);
+  settingsForm.preLaunchCommand = s?.preLaunchCommand ?? '';
+  settingsForm.postExitCommand = s?.postExitCommand ?? '';
+  settingsForm.wrapperCommand = s?.wrapperCommand ?? '';
+  settingsForm.gameDirectory = s?.gameDirectory ?? '';
+  settingsForm.hideLauncher = s?.hideLauncher === true;
+  iconForm.value = managingInstance.value?.iconUrl ?? '';
+
+  // Unfold the advanced block when the profile already uses something from it, so a setting
+  // that is in effect is never hidden behind a collapsed section.
+  showAdvancedProfileSettings.value = Boolean(
+    s?.envVars && Object.keys(s.envVars).length > 0
+      || s?.preLaunchCommand || s?.postExitCommand || s?.wrapperCommand || s?.gameDirectory,
+  );
 }
 
 /** An empty, blank or non-positive field means "no override" and is stored as null. */
@@ -506,18 +741,35 @@ function parseIntOrNull(value: string | number): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function blankToNull(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
 async function saveSettings() {
   if (!managingInstance.value) return;
   const payload: InstanceSettings = {
     maxMemoryMb: parseIntOrNull(settingsForm.maxMemoryMb),
     minMemoryMb: parseIntOrNull(settingsForm.minMemoryMb),
-    jvmArgs: settingsForm.jvmArgs.trim() === '' ? null : settingsForm.jvmArgs.trim(),
+    jvmArgs: blankToNull(settingsForm.jvmArgs),
     resolutionWidth: parseIntOrNull(settingsForm.resolutionWidth),
     resolutionHeight: parseIntOrNull(settingsForm.resolutionHeight),
-    javaPath: settingsForm.javaPath.trim() === '' ? null : settingsForm.javaPath.trim(),
+    // Only stored when switched on: a stored `false` would override a future default.
+    fullscreen: settingsForm.fullscreen ? true : null,
+    javaPath: blankToNull(settingsForm.javaPath),
+    envVars: parseEnvVars(settingsForm.envVars),
+    preLaunchCommand: blankToNull(settingsForm.preLaunchCommand),
+    postExitCommand: blankToNull(settingsForm.postExitCommand),
+    wrapperCommand: blankToNull(settingsForm.wrapperCommand),
+    gameDirectory: blankToNull(settingsForm.gameDirectory),
+    hideLauncher: settingsForm.hideLauncher ? true : null,
   };
   isSavingSettings.value = true;
-  const ok = await handleUpdateInstanceSettings(managingInstance.value.name, payload);
+  const name = managingInstance.value.name;
+  const ok = await handleUpdateInstanceSettings(name, payload);
+  if (ok && iconForm.value.trim() !== (managingInstance.value?.iconUrl ?? '')) {
+    await handleSetIcon(name, iconForm.value.trim());
+  }
   isSavingSettings.value = false;
   if (ok) {
     // The saved profile is written back into the shared list, which `managingInstance` reads
@@ -546,6 +798,62 @@ async function saveSettings() {
               {{ f === 'ALL' ? 'ALLE' : f }}
             </button>
           </div>
+          <div class="relative min-w-[180px] flex-1 md:max-w-[280px]">
+            <Icon icon="lucide:search" class="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-white/30" />
+            <input
+              ref="searchInput"
+              v-model="profileSearch"
+              type="text"
+              :placeholder="t('profiles.search')"
+              class="w-full rounded-md border border-white/10 bg-[var(--surface-input)] py-[5px] pl-7 pr-7 text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]"
+              @click.stop
+            />
+            <button
+              v-if="profileSearch"
+              type="button"
+              class="absolute right-1.5 top-1/2 flex size-4 -translate-y-1/2 items-center justify-center rounded text-white/30 hover:text-white/70"
+              @click.stop="profileSearch = ''"
+            >
+              <Icon icon="lucide:x" class="size-3" />
+            </button>
+          </div>
+
+          <select
+            :value="profileSort"
+            class="rounded-md border border-white/10 bg-[var(--surface-input)] px-2 py-[5px] text-[length:var(--text-sm)] text-white/70 outline-none focus:border-[var(--accent-border-focus)]"
+            :title="t('profiles.sortBy')"
+            @click.stop
+            @change="changeSort(($event.target as HTMLSelectElement).value as ProfileSort)"
+          >
+            <option v-for="option in SORT_OPTIONS" :key="option.id" :value="option.id">
+              {{ t(option.labelKey) }}
+            </option>
+          </select>
+
+          <button
+            type="button"
+            class="flex size-[30px] items-center justify-center rounded-md border transition-all"
+            :class="favouritesFirst
+              ? 'border-[var(--accent-border-active)] bg-[var(--accent-bg-strong)] text-[var(--primary)]'
+              : 'border-white/10 bg-white/[0.03] text-white/40 hover:bg-white/[0.07] hover:text-white/70'"
+            :title="t('profiles.favouritesFirst')"
+            @click.stop="toggleFavouritesFirst()"
+          >
+            <Icon icon="lucide:star" class="size-3.5" />
+          </button>
+
+          <button
+            type="button"
+            class="flex size-[30px] items-center justify-center rounded-md border transition-all"
+            :class="groupBy
+              ? 'border-[var(--accent-border-active)] bg-[var(--accent-bg-strong)] text-[var(--primary)]'
+              : 'border-white/10 bg-white/[0.03] text-white/40 hover:bg-white/[0.07] hover:text-white/70'"
+            :title="t('profiles.groupView')"
+            @click.stop="groupBy = !groupBy"
+          >
+            <Icon icon="lucide:folder-tree" class="size-3.5" />
+          </button>
+
           <div class="flex-1"></div>
           <button type="button" :disabled="isImportingPack" :title="t('import.hint')"
             class="inline-flex items-center gap-1.5 rounded-[7px] border border-white/10 bg-white/5 px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold tracking-[0.07em] text-white/45 transition-all duration-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
@@ -626,112 +934,61 @@ async function saveSettings() {
           </button>
         </div>
 
-        <!-- Instance cards -->
-        <div v-for="inst in filteredInstances" :key="inst.slug"
-          class="group relative h-48 overflow-visible rounded-xl border bg-[var(--surface-panel)] text-left transition-all duration-200"
-          :class="inst.busy
-            ? 'border-[var(--accent-border)] cursor-progress'
-            : 'border-white/10 cursor-pointer hover:-translate-y-1 hover:border-[var(--accent-border-hover)] hover:shadow-[0_12px_32px_rgba(0,0,0,.4),0_0_24px_rgba(var(--primary-rgb),.1)]'"
-          @click.stop="openManage(inst)">
-          <!-- Card image area -->
-          <div
-            class="relative flex h-[100px] items-center justify-center overflow-hidden rounded-t-xl pointer-events-none">
-            <!-- Profiles from a modpack show its artwork; hand-made ones keep the version emoji. -->
-            <template v-if="inst.packIconUrl">
-              <img :src="inst.packIconUrl" alt=""
-                class="absolute inset-0 size-full object-cover transition-transform duration-300 group-hover:scale-105"
-                loading="lazy" @error="handleImgError" />
-              <div class="absolute inset-0 bg-black/25"></div>
-            </template>
-            <div v-else
-              class="absolute inset-0 flex items-center justify-center text-[40px] opacity-70 transition-transform duration-300 group-hover:scale-105"
-              :class="versionGradientClass(inst.versionType)">
-              {{ versionEmoji(inst.versionType) }}
-            </div>
-            <div class="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-[rgba(8,18,34,.95)]">
-            </div>
+        <!-- Instance cards, flat -->
+        <template v-if="!groupBy">
+          <ProfileCard
+            v-for="inst in filteredInstances"
+            :key="inst.slug"
+            :inst="inst"
+            :open-menu-slug="openMenuSlug"
+            @manage="openManage"
+            @play="playInstance"
+            @select="selectInstance"
+            @toggle-menu="toggleMenu"
+            @rename="startEdit"
+            @duplicate="startDuplicate"
+            @group="startGroup"
+            @open-folder="openFolder"
+            @export="openExportFor"
+            @favourite="handleToggleFavourite($event.name)"
+            @delete="startDelete"
+          />
+        </template>
 
-            <!-- Play button overlay — pointer-events enabled, stops card click.
-                 Suppressed while the profile is still being installed. -->
-            <div v-if="!inst.busy"
-              class="pointer-events-auto absolute inset-0 flex items-center justify-center gap-2 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
-              <button type="button"
-                class="h-10 inline-flex items-center gap-2 bg-[var(--primary)] rounded-[7px] px-4 py-2 text-[length:var(--text-base)] font-bold tracking-[0.08em] text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                :disabled="!authData || isLaunching" @click.stop="playInstance(inst)">
-                <Icon icon="lucide:play" class="size-[10px]" />{{ t("profiles.play") }}
-              </button>
-              <button v-if="selectedInstanceName !== inst.name" type="button"
-                class="h-10 inline-flex items-center gap-2 rounded-r-[7px] bg-(--surface-input) px-4 py-2 text-[length:var(--text-base)] font-bold tracking-[0.08em] text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                @click.stop="selectInstance(inst)">
-                <Icon icon="mynaui:arrow-left-right" class="size-[24px] brightness-60" />
-              </button>
+        <!-- Instance cards, grouped by folder. Each section spans the whole grid so its own
+             cards flow underneath the heading rather than beside it. -->
+        <template v-else>
+          <div v-for="group in groupedInstances" :key="group.name || '__ungrouped'" class="col-[1/-1]">
+            <div class="mb-2 flex items-center gap-2 text-[length:var(--text-2xs)] font-bold tracking-[0.12em] text-white/40">
+              <Icon :icon="group.name ? 'lucide:folder' : 'lucide:folder-minus'" class="size-3" />
+              {{ (group.name || t("profiles.ungrouped")).toUpperCase() }}
+              <span class="text-white/25">({{ group.instances.length }})</span>
             </div>
-
-            <div class="absolute left-[7px] top-[7px] flex gap-1 pointer-events-none">
-              <span v-if="inst.busy"
-                class="inline-flex items-center gap-1 rounded border border-[var(--accent-border)] bg-[var(--accent-bg-strong)] px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-[var(--primary)]">
-                <Icon icon="lucide:loader-2" class="size-[8px] animate-spin" />INSTALLING</span>
-              <span v-else-if="inst.running"
-                class="rounded border border-[var(--success-border)] bg-[var(--success-bg)] px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-[var(--accent)]">▶
-                ACTIVE</span>
-              <span v-else-if="selectedInstanceName === inst.name"
-                class="rounded border border-[var(--primary-border)] bg-(--primary)/20 px-1.5 py-0.5 text-[8px] font-bold tracking-[0.08em] text-[var(--primary)]">▶
-                SELECTED</span>
+            <div class="grid grid-cols-[repeat(auto-fit,minmax(250px,1fr))] gap-3">
+              <ProfileCard
+                v-for="inst in group.instances"
+                :key="inst.slug"
+                :inst="inst"
+                :open-menu-slug="openMenuSlug"
+                @manage="openManage"
+                @play="playInstance"
+                @select="selectInstance"
+                @toggle-menu="toggleMenu"
+                @rename="startEdit"
+                @duplicate="startDuplicate"
+                @group="startGroup"
+                @open-folder="openFolder"
+                @export="openExportFor"
+                @favourite="handleToggleFavourite($event.name)"
+                @delete="startDelete"
+              />
             </div>
           </div>
-
-          <!-- Card info -->
-          <div class="px-3 py-2.5 pointer-events-none">
-            <div class="mb-1.5 truncate text-[length:var(--text-md-plus)] font-semibold leading-[1.35] text-white">{{
-              inst.name }}</div>
-            <InstallProgress v-if="inst.busy" compact :stage="inst.busyStage ?? null"
-              :completed="inst.busyCompleted ?? 0" :total="inst.busyTotal ?? 0" :percent="inst.busyPercent ?? -1" />
-            <div v-else class="flex flex-wrap gap-[5px] text-[length:var(--text-2xs)] text-white/60">
-              <span class="inline-flex items-center gap-1"><span class="size-1.5 rounded-full bg-[#4caf50]"></span>{{
-                formatLoaderId(inst.versionId) }}</span>
-              <span class="inline-flex items-center gap-1"><span class="size-1.5 rounded-full bg-[#6c63ff]"></span>Java
-                {{ inst.javaMajorVersion }}</span>
-              <span class="text-white/25">{{ formatRelativeDate(inst.lastPlayedAt) }}</span>
-            </div>
-          </div>
-
-          <!-- 3-dot menu -->
-          <div v-if="!inst.busy" class="absolute right-[7px] top-[7px] z-10" @click.stop>
-            <button type="button"
-              class="flex size-6 items-center justify-center rounded-md border border-white/10 bg-black/40 text-white/40 opacity-0 backdrop-blur-sm transition-all duration-150 group-hover:opacity-100 hover:!text-white hover:bg-white/15"
-              @click="toggleMenu(inst.slug)">
-              <Icon icon="lucide:more-vertical" class="size-3" />
-            </button>
-            <div v-if="openMenuSlug === inst.slug"
-              class="absolute right-0 top-8 z-20 min-w-[148px] overflow-hidden rounded-[9px] border border-white/10 bg-[var(--surface-panel-strong)] shadow-[0_8px_24px_rgba(0,0,0,.5)] backdrop-blur-md">
-              <button type="button"
-                class="flex w-full items-center gap-2.5 px-3 py-2 text-[length:var(--text-sm)] text-white/70 transition-colors hover:bg-white/8 hover:text-white"
-                @click="startEdit(inst)">
-                <Icon icon="lucide:pencil" class="size-3.5 shrink-0" />Rename
-              </button>
-              <button type="button"
-                class="flex w-full items-center gap-2.5 px-3 py-2 text-[length:var(--text-sm)] text-white/70 transition-colors hover:bg-white/8 hover:text-white"
-                @click="openFolder(inst)">
-                <Icon icon="lucide:folder-open" class="size-3.5 shrink-0" />Open folder
-              </button>
-              <button type="button"
-                class="flex w-full items-center gap-2.5 px-3 py-2 text-[length:var(--text-sm)] text-white/70 transition-colors hover:bg-white/8 hover:text-white"
-                @click="openExportFor(inst)">
-                <Icon icon="lucide:package-open" class="size-3.5 shrink-0" />{{ t("export.title") }}
-              </button>
-              <div class="mx-2 my-0.5 h-px bg-white/7"></div>
-              <button type="button"
-                class="flex w-full items-center gap-2.5 px-3 py-2 text-[length:var(--text-sm)] text-[var(--danger-text,#f87171)] transition-colors hover:bg-red-500/10"
-                @click="startDelete(inst)">
-                <Icon icon="lucide:trash-2" class="size-3.5 shrink-0" />Delete
-              </button>
-            </div>
-          </div>
-        </div>
+        </template>
 
         <div v-if="filteredInstances.length === 0 && !isLoadingInstances"
           class="col-[1/-1] py-10 text-center text-[length:var(--text-md)] text-white/40">
-          No profile found. Create a new one or import one.
+          {{ profileSearch.trim() ? t("profiles.noMatches") : t("profiles.empty") }}
         </div>
       </div>
     </template>
@@ -801,6 +1058,44 @@ async function saveSettings() {
                 @click="openPanel('datapacks')">
                 <Icon icon="lucide:database" class="size-[10px]" />Data Packs
               </button>
+
+              <div class="my-0.5 h-px bg-white/7"></div>
+
+              <button type="button"
+                class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
+                :class="activePanel === 'worlds' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
+                @click="openPanel('worlds')">
+                <Icon icon="lucide:globe" class="size-[10px]" />{{ t("worlds.title") }}
+              </button>
+              <button type="button"
+                class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
+                :class="activePanel === 'servers' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
+                @click="openPanel('servers')">
+                <Icon icon="lucide:server" class="size-[10px]" />{{ t("servers.title") }}
+              </button>
+              <button type="button"
+                class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
+                :class="activePanel === 'screenshots' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
+                @click="openPanel('screenshots')">
+                <Icon icon="lucide:image" class="size-[10px]" />{{ t("screenshots.title") }}
+              </button>
+              <button type="button"
+                class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
+                :class="activePanel === 'logs' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
+                @click="openPanel('logs')">
+                <Icon icon="lucide:terminal" class="size-[10px]" />{{ t("logs.title") }}
+                <span v-if="managingInstance.launchPhase === 'failed'"
+                  class="size-1.5 rounded-full bg-[var(--danger)]" />
+              </button>
+              <button type="button"
+                class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
+                :class="activePanel === 'backups' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
+                @click="openPanel('backups')">
+                <Icon icon="lucide:archive" class="size-[10px]" />{{ t("backups.title") }}
+              </button>
+
+              <div class="my-0.5 h-px bg-white/7"></div>
+
               <button type="button"
                 class="w-full inline-flex items-center justify-center gap-2 rounded-[7px] border py-2 text-[length:var(--text-sm)] font-bold tracking-[0.08em] transition-all"
                 :class="activePanel === 'settings' ? 'border-(--accent-border-strong) bg-(--accent-bg-strong) text-(--primary)' : 'border-(--surface-panel-strong) bg-(--surface-input) text-white hover:bg-white/10'"
@@ -832,6 +1127,20 @@ async function saveSettings() {
                 <div class="flex flex-col gap-0.5">
                   <div class="text-[length:var(--text-2xs)] text-white/35 tracking-[0.08em]">ZULETZT GESPIELT</div>
                   <div class="text-[length:var(--text-sm)] font-medium text-white">{{ formatRelativeDate(managingInstance.lastPlayedAt) }}</div>
+                </div>
+                <div class="flex flex-col gap-0.5">
+                  <div class="text-[length:var(--text-2xs)] text-white/35 tracking-[0.08em]">{{ t("profiles.playtime").toUpperCase() }}</div>
+                  <div class="text-[length:var(--text-sm)] font-medium text-white">{{ formatPlaytime(managingInstance.totalPlaytimeMs) }}</div>
+                </div>
+                <div v-if="managingInstance.groupName" class="flex flex-col gap-0.5">
+                  <div class="text-[length:var(--text-2xs)] text-white/35 tracking-[0.08em]">{{ t("profiles.group").toUpperCase() }}</div>
+                  <div class="truncate text-[length:var(--text-sm)] font-medium text-white">{{ managingInstance.groupName }}</div>
+                </div>
+                <div v-if="managingInstance.customGameDirectory" class="flex flex-col gap-0.5 sm:col-span-2">
+                  <div class="text-[length:var(--text-2xs)] text-white/35 tracking-[0.08em]">{{ t("profiles.customDirectory").toUpperCase() }}</div>
+                  <div class="truncate font-mono text-[length:var(--text-2xs)] text-white/60" :title="managingInstance.gameDirectory">
+                    {{ managingInstance.gameDirectory }}
+                  </div>
                 </div>
               </div>
             </div>
@@ -890,7 +1199,20 @@ async function saveSettings() {
                   {{ CONTENT_LABELS[activeContentType].toUpperCase() }}
                   <span class="text-white/35 font-medium">({{ contentItems.length }})</span>
                 </div>
-                <div class="flex items-center gap-1.5">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <div class="relative">
+                    <Icon icon="lucide:search" class="pointer-events-none absolute left-2 top-1/2 size-3 -translate-y-1/2 text-white/30" />
+                    <input v-model="contentSearch" type="text" :placeholder="t('common.search')"
+                      class="w-[160px] rounded-md border border-white/10 bg-[var(--surface-input)] py-1 pl-7 pr-2 text-[length:var(--text-2xs)] text-white outline-none focus:border-[var(--accent-border-focus)]" />
+                  </div>
+                  <button type="button" :disabled="isTogglingAll || contentItems.length === 0"
+                    class="inline-flex items-center gap-1.5 rounded-[6px] border border-white/10 bg-white/5 px-2.5 py-1.5 text-[length:var(--text-2xs)] font-semibold tracking-[0.06em] text-white/50 transition-all hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    :title="enabledContentCount > 0 ? t('common.disable') : t('common.enable')"
+                    @click="onToggleAll(enabledContentCount === 0)">
+                    <Icon :icon="isTogglingAll ? 'lucide:loader-2' : (enabledContentCount > 0 ? 'lucide:toggle-right' : 'lucide:toggle-left')"
+                      class="size-3" :class="isTogglingAll ? 'animate-spin' : ''" />
+                    {{ enabledContentCount > 0 ? t("common.disable") : t("common.enable") }}
+                  </button>
                   <button type="button" :disabled="isCheckingUpdates || contentItems.length === 0"
                     class="inline-flex items-center gap-1.5 rounded-[6px] border border-white/10 bg-white/5 px-2.5 py-1.5 text-[length:var(--text-2xs)] font-semibold tracking-[0.06em] text-white/50 transition-all hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                     @click="onCheckUpdates">
@@ -915,6 +1237,24 @@ async function saveSettings() {
                   </button>
                 </div>
               </div>
+              <div v-if="dependencyWarnings.length > 0"
+                class="shrink-0 border-b border-amber-500/20 bg-amber-500/[0.06] px-4 py-2">
+                <div class="flex items-start gap-2">
+                  <Icon icon="lucide:alert-triangle" class="mt-px size-3.5 shrink-0 text-amber-400" />
+                  <div class="min-w-0 text-[length:var(--text-2xs)] leading-[1.5] text-amber-200/80">
+                    <div class="font-semibold text-amber-300">{{ t("content.dependencyWarning", { n: dependencyWarnings.length }) }}</div>
+                    <div v-for="warning in dependencyWarnings.slice(0, 4)" :key="warning.fileName + warning.dependencyProjectId">
+                      {{ warning.state === "disabled"
+                        ? t("content.dependencyDisabled", { project: warning.projectName })
+                        : t("content.dependencyMissing", { project: warning.projectName }) }}
+                    </div>
+                    <div v-if="dependencyWarnings.length > 4" class="text-amber-200/50">
+                      {{ t("content.dependencyMore", { n: dependencyWarnings.length - 4 }) }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div v-if="hasCheckedUpdates"
                 class="shrink-0 border-b border-white/7 px-4 py-1.5 text-[length:var(--text-2xs)]"
                 :class="contentUpdates.length > 0 ? 'text-[var(--primary)]' : 'text-white/35'">
@@ -941,8 +1281,12 @@ async function saveSettings() {
                     <div class="text-[length:var(--text-sm)] text-white/40">{{ t("content.empty") }}</div>
                     <div class="text-[length:var(--text-2xs)] text-white/25">{{ t("content.emptyHint") }}</div>
                   </div>
+                  <div v-else-if="visibleContentItems.length === 0"
+                    class="py-10 text-center text-[length:var(--text-sm)] text-white/40">
+                    {{ t("content.noMatches") }}
+                  </div>
                   <div v-else class="flex flex-col gap-1.5">
-                    <div v-for="item in contentItems" :key="item.fileName"
+                    <div v-for="item in visibleContentItems" :key="item.fileName"
                       class="group flex items-center justify-between gap-3 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2.5"
                       :class="!item.enabled ? 'opacity-50' : ''">
                       <div class="flex min-w-0 items-center gap-2.5">
@@ -971,6 +1315,12 @@ async function saveSettings() {
                             <span v-if="!item.enabled">· deaktiviert</span>
                             <span v-if="updateFor(item.fileName)" class="text-[var(--primary)]">
                               → {{ updateFor(item.fileName)!.latestVersionNumber }}
+                            </span>
+                            <span v-if="warningsFor(item.fileName).length > 0"
+                              class="inline-flex items-center gap-1 rounded-[4px] bg-amber-500/15 px-1.5 py-px text-amber-300"
+                              :title="t('content.dependencyRowHint')">
+                              <Icon icon="lucide:alert-triangle" class="size-[9px]" />
+                              {{ warningsFor(item.fileName).length }}
                             </span>
                           </div>
                         </div>
@@ -1009,6 +1359,13 @@ async function saveSettings() {
                 </div>
               </div>
             </div>
+
+            <!-- Worlds, servers, screenshots, logs and backups -->
+            <WorldsPanel v-else-if="activePanel === 'worlds'" :instance="managingInstance" />
+            <ServersPanel v-else-if="activePanel === 'servers'" :instance="managingInstance" />
+            <ScreenshotsPanel v-else-if="activePanel === 'screenshots'" :instance="managingInstance" />
+            <LogsPanel v-else-if="activePanel === 'logs'" :instance="managingInstance" />
+            <BackupsPanel v-else-if="activePanel === 'backups'" :instance="managingInstance" />
 
             <!-- Settings panel -->
             <div v-else-if="activePanel === 'settings'"
@@ -1071,6 +1428,81 @@ async function saveSettings() {
                       class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
                     <span class="text-[length:var(--text-2xs)] text-white/30">Pfad zur java-Executable oder zum JDK-Verzeichnis. Leer = automatisch.</span>
                   </div>
+
+                  <!-- Card image -->
+                  <div class="flex flex-col gap-1.5">
+                    <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profiles.icon").toUpperCase() }}</label>
+                    <div class="flex items-center gap-2.5">
+                      <div class="flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-[7px] border border-white/10 bg-white/5">
+                        <img v-if="iconForm || managingInstance.packIconUrl" :src="iconForm || managingInstance.packIconUrl"
+                          alt="" class="size-full object-cover" @error="handleImgError" />
+                        <span v-else class="text-[18px]">{{ versionEmoji(managingInstance.versionType) }}</span>
+                      </div>
+                      <input v-model="iconForm" type="text" :placeholder="t('profiles.iconPlaceholder')"
+                        class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
+                    </div>
+                    <span class="text-[length:var(--text-2xs)] text-white/30">{{ t("profiles.iconHint") }}</span>
+                  </div>
+
+                  <!-- Window behaviour -->
+                  <div class="flex flex-col gap-2">
+                    <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("settings.options").toUpperCase() }}</label>
+                    <label class="flex cursor-pointer items-center gap-2.5 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2.5">
+                      <input v-model="settingsForm.fullscreen" type="checkbox" class="size-3.5 accent-[var(--primary)]" />
+                      <span class="text-[length:var(--text-sm)] text-white/80">{{ t("settings.fullscreen") }}</span>
+                    </label>
+                    <label class="flex cursor-pointer items-center gap-2.5 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2.5">
+                      <input v-model="settingsForm.hideLauncher" type="checkbox" class="size-3.5 accent-[var(--primary)]" />
+                      <span class="text-[length:var(--text-sm)] text-white/80">{{ t("settings.hideLauncher") }}</span>
+                    </label>
+                  </div>
+
+                  <!-- Advanced: hooks, wrapper, environment and the directory override -->
+                  <div class="flex flex-col gap-2">
+                    <button type="button"
+                      class="flex items-center gap-2 text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40 transition-colors hover:text-white/70"
+                      @click="showAdvancedProfileSettings = !showAdvancedProfileSettings">
+                      <Icon :icon="showAdvancedProfileSettings ? 'lucide:chevron-down' : 'lucide:chevron-right'" class="size-3" />
+                      {{ t("settings.sections.advanced").toUpperCase() }}
+                    </button>
+
+                    <div v-if="showAdvancedProfileSettings" class="flex flex-col gap-4 rounded-lg border border-white/8 bg-white/[0.02] p-3.5">
+                      <div class="flex flex-col gap-1.5">
+                        <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profileSettings.wrapper").toUpperCase() }}</label>
+                        <input v-model="settingsForm.wrapperCommand" type="text" placeholder="gamemoderun"
+                          class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
+                        <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">{{ t("profileSettings.wrapperHint") }}</span>
+                      </div>
+
+                      <div class="flex flex-col gap-1.5">
+                        <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profileSettings.env").toUpperCase() }}</label>
+                        <textarea v-model="settingsForm.envVars" rows="3" placeholder="MESA_GL_VERSION_OVERRIDE=4.6"
+                          class="w-full resize-y rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]"></textarea>
+                        <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">{{ t("profileSettings.envHint") }}</span>
+                      </div>
+
+                      <div class="flex flex-col gap-1.5">
+                        <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profileSettings.preLaunch").toUpperCase() }}</label>
+                        <input v-model="settingsForm.preLaunchCommand" type="text"
+                          class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
+                        <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">{{ t("profileSettings.preLaunchHint") }}</span>
+                      </div>
+
+                      <div class="flex flex-col gap-1.5">
+                        <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profileSettings.postExit").toUpperCase() }}</label>
+                        <input v-model="settingsForm.postExitCommand" type="text"
+                          class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
+                      </div>
+
+                      <div class="flex flex-col gap-1.5">
+                        <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">{{ t("profileSettings.gameDirectory").toUpperCase() }}</label>
+                        <input v-model="settingsForm.gameDirectory" type="text" :placeholder="managingInstance.gameDirectory"
+                          class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]" />
+                        <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">{{ t("profileSettings.gameDirectoryHint") }}</span>
+                      </div>
+                    </div>
+                  </div>
+
                   <div class="flex justify-end gap-2 pt-1">
                     <button type="button"
                       class="inline-flex items-center gap-1.5 rounded-[7px] border border-white/10 bg-white/5 px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold tracking-[0.07em] text-white/45 transition-all hover:bg-white/10"
@@ -1104,6 +1536,24 @@ async function saveSettings() {
                     @click="openFolder(managingInstance)">
                     <Icon icon="lucide:folder-open" class="size-3.5 shrink-0 text-white/40" />
                     <span>{{ t("profiles.openFolder") }}</span>
+                  </button>
+                  <button type="button"
+                    class="flex items-center gap-3 rounded-lg border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-[length:var(--text-sm)] text-white/70 transition-all hover:bg-white/8 hover:text-white"
+                    @click="startDuplicate(managingInstance)">
+                    <Icon icon="lucide:copy" class="size-3.5 shrink-0 text-white/40" />
+                    <span>{{ t("profiles.duplicate") }}</span>
+                  </button>
+                  <button type="button"
+                    class="flex items-center gap-3 rounded-lg border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-[length:var(--text-sm)] text-white/70 transition-all hover:bg-white/8 hover:text-white"
+                    @click="startGroup(managingInstance)">
+                    <Icon icon="lucide:folder" class="size-3.5 shrink-0 text-white/40" />
+                    <span>{{ t("profiles.group") }}</span>
+                  </button>
+                  <button type="button"
+                    class="flex items-center gap-3 rounded-lg border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-[length:var(--text-sm)] text-white/70 transition-all hover:bg-white/8 hover:text-white"
+                    @click="openVerify">
+                    <Icon icon="lucide:shield-check" class="size-3.5 shrink-0 text-white/40" />
+                    <span>{{ t("verify.title") }}</span>
                   </button>
                   <button type="button"
                     class="flex items-center gap-3 rounded-lg border border-white/8 bg-white/[0.03] px-3.5 py-2.5 text-[length:var(--text-sm)] text-white/70 transition-all hover:bg-white/8 hover:text-white"
@@ -1298,6 +1748,161 @@ async function saveSettings() {
               <Icon :icon="isExporting ? 'lucide:loader-2' : 'lucide:package-open'" class="size-[12px]"
                 :class="isExporting ? 'animate-spin' : ''" />
               {{ isExporting ? t("export.running") : t("export.action") }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- Duplicate modal -->
+  <Teleport to="body">
+    <div v-if="duplicateTarget"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-5 backdrop-blur-md"
+      @click.self="duplicateTarget = null">
+      <div class="w-full max-w-[440px] rounded-[14px] border border-[var(--accent-border)] bg-[var(--surface-panel-strong)] shadow-[var(--shadow-modal)]">
+        <div class="flex items-center justify-between border-b border-white/7 px-5 py-4">
+          <div class="text-[length:var(--text-lg)] font-bold tracking-[0.1em] text-white">
+            {{ t("profiles.duplicateTitle").toUpperCase() }}
+          </div>
+          <button type="button"
+            class="flex size-7 items-center justify-center rounded-md border border-white/10 bg-white/5 text-white/40 transition-all hover:bg-white/10 hover:text-white"
+            @click="duplicateTarget = null">
+            <Icon icon="lucide:x" class="size-[14px]" />
+          </button>
+        </div>
+        <div class="flex flex-col gap-4 p-5">
+          <div class="flex flex-col gap-1.5">
+            <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">PROFILNAME</label>
+            <input v-model="duplicateName" type="text"
+              class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-[13px] py-2.5 text-[length:var(--text-md)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]"
+              @keyup.enter="confirmDuplicate" />
+            <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">{{ t("profiles.duplicateHint") }}</span>
+          </div>
+          <div class="flex justify-end gap-2">
+            <button type="button"
+              class="rounded-[7px] border border-white/10 bg-white/5 px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-white/45 transition-all hover:bg-white/10"
+              @click="duplicateTarget = null">
+              {{ t("common.cancel") }}
+            </button>
+            <button type="button" :disabled="!duplicateName.trim() || isDuplicating"
+              class="inline-flex items-center gap-1.5 rounded-[7px] border border-[var(--accent-border-strong)] bg-[var(--accent-bg-strong)] px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-[var(--primary)] transition-all hover:bg-[var(--accent-bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+              @click="confirmDuplicate">
+              <Icon :icon="isDuplicating ? 'lucide:loader-2' : 'lucide:copy'" class="size-[12px]"
+                :class="isDuplicating ? 'animate-spin' : ''" />
+              {{ isDuplicating ? t("profiles.duplicating") : t("profiles.duplicate") }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- Folder modal -->
+  <Teleport to="body">
+    <div v-if="groupTarget"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-5 backdrop-blur-md"
+      @click.self="groupTarget = null">
+      <div class="w-full max-w-[430px] rounded-[14px] border border-[var(--accent-border)] bg-[var(--surface-panel-strong)] shadow-[var(--shadow-modal)]">
+        <div class="border-b border-white/7 px-5 py-4 text-[length:var(--text-lg)] font-bold tracking-[0.1em] text-white">
+          {{ t("profiles.groupTitle").toUpperCase() }}
+        </div>
+        <div class="flex flex-col gap-4 p-5">
+          <div class="flex flex-col gap-1.5">
+            <input v-model="groupValue" type="text" maxlength="48" list="profile-groups"
+              :placeholder="t('profiles.groupPlaceholder')"
+              class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-[13px] py-2.5 text-[length:var(--text-md)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]"
+              @keyup.enter="confirmGroup" />
+            <datalist id="profile-groups">
+              <option v-for="group in instanceGroups" :key="group" :value="group" />
+            </datalist>
+            <span class="text-[length:var(--text-2xs)] text-white/30">{{ t("profiles.groupHint") }}</span>
+          </div>
+          <div class="flex justify-end gap-2">
+            <button type="button"
+              class="rounded-[7px] border border-white/10 bg-white/5 px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-white/45 transition-all hover:bg-white/10"
+              @click="groupTarget = null">
+              {{ t("common.cancel") }}
+            </button>
+            <button type="button"
+              class="rounded-[7px] border border-[var(--accent-border-strong)] bg-[var(--accent-bg-strong)] px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-[var(--primary)] transition-all hover:bg-[var(--accent-bg-hover)]"
+              @click="confirmGroup">
+              {{ t("common.save") }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- Verify and repair modal -->
+  <Teleport to="body">
+    <div v-if="showVerifyModal"
+      class="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-5 backdrop-blur-md"
+      @click.self="showVerifyModal = false">
+      <div class="flex max-h-[80vh] w-full max-w-[520px] flex-col rounded-[14px] border border-[var(--accent-border)] bg-[var(--surface-panel-strong)] shadow-[var(--shadow-modal)]">
+        <div class="flex items-center justify-between border-b border-white/7 px-5 py-4">
+          <div class="text-[length:var(--text-lg)] font-bold tracking-[0.1em] text-white">
+            {{ t("verify.title").toUpperCase() }}
+          </div>
+          <button type="button"
+            class="flex size-7 items-center justify-center rounded-md border border-white/10 bg-white/5 text-white/40 transition-all hover:bg-white/10 hover:text-white"
+            @click="showVerifyModal = false">
+            <Icon icon="lucide:x" class="size-[14px]" />
+          </button>
+        </div>
+
+        <div class="flex flex-1 flex-col gap-4 overflow-y-auto p-5">
+          <label class="flex cursor-pointer items-start gap-2.5 rounded-lg border border-white/8 bg-white/[0.03] px-3 py-2.5">
+            <input v-model="verifyDeep" type="checkbox" class="mt-0.5 size-3.5 accent-[var(--primary)]" />
+            <span class="flex flex-col gap-0.5">
+              <span class="text-[length:var(--text-sm)] text-white/80">{{ t("verify.deep") }}</span>
+              <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/35">{{ t("verify.deepHint") }}</span>
+            </span>
+          </label>
+
+          <div v-if="isVerifying" class="flex flex-col gap-2 rounded-lg border border-[var(--accent-border)] bg-[var(--accent-bg-soft)] px-3 py-3">
+            <div class="flex items-center gap-2 text-[length:var(--text-sm)] text-[var(--primary)]">
+              <Icon icon="lucide:loader-2" class="size-3.5 animate-spin" />{{ t("verify.running") }}
+            </div>
+            <div class="h-1 overflow-hidden rounded-full bg-white/10">
+              <div class="h-full rounded-full bg-[var(--primary)] transition-[width] duration-200"
+                :style="{ width: verifyProgress >= 0 ? `${verifyProgress}%` : '35%' }" />
+            </div>
+          </div>
+
+          <div v-else-if="verifyReport" class="flex flex-col gap-2 rounded-lg border px-3 py-3"
+            :class="verifyReport.healthy
+              ? 'border-[var(--success-border)] bg-[var(--success-bg)]'
+              : 'border-amber-500/25 bg-amber-500/[0.06]'">
+            <div class="text-[length:var(--text-sm)] font-semibold"
+              :class="verifyReport.healthy ? 'text-[var(--accent)]' : 'text-amber-300'">
+              {{ verifyReport.healthy ? t("verify.healthy") : t("verify.problems") }}
+            </div>
+            <div class="text-[length:var(--text-2xs)] text-white/50">
+              {{ t("verify.summary", {
+                checked: verifyReport.checked,
+                missing: verifyReport.missing,
+                corrupt: verifyReport.corrupt,
+              }) }}
+            </div>
+            <div v-if="verifyReport.problems.length > 0" class="max-h-[180px] overflow-y-auto rounded bg-black/25 p-2">
+              <div v-for="problem in verifyReport.problems" :key="problem"
+                class="font-mono text-[11px] leading-[1.5] text-white/50">{{ problem }}</div>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap justify-end gap-2">
+            <button type="button" :disabled="isVerifying"
+              class="inline-flex items-center gap-1.5 rounded-[7px] border border-white/10 bg-white/5 px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-white/60 transition-all hover:bg-white/10 disabled:opacity-50"
+              @click="runVerify(false)">
+              <Icon icon="lucide:shield-check" class="size-[12px]" />{{ t("verify.quick") }}
+            </button>
+            <button type="button" :disabled="isVerifying || managingInstance?.running"
+              class="inline-flex items-center gap-1.5 rounded-[7px] border border-[var(--accent-border-strong)] bg-[var(--accent-bg-strong)] px-3.5 py-[7px] text-[length:var(--text-sm)] font-semibold text-[var(--primary)] transition-all hover:bg-[var(--accent-bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+              :title="t('verify.repairHint')"
+              @click="runVerify(true)">
+              <Icon icon="lucide:wrench" class="size-[12px]" />{{ t("verify.repair") }}
             </button>
           </div>
         </div>

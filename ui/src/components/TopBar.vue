@@ -2,6 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount } from 'vue';
 import { Icon } from "@iconify/vue";
 import { useLauncher } from '@/composables/useLauncher';
+import TaskCenter from '@/components/TaskCenter.vue';
 const {
   t,
   authData,
@@ -73,6 +74,7 @@ const isMac = navigator.userAgent.toLowerCase().includes('mac');
         />
       </nav>
       <div class="ml-auto flex items-center gap-2" style="-webkit-app-region: no-drag">
+        <TaskCenter />
         <div ref="notifMenuRef" class="relative">
           <button
             type="button"

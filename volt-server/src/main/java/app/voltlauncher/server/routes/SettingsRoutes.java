@@ -3,6 +3,9 @@ package app.voltlauncher.server.routes;
 import app.voltlauncher.core.AppPaths;
 import app.voltlauncher.core.config.LauncherSettings;
 import app.voltlauncher.core.config.SettingsStore;
+import app.voltlauncher.core.discord.DiscordPresenceService;
+import app.voltlauncher.core.update.LauncherUpdateService;
+import app.voltlauncher.core.util.SystemOpener;
 import app.voltlauncher.game.java.JavaInstallService;
 import app.voltlauncher.game.java.JavaRuntimeResolver;
 import app.voltlauncher.server.route.RequestBody;
@@ -21,13 +24,18 @@ public final class SettingsRoutes implements RouteModule {
     private final SettingsStore settings;
     private final JavaRuntimeResolver javaResolver;
     private final JavaInstallService javaInstaller;
+    private final LauncherUpdateService updates;
+    private final DiscordPresenceService presence;
     private final String launcherVersion;
 
     public SettingsRoutes(SettingsStore settings, JavaRuntimeResolver javaResolver,
-                          JavaInstallService javaInstaller, String launcherVersion) {
+                          JavaInstallService javaInstaller, LauncherUpdateService updates,
+                          DiscordPresenceService presence, String launcherVersion) {
         this.settings = settings;
         this.javaResolver = javaResolver;
         this.javaInstaller = javaInstaller;
+        this.updates = updates;
+        this.presence = presence;
         this.launcherVersion = launcherVersion;
     }
 
@@ -39,6 +47,12 @@ public final class SettingsRoutes implements RouteModule {
 
         routes.get("/api/settings/directories", this::directories);
         routes.post("/api/settings/directories/{id}/open", this::openDirectory);
+
+        routes.get("/api/updates", this::checkUpdates);
+        routes.post("/api/updates/download", this::downloadUpdate);
+        routes.post("/api/updates/open-release", this::openRelease);
+
+        routes.get("/api/integrations/discord", this::discordStatus);
 
         routes.get("/api/java/runtimes", this::listRuntimes);
         routes.post("/api/java/runtimes/{majorVersion}/install", this::installRuntime);
@@ -70,6 +84,8 @@ public final class SettingsRoutes implements RouteModule {
         array.put(directory("instances", "Profiles", AppPaths.instancesDirectory()));
         array.put(directory("logs", "Logs", AppPaths.logsDirectory()));
         array.put(directory("exports", "Exported packs", AppPaths.exportsDirectory()));
+        array.put(directory("backups", "Profile backups", AppPaths.backupsDirectory()));
+        array.put(directory("updates", "Downloaded updates", AppPaths.updatesDirectory()));
         array.put(directory("runtimes", "Java runtimes", AppPaths.runtimesDirectory()));
         array.put(directory("cache", "Cache", AppPaths.cacheDirectory()));
         return new JSONObject().put("directories", array);
@@ -88,6 +104,8 @@ public final class SettingsRoutes implements RouteModule {
             case "instances" -> AppPaths.instancesDirectory();
             case "logs" -> AppPaths.logsDirectory();
             case "exports" -> AppPaths.exportsDirectory();
+            case "backups" -> AppPaths.backupsDirectory();
+            case "updates" -> AppPaths.updatesDirectory();
             case "runtimes" -> AppPaths.runtimesDirectory();
             case "cache" -> AppPaths.cacheDirectory();
             default -> throw new IllegalArgumentException("Unknown directory: " + id);
@@ -96,6 +114,55 @@ public final class SettingsRoutes implements RouteModule {
 
     private JSONObject directory(String id, String label, Path path) {
         return new JSONObject().put("id", id).put("label", label).put("path", path.toString());
+    }
+
+    // ── launcher updates ──────────────────────────────────────────────────────
+
+    /**
+     * Checks the release feed. Cached for a few minutes unless {@code force} is passed, so opening
+     * the Updates screen repeatedly does not burn through GitHub's unauthenticated rate limit.
+     */
+    private JSONObject checkUpdates(Context ctx) {
+        LauncherUpdateService.UpdateInfo info = updates.check(
+                RequestBody.queryFlag(ctx, "force", false));
+        return new JSONObject().put("update", info.toJson());
+    }
+
+    /**
+     * Downloads the installer for the newest release and reports where it landed. Applying it is
+     * left to the user: replacing a running launcher's own files is not something to do silently.
+     */
+    private JSONObject downloadUpdate(Context ctx) throws Exception {
+        LauncherUpdateService.UpdateInfo info = updates.check(false);
+        if (!info.available()) {
+            throw new IllegalStateException("There is no newer release to download.");
+        }
+        Path file = updates.download(info);
+        return new JSONObject()
+                .put("path", file.toString())
+                .put("fileName", file.getFileName().toString())
+                .put("directory", file.getParent().toString());
+    }
+
+    private JSONObject openRelease(Context ctx) throws Exception {
+        LauncherUpdateService.UpdateInfo info = updates.check(false);
+        String url = info.releaseUrl();
+        if (url == null || url.isBlank()) {
+            throw new IllegalStateException("No release page is known yet.");
+        }
+        SystemOpener.openUrl(url);
+        return new JSONObject().put("url", url);
+    }
+
+    // ── integrations ──────────────────────────────────────────────────────────
+
+    /** Whether rich presence is connected, and if not, what is missing. */
+    private JSONObject discordStatus(Context ctx) {
+        return new JSONObject()
+                .put("state", presence.status().name().toLowerCase(Locale.ROOT))
+                .put("message", presence.statusMessage())
+                .put("transport", DiscordPresenceService.transportName())
+                .put("configured", !settings.get().discordApplicationId().isBlank());
     }
 
     // ── java runtimes ─────────────────────────────────────────────────────────

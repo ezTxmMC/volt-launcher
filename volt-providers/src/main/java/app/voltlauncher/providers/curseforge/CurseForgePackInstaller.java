@@ -76,7 +76,7 @@ public final class CurseForgePackInstaller extends AbstractModpackInstaller {
             String versionNumber = version.versionNumber() == null || version.versionNumber().isBlank()
                     ? info.packVersion()
                     : version.versionNumber();
-            return new PackInfo(info.versionId(), info.packName(), versionNumber, archive);
+            return new PackInfo(info.versionId(), info.packName(), versionNumber, archive, fileId);
         } catch (Exception e) {
             Files.deleteIfExists(archive);
             throw e;
@@ -84,8 +84,9 @@ public final class CurseForgePackInstaller extends AbstractModpackInstaller {
     }
 
     @Override
-    public List<ContentSource> applyPackContents(Instance instance, Path archive, ProgressSink progress)
+    public List<ContentSource> applyPackContents(Instance instance, PackInfo info, ProgressSink progress)
             throws Exception {
+        Path archive = info.archiveFile();
         JSONObject manifest = readJsonEntry(archive, MANIFEST_ENTRY);
 
         List<RemoteFile> files = resolveManifestFiles(manifest.optJSONArray("files"), progress);

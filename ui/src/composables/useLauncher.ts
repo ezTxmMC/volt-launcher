@@ -8,9 +8,16 @@ import { useSettings } from "./useSettings";
 import { useProviders } from "./useProviders";
 import { useJava } from "./useJava";
 import { useSkins } from "./useSkins";
+import { startTaskPolling, stopTaskPolling, useTasks } from "./useTasks";
+import { useWorlds } from "./useWorlds";
+import { stopFollowingLog, useLogs } from "./useLogs";
+import { useBackups } from "./useBackups";
+import { useUpdates } from "./useUpdates";
 import { useI18n } from "@/i18n";
 import {
+  formatBytes,
   formatLoaderId,
+  formatPlaytime,
   formatRelativeDate,
   formatRelativeIso,
   formatReleaseTime,
@@ -33,6 +40,8 @@ export {
   formatVersionType,
   formatReleaseTime,
   formatLoaderId,
+  formatPlaytime,
+  formatBytes,
   minecraftVersionOf,
   loaderOf,
   handleImgError,
@@ -46,21 +55,32 @@ let notificationUnwatchers: Array<() => void> = [];
 
 async function init() {
   const { loadSession } = useAuth();
-  const { loadInstances, loadVersions, loadPlatforms } = useInstances();
-  const { loadSettings } = useSettings();
+  const { loadInstances, loadVersions, loadPlatforms, loadGroups, profileSort, favouritesFirst } =
+    useInstances();
+  const { loadSettings, settings } = useSettings();
   const { loadProviders } = useProviders();
+  const { checkForUpdates } = useUpdates();
 
   // Settings first: they carry the language and accent colour the rest of the UI renders with.
   await loadSettings();
 
+  // The grid's sort order is a preference, so it is restored from the stored settings rather
+  // than resetting to "recently played" on every start.
+  profileSort.value = settings.value.profileSort;
+  favouritesFirst.value = settings.value.favouritesFirst;
+
   void loadSession();
   void loadPlatforms();
   void loadInstances();
+  void loadGroups();
   void loadVersions();
   void loadProviders();
+  // A background check so the Updates screen and the badge have an answer before it is opened.
+  if (settings.value.autoUpdate) void checkForUpdates(false);
 
   instancePollInterval = window.setInterval(() => void loadInstances(), INSTANCE_POLL_MS);
   setupInstanceWatchers();
+  startTaskPolling();
 
   notificationUnwatchers = [
     watch(error, (value) => {
@@ -75,6 +95,8 @@ async function init() {
 function cleanup() {
   stopAuth();
   stopLaunchPolling();
+  stopTaskPolling();
+  stopFollowingLog();
   useJava().stopAllPolling();
 
   if (instancePollInterval !== null) {
@@ -96,6 +118,11 @@ export function useLauncher() {
     ...useSettings(),
     ...useProviders(),
     ...useSkins(),
+    ...useTasks(),
+    ...useWorlds(),
+    ...useLogs(),
+    ...useBackups(),
+    ...useUpdates(),
     ...useI18n(),
     java: useJava(),
 
@@ -109,6 +136,8 @@ export function useLauncher() {
     formatVersionType,
     formatReleaseTime,
     formatLoaderId,
+    formatPlaytime,
+    formatBytes,
     minecraftVersionOf,
     loaderOf,
     handleImgError,

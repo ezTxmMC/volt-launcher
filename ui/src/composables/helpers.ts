@@ -77,6 +77,40 @@ export const loaderOf = (id: string): string | null => {
   return loader && loader !== "vanilla" ? loader : null;
 };
 
+/**
+ * Renders a duration the way a player thinks about it: minutes for a short session, then hours,
+ * then days. Anything under a minute reads as "not played yet" rather than "0m".
+ */
+export const formatPlaytime = (milliseconds: number): string => {
+  if (!milliseconds || milliseconds < 60_000) return t("time.noPlaytime");
+
+  const minutes = Math.floor(milliseconds / 60_000);
+  if (minutes < 60) return t("time.minutes", { n: minutes });
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 24) {
+    return remainingMinutes === 0
+      ? t("time.hours", { n: hours })
+      : t("time.hoursMinutes", { h: hours, m: remainingMinutes });
+  }
+
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return remainingHours === 0
+    ? t("time.days", { n: days })
+    : t("time.daysHours", { d: days, h: remainingHours });
+};
+
+/** Byte counts with one decimal place from kilobytes upward. */
+export const formatBytes = (bytes: number): string => {
+  if (!bytes || bytes < 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+};
+
 export const handleImgError = (event: Event) => {
   const image = event.target as HTMLImageElement;
   const fallback = image.dataset.fallbackSrc;

@@ -64,7 +64,7 @@ public final class ModrinthPackInstaller extends AbstractModpackInstaller {
             // The provider's own version number beats the one written into the index, which pack
             // authors often forget to bump.
             String versionNumber = versionMeta.optString("version_number", info.packVersion());
-            return new PackInfo(info.versionId(), info.packName(), versionNumber, archive);
+            return new PackInfo(info.versionId(), info.packName(), versionNumber, archive, modrinthVersionId);
         } catch (Exception e) {
             Files.deleteIfExists(archive);
             throw e;
@@ -72,8 +72,9 @@ public final class ModrinthPackInstaller extends AbstractModpackInstaller {
     }
 
     @Override
-    public List<ContentSource> applyPackContents(Instance instance, Path archive, ProgressSink progress)
+    public List<ContentSource> applyPackContents(Instance instance, PackInfo info, ProgressSink progress)
             throws Exception {
+        Path archive = info.archiveFile();
         JSONObject index = readJsonEntry(archive, INDEX_ENTRY);
 
         List<RemoteFile> files = collectFiles(index.optJSONArray("files"));

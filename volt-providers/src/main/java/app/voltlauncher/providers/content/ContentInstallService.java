@@ -175,7 +175,25 @@ public final class ContentInstallService {
                 target.folder(), stored, provider.id().id(), version.projectId(), version.versionId(),
                 label.title(), version.versionNumber(), version.downloadUrl(),
                 version.sha1() == null ? "" : version.sha1(), Files.size(destination),
-                ContentSource.ORIGIN_PROVIDER, label.iconUrl()));
+                ContentSource.ORIGIN_PROVIDER, label.iconUrl(), requiredProjectIds(version)));
+    }
+
+    /**
+     * The projects this release declares as required, stored alongside the file.
+     *
+     * <p>Recording them at install time is what later lets the launcher point out that disabling
+     * one mod has broken three others, without re-querying the provider for every installed file.
+     */
+    private static List<String> requiredProjectIds(ProjectVersion version) {
+        List<String> projectIds = new ArrayList<>();
+        for (VersionDependency dependency : version.dependencies()) {
+            if (!dependency.isRequired()) continue;
+            String projectId = dependency.projectId();
+            if (projectId != null && !projectId.isBlank() && !projectIds.contains(projectId)) {
+                projectIds.add(projectId);
+            }
+        }
+        return projectIds;
     }
 
     /** The loader a profile runs, or {@code null} for vanilla profiles. */

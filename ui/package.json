@@ -22,7 +22,8 @@
     "appId": "app.voltlauncher",
     "productName": "VoltLauncher",
     "directories": {
-      "output": "../volt-app/src/main/resources/electron-bin"
+      "output": "../volt-app/src/main/resources/electron-bin",
+      "buildResources": "icons"
     },
     "files": [
       "dist/**/*",
@@ -30,13 +31,16 @@
       "package.json"
     ],
     "mac": {
-      "target": "dir"
+      "target": "dir",
+      "icon": "icon.icns"
     },
     "win": {
-      "target": "dir"
+      "target": "dir",
+      "icon": "icon.ico"
     },
     "linux": {
-      "target": "dir"
+      "target": "dir",
+      "icon": "icon.png"
     }
   },
   "dependencies": {

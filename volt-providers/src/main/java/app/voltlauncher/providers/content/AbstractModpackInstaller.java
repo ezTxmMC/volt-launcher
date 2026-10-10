@@ -42,11 +42,37 @@ public abstract class AbstractModpackInstaller {
     }
 
     /**
-     * Metadata read from a pack archive, before an instance exists.
+     * Metadata read from a pack, before an instance exists.
      *
      * @param packVersion the pack's own version string, shown when offering an update
+     * @param archiveFile the downloaded archive, or {@code null} for a platform that serves a file
+     *                    list rather than an archive
+     * @param sourceRef   the provider's own version identifier, so an installer that has no
+     *                    archive to re-read can resolve the file list again when it applies it
      */
-    public record PackInfo(String versionId, String packName, String packVersion, Path archiveFile) {}
+    public record PackInfo(String versionId, String packName, String packVersion, Path archiveFile,
+                           String sourceRef) {
+
+        public PackInfo(String versionId, String packName, String packVersion, Path archiveFile) {
+            this(versionId, packName, packVersion, archiveFile, "");
+        }
+
+        public PackInfo {
+            sourceRef = sourceRef == null ? "" : sourceRef;
+        }
+
+        public boolean hasArchive() {
+            return archiveFile != null;
+        }
+
+        public PackInfo withVersion(String newPackVersion) {
+            return new PackInfo(versionId, packName, newPackVersion, archiveFile, sourceRef);
+        }
+
+        public PackInfo withSourceRef(String newSourceRef) {
+            return new PackInfo(versionId, packName, packVersion, archiveFile, newSourceRef);
+        }
+    }
 
     /**
      * One file the pack pulls from the network. Public because Java only lets a subclass invoke a
@@ -73,6 +99,11 @@ public abstract class AbstractModpackInstaller {
     /** Reads the launcher version id and display name out of an archive already on disk. */
     public abstract PackInfo readPackInfo(Path archive) throws Exception;
 
+    /** Whether this platform distributes packs as an archive a user can import from disk. */
+    public boolean supportsImport() {
+        return true;
+    }
+
     /** Downloads the pack archive for a provider version, then reads its metadata. */
     public abstract PackInfo fetchPackInfo(String versionId) throws Exception;
 
@@ -80,13 +111,13 @@ public abstract class AbstractModpackInstaller {
      * Installs the pack's contents into the instance and reports every file that landed in a
      * content folder, so the caller can record where each one came from.
      *
-     * <p>The archive is left in place; the caller owns its lifetime, because an update needs to
-     * read it again after the contents have been applied.
+     * <p>The archive, when there is one, is left in place; the caller owns its lifetime, because
+     * an update needs to read it again after the contents have been applied.
      *
      * @param progress receives stage changes and download counts
      */
     public abstract List<ContentSource> applyPackContents(
-            Instance instance, Path archive, ProgressSink progress) throws Exception;
+            Instance instance, PackInfo info, ProgressSink progress) throws Exception;
 
     // ── shared helpers ────────────────────────────────────────────────────────
 
@@ -110,6 +141,27 @@ public abstract class AbstractModpackInstaller {
             ZipEntry entry;
             while ((entry = zip.getNextEntry()) != null) {
                 if (entryName.equals(entry.getName())) return true;
+                zip.closeEntry();
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * Whether an archive carries an entry ending in the given path.
+     *
+     * <p>Used where the format's marker file may sit inside a wrapper folder — a plain client zip
+     * has no manifest declaring its root, so {@code bin/version.json} and
+     * {@code MyPack/bin/version.json} both have to count.
+     */
+    public static boolean hasEntryEndingWith(Path archive, String suffix) {
+        try (ZipInputStream zip = new ZipInputStream(Files.newInputStream(archive))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName().replace('\\', '/');
+                if (name.equals(suffix) || name.endsWith("/" + suffix)) return true;
                 zip.closeEntry();
             }
         } catch (Exception e) {
@@ -201,6 +253,87 @@ public abstract class AbstractModpackInstaller {
             }
         }
         return written;
+    }
+
+    /**
+     * Extracts a whole archive over the game directory, skipping the entries a caller rejects and
+     * transparently stripping a single wrapper folder.
+     *
+     * <p>Packs distributed as a plain client zip — Technic's format — have no manifest saying
+     * where their contents start, and authors zip them both ways: sometimes at the root,
+     * sometimes inside a folder named after the pack. Guessing wrong installs a profile whose
+     * mods folder is one level too deep and which therefore launches vanilla.
+     *
+     * @param skip tested against the archive-relative path, after any wrapper folder is removed
+     * @return the game-relative paths that were written
+     */
+    protected List<String> extractAll(Path gameDir, Path archive, java.util.function.Predicate<String> skip)
+            throws Exception {
+        String wrapper = detectWrapperFolder(archive);
+        List<String> written = new ArrayList<>();
+
+        try (ZipInputStream zip = new ZipInputStream(Files.newInputStream(archive))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName().replace('\\', '/');
+                if (wrapper != null && name.startsWith(wrapper)) {
+                    name = name.substring(wrapper.length());
+                }
+                if (name.isBlank() || entry.isDirectory() || (skip != null && skip.test(name))) {
+                    zip.closeEntry();
+                    continue;
+                }
+
+                Path destination = gameDir.resolve(name).normalize();
+                if (!destination.startsWith(gameDir)) {
+                    throw new IllegalStateException(
+                            "Modpack archive tried to write outside the instance: " + entry.getName());
+                }
+                Files.createDirectories(destination.getParent());
+                Files.copy(zip, destination, StandardCopyOption.REPLACE_EXISTING);
+                written.add(name);
+                zip.closeEntry();
+            }
+        }
+        return written;
+    }
+
+    /**
+     * The single top-level folder every entry sits inside, or {@code null} when the archive's
+     * contents are already at its root.
+     */
+    protected static String detectWrapperFolder(Path archive) throws Exception {
+        String candidate = null;
+        boolean sawEntry = false;
+
+        try (ZipInputStream zip = new ZipInputStream(Files.newInputStream(archive))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                String name = entry.getName().replace('\\', '/');
+                zip.closeEntry();
+                if (name.isBlank()) continue;
+
+                // A traversal entry must never be mistaken for a wrapper folder: stripping
+                // "../" as a prefix would rewrite the path into something harmless-looking and
+                // rob the extraction step of the check that would have refused it.
+                if (name.startsWith("/") || name.contains("..")) return null;
+
+                int slash = name.indexOf('/');
+                if (slash <= 0) {
+                    // A file at the root means there is no wrapper folder.
+                    if (!entry.isDirectory()) return null;
+                    continue;
+                }
+                String top = name.substring(0, slash + 1);
+                if (!sawEntry) {
+                    candidate = top;
+                    sawEntry = true;
+                } else if (!top.equals(candidate)) {
+                    return null;
+                }
+            }
+        }
+        return candidate;
     }
 
     /**

@@ -95,7 +95,12 @@ public class MicrosoftAuth {
     }
 
     public MinecraftAccountSession getLaunchSession() throws Exception {
-        return sessionManager.getLaunchSession();
+        return sessionManager.getLaunchSession(false);
+    }
+
+    /** @see app.voltlauncher.auth.session.SessionManager#getLaunchSession(boolean) */
+    public MinecraftAccountSession getLaunchSession(boolean allowOffline) throws Exception {
+        return sessionManager.getLaunchSession(allowOffline);
     }
 
     public void logout() throws Exception {

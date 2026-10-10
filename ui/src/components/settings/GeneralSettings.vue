@@ -1,11 +1,24 @@
 <script setup lang="ts">
+import { computed, onMounted } from "vue";
+import { Icon } from "@iconify/vue";
 import { useLauncher } from "@/composables/useLauncher";
 import { accentColors } from "./settingsData";
 import SettingsPanel from "./SettingsPanel.vue";
 import SettingsToggle from "./SettingsToggle.vue";
 import SettingsRow from "./SettingsRow.vue";
 
-const { t, settings, accentColor, locales } = useLauncher();
+const { t, settings, accentColor, locales, discordStatus, loadDiscordStatus } = useLauncher();
+
+/** What rich presence is actually doing right now, so the toggle does not have to be believed. */
+const presenceState = computed(() => {
+  const state = discordStatus.value?.state;
+  if (state === "connected") return { key: "discord.connected", tone: "text-[var(--accent)]", icon: "lucide:check-circle-2" };
+  if (state === "waiting_for_discord") return { key: "discord.waiting", tone: "text-white/45", icon: "lucide:loader-2" };
+  if (state === "not_configured") return { key: "discord.notConfigured", tone: "text-amber-300", icon: "lucide:alert-triangle" };
+  return { key: "discord.disabled", tone: "text-white/35", icon: "lucide:circle-slash" };
+});
+
+onMounted(() => void loadDiscordStatus());
 </script>
 
 <template>
@@ -67,6 +80,47 @@ const { t, settings, accentColor, locales } = useLauncher();
           :label="t('settings.autoUpdate')"
           :description="t('settings.autoUpdateHint')"
         />
+        <SettingsToggle
+          v-model="settings.offlineModeAllowed"
+          :label="t('settings.offlineMode')"
+          :description="t('settings.offlineModeHint')"
+        />
+      </div>
+    </SettingsPanel>
+
+    <SettingsPanel :title="t('discord.title')" icon="simple-icons:discord">
+      <div class="flex flex-col gap-2">
+        <div class="flex items-center gap-2">
+          <Icon
+            :icon="presenceState.icon"
+            class="size-3.5"
+            :class="[presenceState.tone, discordStatus?.state === 'waiting_for_discord' ? 'animate-spin' : '']"
+          />
+          <span class="text-[length:var(--text-sm)]" :class="presenceState.tone">{{ t(presenceState.key) }}</span>
+          <button
+            type="button"
+            class="ml-auto flex size-6 items-center justify-center rounded border border-white/10 bg-white/5 text-white/40 transition-all hover:bg-white/10 hover:text-white"
+            @click="loadDiscordStatus()"
+          >
+            <Icon icon="lucide:refresh-cw" class="size-3" />
+          </button>
+        </div>
+
+        <div class="flex flex-col gap-1.5">
+          <label class="text-[length:var(--text-2xs)] font-bold tracking-[0.14em] text-white/40">
+            {{ t("discord.applicationId").toUpperCase() }}
+          </label>
+          <input
+            v-model="settings.discordApplicationId"
+            type="text"
+            inputmode="numeric"
+            placeholder="000000000000000000"
+            class="w-full rounded-lg border border-white/10 bg-[var(--surface-input)] px-3 py-2 font-mono text-[length:var(--text-sm)] text-white outline-none transition-colors focus:border-[var(--accent-border-focus)]"
+          />
+          <span class="text-[length:var(--text-2xs)] leading-[1.5] text-white/30">
+            {{ t("discord.applicationIdHint") }}
+          </span>
+        </div>
       </div>
     </SettingsPanel>
   </div>

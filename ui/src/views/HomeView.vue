@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, watch } from 'vue';
 import { useLauncher } from '@/composables/useLauncher';
+import { useShortcuts } from '@/composables/useShortcuts';
+import type { MainTab } from '@/composables/types';
 import AuroraBackground from '@/components/AuroraBackground.vue';
 import TopBar from '@/components/TopBar.vue';
 import CreateProfileModal from '@/components/CreateProfileModal.vue';
@@ -9,7 +11,33 @@ import ProfilesTab from '@/components/tabs/ProfilesTab.vue';
 import SkinsTab from '@/components/tabs/SkinsTab.vue';
 import DiscoverTab from '@/components/tabs/DiscoverTab.vue';
 import SettingsTab from '@/components/tabs/SettingsTab.vue';
-const { init, cleanup, accentColor } = useLauncher();
+const { init, cleanup, accentColor, activeTab, selectedInstance, handleLaunch, authData } = useLauncher();
+
+/** Ctrl+1…5 jump between the main tabs, in the order the navigation shows them. */
+const TAB_ORDER: MainTab[] = ['home', 'profiles', 'skins', 'discover', 'settings'];
+
+useShortcuts([
+  ...TAB_ORDER.map((tab, index) => ({
+    key: String(index + 1),
+    ctrl: true,
+    run: () => { activeTab.value = tab; },
+  })),
+  {
+    key: ',',
+    ctrl: true,
+    run: () => { activeTab.value = 'settings'; },
+  },
+  {
+    key: 'Enter',
+    ctrl: true,
+    run: () => {
+      // Only when a profile is actually launchable; otherwise the shortcut would silently fail.
+      if (!authData.value || !selectedInstance.value || selectedInstance.value.busy) return;
+      if (selectedInstance.value.running) return;
+      void handleLaunch(selectedInstance.value.name);
+    },
+  },
+]);
 
 function hexToRgb(hex: string) {
   const n = parseInt(hex.replace('#', ''), 16);

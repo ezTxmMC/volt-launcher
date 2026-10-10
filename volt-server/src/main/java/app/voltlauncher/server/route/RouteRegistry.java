@@ -56,7 +56,15 @@ public final class RouteRegistry {
      * codes and error handling.
      */
     public RouteRegistry raw(String method, String path, Handler handler) {
-        config.routes.addHttpHandler(HandlerType.findOrCreate(method), path, handler);
+        config.routes.addHttpHandler(HandlerType.findOrCreate(method), path, ctx -> {
+            try {
+                handler.handle(ctx);
+            } catch (Exception e) {
+                // Raw handlers own their success response, but not their failures: without this a
+                // rejected file name surfaced as an opaque 500 instead of the 400 it is.
+                respond(ctx, statusFor(e), error(e));
+            }
+        });
         if (logRoutes) {
             System.out.println("[API] " + method + " " + path + " (raw)");
         }
@@ -76,31 +84,41 @@ public final class RouteRegistry {
             JSONObject payload = handler.handle(ctx);
             JSONObject body = payload == null ? new JSONObject() : payload;
             respond(ctx, 200, body.put("success", true));
-        } catch (IllegalArgumentException e) {
-            respond(ctx, 400, error(e));
-        } catch (NoSuchElementException e) {
-            respond(ctx, 404, error(e));
-        } catch (IllegalStateException e) {
-            // A well-formed request the launcher cannot satisfy right now, e.g. deleting a
-            // running instance or a provider whose bridge is offline.
-            respond(ctx, 409, error(e));
         } catch (Throwable t) {
-            // Throwable, not Exception: in the packaged native image a missing JDK feature surfaces
-            // as a linkage Error, and letting it escape gave the UI an empty 500 with no message.
-            System.err.println("[API] " + ctx.method() + " " + ctx.path() + " failed: " + t);
-            t.printStackTrace(System.err);
-            respond(ctx, 500, error(t));
+            int status = statusFor(t);
+            if (status >= 500) {
+                // Logged only for genuine faults: a refused file name is not worth a stack trace.
+                System.err.println("[API] " + ctx.method() + " " + ctx.path() + " failed: " + t);
+                t.printStackTrace(System.err);
+            }
+            respond(ctx, status, error(t));
         }
     }
 
-    private JSONObject error(Throwable t) {
+    /**
+     * Maps an exception onto a status.
+     *
+     * <p>{@code Throwable} rather than {@code Exception}: in the packaged native image a missing
+     * JDK feature surfaces as a linkage {@link Error}, and letting it escape gave the UI an empty
+     * 500 with no message at all.
+     */
+    private static int statusFor(Throwable t) {
+        if (t instanceof IllegalArgumentException) return 400;
+        if (t instanceof NoSuchElementException) return 404;
+        // A well-formed request the launcher cannot satisfy right now, e.g. deleting a running
+        // instance, or a provider whose bridge is offline.
+        if (t instanceof IllegalStateException) return 409;
+        return 500;
+    }
+
+    private static JSONObject error(Throwable t) {
         String message = t.getMessage();
         return new JSONObject()
                 .put("success", false)
                 .put("error", message == null || message.isBlank() ? t.getClass().getSimpleName() : message);
     }
 
-    private void respond(Context ctx, int status, JSONObject body) {
+    private static void respond(Context ctx, int status, JSONObject body) {
         ctx.status(status).contentType(JSON).result(body.toString());
     }
 }
