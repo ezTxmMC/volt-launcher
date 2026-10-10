@@ -1,0 +1,59 @@
+appId: app.voltlauncher.app
+productName: Volt Launcher
+artifactName: "VoltLauncher-${version}-${os}-${arch}.${ext}"
+copyright: Copyright © VoltLauncher contributors
+directories:
+  output: release
+files:
+  - out/**
+  - package.json
+asar: true
+# The Novus backend is staged per target by scripts/package.mjs into .stage/backend/
+# (from backend/dist/<os>-<arch>/). At runtime the main process starts
+# process.resourcesPath/backend/volt-backend[.exe].
+extraResources:
+  - from: .stage/backend
+    to: backend
+linux:
+  maintainer: VoltLauncher contributors
+  icon: ../packaging/linux/voltlauncher.png
+  category: Game
+  synopsis: Minecraft launcher
+  description: Minecraft launcher with multiple accounts, mod loaders and content from Modrinth, CurseForge, Technic and FTB.
+  target:
+    - AppImage
+    - deb
+    - rpm
+    - zip
+    - tar.gz
+    - flatpak
+flatpak:
+  runtime: org.freedesktop.Platform
+  runtimeVersion: "24.08"
+  sdk: org.freedesktop.Sdk
+  base: org.electronjs.Electron2.BaseApp
+  baseVersion: "24.08"
+  finishArgs:
+    - --share=network
+    - --share=ipc
+    - --socket=x11
+    - --socket=wayland
+    - --socket=pulseaudio
+    - --device=dri
+    - --filesystem=xdg-download
+win:
+  icon: ../packaging/windows/voltlauncher.ico
+  target:
+    - nsis
+    - msi
+    - zip
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+mac:
+  icon: ../packaging/macos/AppIcon.icns
+  category: public.app-category.games
+  target:
+    - dmg
+    - zip

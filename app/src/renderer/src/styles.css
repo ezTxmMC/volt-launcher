@@ -1,0 +1,521 @@
+@import '@fontsource-variable/space-grotesk';
+@import '@fontsource-variable/inter';
+@import 'tailwindcss';
+
+/*
+ * Design tokens taken from the old Vue UI (@volt-launcher/volt-ui theme.css and ui/src/assets/base.css).
+ * The dark theme is the original look. The light theme keeps the same structure with a light base
+ * so the existing Theme setting keeps working; the old UI had no light theme.
+ */
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #030912; /* --app-bg */
+  --surface: rgba(8, 18, 34, 0.78); /* --surface-panel */
+  --surface-strong: rgba(8, 18, 34, 0.96); /* --surface-panel-strong */
+  --surface-2: rgba(5, 13, 26, 0.62); /* --surface-input-muted: rows and list items */
+  --surface-3: rgba(255, 255, 255, 0.05); /* bg-white/5: secondary buttons, chips */
+  --card-solid: #0b1528; /* opaque card background: a translucent card shows seams while it lifts */
+  --header-bg: rgba(3, 9, 18, 0.95); /* --header-bg */
+  --border: rgba(255, 255, 255, 0.1); /* border-white/10 */
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --fg: rgba(255, 255, 255, 0.96); /* --app-fg */
+  --fg-muted: rgba(255, 255, 255, 0.6); /* text-white/60 */
+  --fg-subtle: rgba(255, 255, 255, 0.4); /* text-white/40 */
+  --accent: #00b2ff; /* --primary */
+  --accent-rgb: 0, 178, 255; /* --primary-rgb */
+  --accent-hover: #22c0ff;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(0, 178, 255, 0.1); /* --accent-bg */
+  --accent-soft-hover: rgba(0, 178, 255, 0.2); /* --accent-bg-hover */
+  --accent-line: rgba(0, 178, 255, 0.28); /* --accent-border-active */
+  --accent-soft-strong: rgba(0, 178, 255, 0.12); /* --accent-bg-strong */
+  --accent-border: rgba(0, 178, 255, 0.2); /* --accent-border */
+  --accent-border-strong: rgba(0, 178, 255, 0.25); /* --accent-border-strong */
+  --accent-border-active: rgba(0, 178, 255, 0.45); /* selected items: the accent outline, never the text colour */
+  --accent-focus: rgba(0, 178, 255, 0.4); /* --accent-border-focus */
+  --surface-input: rgba(5, 13, 26, 0.8); /* --surface-input */
+  --aurora-primary: radial-gradient(circle, rgba(var(--accent-rgb), 0.2), transparent 70%);
+  --aurora-secondary: radial-gradient(circle, rgba(108, 99, 255, 0.18), transparent 70%);
+  --aurora-violet: radial-gradient(circle, rgba(139, 92, 246, 0.15), transparent 70%);
+  --aurora-accent: radial-gradient(circle, rgba(0, 255, 204, 0.1), transparent 70%);
+  --secondary: #6c63ff; /* --secondary */
+  --danger: #ff5f57; /* --danger */
+  --danger-text: #ff9898; /* --danger-text */
+  --danger-soft: rgba(255, 95, 87, 0.1); /* --danger-bg */
+  --warning: #fbb724; /* --warning */
+  --warning-soft: rgba(251, 191, 36, 0.2); /* --warning-bg */
+  --success: #00ffcc; /* --accent of the old theme, used for success */
+  --success-soft: rgba(0, 255, 204, 0.18); /* --success-bg */
+  --info: #6c63ff;
+  --info-soft: rgba(108, 99, 255, 0.15);
+  --shadow: 0 32px 80px rgb(0 0 0 / 0.5), 0 0 40px rgb(0 178 255 / 0.08); /* --shadow-modal */
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #eef3f9;
+  --surface: rgba(255, 255, 255, 0.82);
+  --surface-strong: rgba(255, 255, 255, 0.96);
+  --surface-2: rgba(240, 245, 251, 0.85);
+  --surface-3: rgba(15, 30, 55, 0.05);
+  --card-solid: #ffffff;
+  --header-bg: rgba(255, 255, 255, 0.92);
+  --border: rgba(15, 30, 55, 0.1);
+  --border-strong: rgba(15, 30, 55, 0.18);
+  --fg: #0b1626;
+  --fg-muted: rgba(11, 22, 38, 0.66);
+  --fg-subtle: rgba(11, 22, 38, 0.44);
+  --accent: #0077b8;
+  --accent-rgb: 0, 119, 184;
+  --accent-hover: #006aa6;
+  --accent-fg: #ffffff;
+  --accent-soft: rgba(0, 119, 184, 0.1);
+  --accent-soft-hover: rgba(0, 119, 184, 0.18);
+  --accent-line: rgba(0, 119, 184, 0.3);
+  --accent-soft-strong: rgba(0, 119, 184, 0.14);
+  --accent-border: rgba(0, 119, 184, 0.22);
+  --accent-border-strong: rgba(0, 119, 184, 0.3);
+  --accent-border-active: rgba(0, 119, 184, 0.55);
+  --accent-focus: rgba(0, 119, 184, 0.45);
+  --surface-input: rgba(255, 255, 255, 0.9);
+  --aurora-primary: radial-gradient(circle, rgba(var(--accent-rgb), 0.14), transparent 70%);
+  --aurora-secondary: radial-gradient(circle, rgba(90, 82, 224, 0.12), transparent 70%);
+  --aurora-violet: radial-gradient(circle, rgba(139, 92, 246, 0.1), transparent 70%);
+  --aurora-accent: radial-gradient(circle, rgba(13, 138, 95, 0.08), transparent 70%);
+  --secondary: #5a52e0;
+  --danger: #c0282d;
+  --danger-text: #b3262b;
+  --danger-soft: rgba(192, 40, 45, 0.1);
+  --warning: #96590a;
+  --warning-soft: rgba(150, 89, 10, 0.12);
+  --success: #0d8a5f;
+  --success-soft: rgba(13, 138, 95, 0.12);
+  --info: #5a52e0;
+  --info-soft: rgba(90, 82, 224, 0.1);
+  --shadow: 0 32px 80px rgb(15 30 55 / 0.18), 0 0 40px rgb(0 119 184 / 0.06);
+}
+
+/*
+ * Motion tokens. Animations stay between 150 and 280 ms, ease-out, transform and opacity only.
+ * They drop to zero when the Animations setting is off (applyAppearance sets data-no-animations on <html>)
+ * or when the OS asks for reduced motion, so every rule that reads them stops moving without extra logic.
+ */
+:root {
+  --motion-fast: 150ms;
+  --motion-base: 220ms;
+  --motion-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --motion-distance: 6px;
+  --motion-scale-from: 0.97;
+  --motion-press: 0.98;
+  --motion-lift: -2px;
+  --motion-stagger: 25ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+    --motion-distance: 0px;
+    --motion-scale-from: 1;
+    --motion-press: 1;
+    --motion-lift: 0px;
+    --motion-stagger: 0ms;
+  }
+}
+
+:root[data-no-animations] {
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+  --motion-distance: 0px;
+  --motion-scale-from: 1;
+  --motion-press: 1;
+  --motion-lift: 0px;
+  --motion-stagger: 0ms;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-strong: var(--surface-strong);
+  --color-surface-2: var(--surface-2);
+  --color-surface-input: var(--surface-input);
+  --color-surface-input-muted: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-header: var(--header-bg);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--fg-muted);
+  --color-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-soft-strong: var(--accent-soft-strong);
+  --color-accent-soft-hover: var(--accent-soft-hover);
+  --color-accent-line: var(--accent-line);
+  --color-secondary: var(--secondary);
+  --color-danger: var(--danger);
+  --color-danger-text: var(--danger-text);
+  --color-danger-soft: var(--danger-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --font-sans: 'Space Grotesk Variable', 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --shadow-pop: var(--shadow);
+  --shadow-accent-md: 0 0 12px rgb(var(--accent-rgb) / 0.2);
+  --shadow-accent-lg: 0 0 16px rgb(var(--accent-rgb) / 0.4);
+  --text-2xs: 12px;
+  --text-xs: 13px;
+  --text-sm: 13.5px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  ::selection {
+    background: var(--accent-soft-hover);
+  }
+
+  /* No visible scrollbars anywhere: the content still scrolls with wheel, trackpad and keyboard. */
+  * {
+    scrollbar-width: none;
+  }
+
+  *::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  dialog::backdrop {
+    background: rgb(0 0 0 / 0.6);
+    backdrop-filter: blur(12px);
+  }
+}
+
+@keyframes volt-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes volt-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+@keyframes volt-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(var(--motion-distance));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes volt-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(var(--motion-scale-from));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes volt-scale-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: scale(var(--motion-scale-from));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@layer components {
+  /* Page transition: the routed content rises in on every navigation (PageTransition.tsx). */
+  .volt-page {
+    animation: volt-fade-up var(--motion-base) var(--motion-ease) both;
+  }
+
+  /* Dialogs (Modal.tsx) and menus (ContextMenu.tsx) open with a scale-in. Closing is not animated: the
+     parents unmount them on close. */
+  .volt-dialog[open],
+  .volt-menu {
+    animation: volt-scale-in var(--motion-base) var(--motion-ease) both;
+  }
+  .volt-menu {
+    transform-origin: top left;
+  }
+
+  /* Closing a dialog or menu the user dismissed: it fades and shrinks out, then the parent unmounts it
+     (leave.ts). Only user-initiated closes play it. */
+  .volt-dialog[data-leaving],
+  .volt-menu[data-leaving] {
+    animation: volt-scale-out var(--motion-fast) var(--motion-ease) both;
+    pointer-events: none;
+  }
+
+  /* Stagger (Stagger.tsx): each direct child fades up, 25 ms after the previous one, the first 10 only. */
+  .volt-stagger[data-stagger='play'] > * {
+    --stagger-i: 9;
+    animation: volt-fade-up var(--motion-base) var(--motion-ease) both;
+    animation-delay: calc(var(--stagger-i) * var(--motion-stagger));
+  }
+  .volt-stagger[data-stagger='play'] > :nth-child(1) { --stagger-i: 0; }
+  .volt-stagger[data-stagger='play'] > :nth-child(2) { --stagger-i: 1; }
+  .volt-stagger[data-stagger='play'] > :nth-child(3) { --stagger-i: 2; }
+  .volt-stagger[data-stagger='play'] > :nth-child(4) { --stagger-i: 3; }
+  .volt-stagger[data-stagger='play'] > :nth-child(5) { --stagger-i: 4; }
+  .volt-stagger[data-stagger='play'] > :nth-child(6) { --stagger-i: 5; }
+  .volt-stagger[data-stagger='play'] > :nth-child(7) { --stagger-i: 6; }
+  .volt-stagger[data-stagger='play'] > :nth-child(8) { --stagger-i: 7; }
+  .volt-stagger[data-stagger='play'] > :nth-child(9) { --stagger-i: 8; }
+  .volt-stagger[data-stagger='play'] > :nth-child(10) { --stagger-i: 9; }
+
+  /* Loading placeholders: a soft sweep over the block. Static when motion is off. */
+  .volt-skeleton {
+    position: relative;
+    overflow: hidden;
+  }
+  .volt-skeleton::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.06), transparent);
+    transform: translateX(-100%);
+    animation: shimmer 1.8s ease-in-out infinite;
+  }
+  .volt-indeterminate {
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+
+  /* Tabs (Tabs.tsx): the pill behind the active tab slides to it. */
+  .volt-tab-indicator {
+    position: absolute;
+    border: 1px solid var(--accent-border);
+    border-radius: 7px;
+    background: var(--accent-soft);
+    pointer-events: none;
+    transition:
+      left var(--motion-base) var(--motion-ease),
+      top var(--motion-base) var(--motion-ease),
+      width var(--motion-base) var(--motion-ease),
+      height var(--motion-base) var(--motion-ease);
+  }
+
+  /* With motion off, the shimmer and the indeterminate bar stop; the bar shows as a faint full-width track. */
+  :root[data-no-animations] .volt-skeleton::after,
+  :root[data-no-animations] .volt-indeterminate {
+    animation: none;
+  }
+  :root[data-no-animations] .volt-skeleton::after {
+    opacity: 0;
+  }
+  :root[data-no-animations] .volt-indeterminate {
+    width: 100%;
+    opacity: 0.35;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .volt-skeleton::after,
+    .volt-indeterminate {
+      animation: none;
+    }
+    .volt-skeleton::after {
+      opacity: 0;
+    }
+    .volt-indeterminate {
+      width: 100%;
+      opacity: 0.35;
+    }
+  }
+
+  /* Project description, styled as the old ProjectDetailPanel .project-body. */
+  .markdown {
+    font-size: var(--text-base);
+    line-height: 1.65;
+    color: rgb(255 255 255 / 0.62);
+    overflow-wrap: anywhere;
+  }
+  :root[data-theme='light'] .markdown {
+    color: var(--fg-muted);
+  }
+  .markdown > * + * {
+    margin-top: 0.75em;
+  }
+  .markdown h1,
+  .markdown h2,
+  .markdown h3,
+  .markdown h4 {
+    color: rgb(255 255 255 / 0.92);
+    font-weight: 700;
+    line-height: 1.3;
+    margin: 1.4em 0 0.5em;
+  }
+  :root[data-theme='light'] .markdown h1,
+  :root[data-theme='light'] .markdown h2,
+  :root[data-theme='light'] .markdown h3,
+  :root[data-theme='light'] .markdown h4 {
+    color: var(--fg);
+  }
+  .markdown h1 {
+    font-size: var(--text-lg);
+  }
+  .markdown h2 {
+    font-size: var(--text-md-plus);
+  }
+  .markdown h3 {
+    font-size: var(--text-md);
+  }
+  .markdown a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .markdown ul,
+  .markdown ol {
+    padding-left: 1.4em;
+    margin: 0.75em 0;
+  }
+  .markdown ul {
+    list-style: disc;
+  }
+  .markdown ol {
+    list-style: decimal;
+  }
+  .markdown li {
+    margin: 0.3em 0;
+  }
+  .markdown code {
+    background: rgb(255 255 255 / 0.07);
+    color: inherit;
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  .markdown pre {
+    background: rgb(0 0 0 / 0.35);
+    border: 1px solid rgb(255 255 255 / 0.08);
+    border-radius: 8px;
+    padding: 12px;
+    overflow-x: auto;
+    margin: 0.9em 0;
+  }
+  .markdown pre code {
+    background: none;
+    padding: 0;
+  }
+  .markdown blockquote {
+    border-left: 3px solid var(--accent);
+    padding-left: 12px;
+    margin: 0.9em 0;
+    color: rgb(255 255 255 / 0.5);
+  }
+  .markdown table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 0.9em 0;
+  }
+  .markdown th,
+  .markdown td {
+    border: 1px solid rgb(255 255 255 / 0.1);
+    padding: 6px 10px;
+    text-align: left;
+  }
+  .markdown img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+  }
+  .markdown hr {
+    border: 0;
+    border-top: 1px solid rgb(255 255 255 / 0.1);
+    margin: 1.4em 0;
+  }
+}
+
+/* Frameless window: the top bar drags the window, its controls (and their dropdowns) do not. */
+.app-drag {
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
