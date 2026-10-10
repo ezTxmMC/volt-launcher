@@ -68,7 +68,7 @@ jobs:
             "https://github.com/ezTxmMC/novus/releases/download/${NOVUS_VERSION}/novusc-x86_64-linux-musl"
           chmod +x "$RUNNER_TEMP/bin/novusc"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          novusc version
+          "$RUNNER_TEMP/bin/novusc" version
 
       - name: Smoke test the host build
         run: backend/scripts/smoke.sh --build
