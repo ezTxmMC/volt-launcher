@@ -18,8 +18,8 @@ var currentSettings = {}
 // The defaults of the contract. To add a setting, add its default here and
 // its rule to settingRule(). A setting whose rule is "fixed" has a default
 // that the launcher owns: PATCH refuses it and a stored value is ignored.
-// autoProfileMods is the Fabric preset of the automatic profiles (autoprofiles/);
-// the other loaders have no preset yet, so the untouched default gives them no mods.
+// syncPackAuto* configure the profiles that are created for every new Minecraft version with
+// the selected synced packs (syncpacks/); syncPackAutoPacks holds pack ids.
 method defaultSettings(): map<string, object> {
     return {
         "language": "de",
@@ -46,18 +46,10 @@ method defaultSettings(): map<string, object> {
         "discordApplicationId": "1490544471962685530",
         "autoUpdate": true,
         "betaUpdates": false,
-        "autoProfilesEnabled": false,
-        "autoProfileLoader": "fabric",
-        "autoProfileVersions": "release",
-        "autoProfileMods": [
-            {"provider": "modrinth", "projectId": "AANobbMI", "name": "Sodium"},
-            {"provider": "modrinth", "projectId": "gvQqBUqZ", "name": "Lithium"},
-            {"provider": "modrinth", "projectId": "uXXizFIs", "name": "FerriteCore"},
-            {"provider": "modrinth", "projectId": "5ZwdcRci", "name": "ImmediatelyFast"},
-            {"provider": "modrinth", "projectId": "NNAgCjsB", "name": "Entity Culling"},
-            {"provider": "modrinth", "projectId": "nmDcB62a", "name": "ModernFix"},
-            {"provider": "modrinth", "projectId": "fQEb0iXm", "name": "Krypton"}
-        ]
+        "syncPackAutoEnabled": false,
+        "syncPackAutoLoader": "fabric",
+        "syncPackAutoVersions": "release",
+        "syncPackAutoPacks": []
     }
 }
 
@@ -89,10 +81,10 @@ method settingRule(string key): string {
         "discordApplicationId": "fixed",
         "autoUpdate": "bool",
         "betaUpdates": "bool",
-        "autoProfilesEnabled": "bool",
-        "autoProfileLoader": "choice:fabric|quilt|forge|neoforge",
-        "autoProfileVersions": "choice:release|snapshots",
-        "autoProfileMods": "presetMods"
+        "syncPackAutoEnabled": "bool",
+        "syncPackAutoLoader": "choice:fabric|quilt|forge|neoforge",
+        "syncPackAutoVersions": "choice:release|snapshots",
+        "syncPackAutoPacks": "idList"
     }
     if (rules.has(key)) {
         return rules[key]
@@ -165,32 +157,17 @@ method isProjectIdText(object value): bool {
     return true
 }
 
-// "" when `value` is a list of preset mods for the auto profiles, otherwise why not:
-// [{"provider": "modrinth", "projectId": "AANobbMI", "name": "Sodium"}, ...] (at most 32 entries).
-method presetModsProblem(string key, object value): string {
-    var shape = "'" + key + "' entries need provider \"modrinth\", a projectId and a name"
+// "" when `value` is a list of ids (the pack ids of syncPackAutoPacks, at most 64), otherwise why not.
+method idListProblem(string key, object value): string {
     if (isArray(value) == false) {
         return "'" + key + "' must be a list"
     }
-    if (value.length() > 32) {
-        return "'" + key + "' has more than 32 entries"
+    if (value.length() > 64) {
+        return "'" + key + "' has more than 64 entries"
     }
     for (entry in value) {
-        if (isMap(entry) == false) {
-            return shape
-        }
-        if (getOr(entry, "provider", "") != "modrinth") {
-            return shape
-        }
-        var projectId = getOr(entry, "projectId", 0)
-        if (isString(projectId) == false) {
-            return shape
-        }
-        if (isProjectIdText(projectId) == false) {
-            return "'" + key + "' has a projectId that is not a Modrinth id or slug"
-        }
-        if (isString(getOr(entry, "name", 0)) == false) {
-            return shape
+        if (isString(entry) == false || isId("" + entry) == false) {
+            return "'" + key + "' entries must be ids"
         }
     }
     return ""
@@ -248,8 +225,8 @@ method validSetting(string key, object value): string {
         }
         return ""
     }
-    if (rule == "presetMods") {
-        return presetModsProblem(key, value)
+    if (rule == "idList") {
+        return idListProblem(key, value)
     }
     // integer:<min>:<max>
     var parts = rule.split(":")

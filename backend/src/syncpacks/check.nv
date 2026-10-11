@@ -1,4 +1,4 @@
-package autoprofiles
+package syncpacks
 
 import launch
 import path
@@ -10,7 +10,7 @@ import core
 // server starts and 30 seconds after the feature is switched on, then every 60 minutes
 // while it is on. A check reads the Mojang manifest and handles every version not yet seen:
 //   - the first check (autoRecordOnlyDue) only records the versions present;
-//   - later checks create "<version> Performance" for each new version of the selected
+//   - later checks create a profile with the selected packs for each new version of the selected
 //     kind (release; with snapshots also snapshot), and record the others as seen.
 // A failed manifest sets lastError and the next check tries again. A version whose profile
 // could not be made now (failed, not skipped) stays unseen and is tried again.
@@ -152,7 +152,7 @@ method autoTick() {
         }
     }
     if (start) {
-        core.startJob("autoprofile", "Automatische Profile prüfen", AutoProfileCheckJob{})
+        core.startJob("autoprofile", "Neue Versionen prüfen", AutoProfileCheckJob{})
     }
 }
 
@@ -169,7 +169,9 @@ method autoProfilesLoop() {
 
 // Loads the state and starts the timer thread (called once from main, before the server listens).
 method startBackground() {
+    packsLoad()
     autoLoadState()
+    spMigrate()
     var enabled = autoEnabled()
     var now = time.now()
     sync (autoLock) {

@@ -8,6 +8,7 @@ import { parseOptionalInt } from '@/lib/format'
 import { useSettings } from '@/state/settings'
 import { useToast } from '@/state/toast'
 import { ProfileAvatar } from '@/components/ProfileCard'
+import { ProfileSyncPacks } from '@/components/profile/ProfileSyncPacks'
 import { SYNCED_ITEMS } from '@/components/profile/syncedItems'
 import { Button, IconButton } from '@/components/ui/Button'
 import { Field, Select, TextArea, TextInput } from '@/components/ui/Field'
@@ -440,6 +441,10 @@ export function SettingsTab({ profile, onChanged }: { profile: Profile; onChange
 
       <div className="lg:col-span-2">
         <SharedFolders profile={profile} onChanged={onChanged} />
+      </div>
+
+      <div className="lg:col-span-2">
+        <ProfileSyncPacks profile={profile} />
       </div>
 
       <Section title={t('profile.section.game')}>

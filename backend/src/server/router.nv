@@ -12,7 +12,7 @@ import gamedata
 import migration
 import logo
 import imports
-import autoprofiles
+import syncpacks
 
 // Routing: /api/<segment>/... to the core or a feature module.
 //
@@ -174,7 +174,14 @@ method dispatch(Request request): map<string, object> {
         if (section == "modpack" || section == "export") {
             return providers.route(verb, segments, query, body)
         }
+        if (section == "syncpacks") {
+            return syncpacks.route(verb, segments, query, body)
+        }
         if (section == "install-game" || section == "launch" || section == "game") {
+            if (section == "launch" && verb == "POST") {
+                // The profile's own files win over its packs' files: settle that before the game starts.
+                syncpacks.beforeLaunch(segments[1])
+            }
             return launch.route(verb, segments, query, body)
         }
         if (section == "worlds" || section == "servers" || section == "screenshots" || section == "logs" || section == "backups") {
@@ -200,8 +207,8 @@ method dispatch(Request request): map<string, object> {
     if (first == "accounts" || first == "skins") {
         return accounts.route(verb, segments, query, body)
     }
-    if (first == "autoprofiles") {
-        return autoprofiles.route(verb, segments, query, body)
+    if (first == "syncpacks") {
+        return syncpacks.route(verb, segments, query, body)
     }
     if (first == "_test" && core.testRoutes()) {
         return core.testRoute(verb, segments, query, body)

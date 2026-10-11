@@ -1,6 +1,6 @@
 import { useCallback } from 'react'
 import { Icon } from '@iconify/react'
-import type { Loader, LoaderVersion, SyncedFolder } from '@shared/models'
+import type { Loader, LoaderVersion, SyncedFolder, SyncPack } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
 import { useAsync } from '@/lib/hooks'
@@ -24,6 +24,11 @@ interface FinishStepProps {
   /** Folders shared with other profiles; empty shares nothing. */
   synced: readonly SyncedFolder[]
   onSynced: (folders: SyncedFolder[]) => void
+  /** The existing synced packs; the block is hidden when there are none. */
+  syncPacks: readonly SyncPack[]
+  /** Ids of the packs to link after the profile is created. */
+  selectedPacks: readonly string[]
+  onSelectedPacks: (ids: string[]) => void
   /** Names of the existing profiles; undefined while they load. */
   existingNames: readonly string[] | undefined
   /** Set when the profile list could not be loaded, so duplicates cannot be checked. */
@@ -45,6 +50,9 @@ export function FinishStep({
   onName,
   synced,
   onSynced,
+  syncPacks,
+  selectedPacks,
+  onSelectedPacks,
   existingNames,
   namesError,
   memoryMb,
@@ -55,6 +63,9 @@ export function FinishStep({
   const setItem = (key: SyncedFolder, on: boolean): void =>
     onSynced(SYNCED_ITEMS.filter((item) => (item.key === key ? on : synced.includes(item.key))).map((item) => item.key))
   const chosen = SYNCED_ITEMS.filter((item) => synced.includes(item.key))
+  const chosenPacks = syncPacks.filter((pack) => selectedPacks.includes(pack.id))
+  const setPack = (id: string, on: boolean): void =>
+    onSelectedPacks(syncPacks.filter((pack) => (pack.id === id ? on : selectedPacks.includes(pack.id))).map((pack) => pack.id))
   const loadLoaderVersions = useCallback(
     () =>
       loader === 'vanilla'
@@ -152,6 +163,34 @@ export function FinishStep({
         </div>
       </fieldset>
 
+      {syncPacks.length > 0 && (
+        <fieldset className="grid min-w-0 gap-2">
+          <legend className="mb-1 text-[12px] font-bold tracking-[0.14em] text-subtle uppercase">
+            {t('createProfile.syncpacks.title')}
+          </legend>
+          <p className="text-[12px] leading-[1.5] text-subtle">{t('createProfile.syncpacks.hint')}</p>
+          <div className="@container min-w-0">
+            <div className="grid min-w-0 gap-x-6 gap-y-2.5 @md:grid-cols-2">
+              {syncPacks.map((pack) => (
+                <Checkbox
+                  key={pack.id}
+                  checked={selectedPacks.includes(pack.id)}
+                  onChange={(on) => setPack(pack.id, on)}
+                  label={
+                    <span className="grid gap-0.5">
+                      <span>{pack.name}</span>
+                      <span className="text-[12px] leading-[1.5] text-subtle">
+                        {t('createProfile.syncpacks.entries', { count: pack.entries.length })}
+                      </span>
+                    </span>
+                  }
+                />
+              ))}
+            </div>
+          </div>
+        </fieldset>
+      )}
+
       <section className="grid gap-3 rounded-[10px] border border-line bg-surface-2 p-4">
         <h3 className="text-[12px] font-bold tracking-[0.14em] text-subtle uppercase">{t('createProfile.summary.title')}</h3>
         <div className="flex min-w-0 items-center gap-3">
@@ -183,6 +222,12 @@ export function FinishStep({
             <>
               <dt className="text-subtle">{t('createProfile.synced.summary')}</dt>
               <dd className="min-w-0 font-semibold">{chosen.map((item) => t(item.label.createProfile)).join(', ')}</dd>
+            </>
+          )}
+          {chosenPacks.length > 0 && (
+            <>
+              <dt className="text-subtle">{t('createProfile.syncpacks.summary')}</dt>
+              <dd className="min-w-0 truncate font-semibold">{chosenPacks.map((pack) => pack.name).join(', ')}</dd>
             </>
           )}
         </dl>

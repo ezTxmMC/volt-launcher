@@ -637,54 +637,67 @@ Notes:
 - No lock is held during network or file access; temporary files carry a random ID.
 - Tests: `backend/tests/logo/run.sh` (classification, priority with fixtures, cache, 404; the jar and the pack fixtures are created with Python in the temporary data folder).
 
-## Automatic profiles (`autoprofiles/`)
+## Synced packs (`syncpacks/`)
 
-A background checker creates a profile `<version> Performance` for every new Minecraft version, with a
-preset list of performance mods (default: Fabric). Settings (`core/settings.nv`):
+A synced pack is a named list of content projects (mods, resource packs, shaders) from Modrinth or CurseForge.
+A pack can be added to any profile, existing or new; the newest version that fits the profile (Minecraft version
+and loader) is installed. Packs replace the former automatic profiles. Definitions live in
+`<dataDir>/syncpacks.json`; what a profile got from a pack lives in `<gameDir>/.volt/syncpacks.json`.
 
-| Key | Default | Rule |
-| --- | --- | --- |
-| `autoProfilesEnabled` | `false` | bool |
-| `autoProfileLoader` | `fabric` | `fabric \| quilt \| forge \| neoforge` |
-| `autoProfileVersions` | `release` | `release \| snapshots` (with `snapshots`, snapshots are included too) |
-| `autoProfileMods` | Fabric preset, 7 Modrinth projects | List of `{provider: "modrinth", projectId, name}`, at most 32 entries; `projectId` made of letters, digits, `-`, `_`, and `.` (at most 64 characters) |
+**The profile always wins.** A project the profile already has (any file of that project, found through the
+content store or, for unknown files, a hash lookup at the provider) is not installed from the pack and is listed as
+`overridden`. A project added to the profile later replaces the pack's file at the next reconcile (before every
+launch, before every apply, or `POST .../reconcile`). A pack file the user deleted stays deleted (`declined`)
+until the pack is added again with `retry`. A pack file that was updated in place (same project, new file name)
+stays the pack's file.
 
-The preset: Sodium `AANobbMI`, Lithium `gvQqBUqZ`, FerriteCore `uXXizFIs`, ImmediatelyFast `5ZwdcRci`,
-Entity Culling `NNAgCjsB`, ModernFix `nmDcB62a`, Krypton `fQEb0iXm`. Iris is not included. The slug
-`memory-leak-fix` does not exist on Modrinth (404) and is therefore omitted.
+Pack: `{id, name, entries, profiles, createdAt}`, entry `{provider, projectId, kind, name, iconUrl}` with `kind` =
+`mod`, `resourcepack` or `shader` (at most 200 entries, 64 packs, names unique case-insensitively, 1 to 64 characters).
+`profiles` are the ids of the profiles the pack is linked to (read from the profiles' records).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/autoprofiles` | `{enabled, loader, versions, mods, seen, lastCheck, lastError, results}`; `seen` is the number of versions seen, `lastCheck` and `lastError` are an ISO time or text, respectively, or `null`; `results` are the last 50 results, newest first, each `{minecraftVersion, status, reason, profileId}` with `status` = `created`, `skipped`, or `failed`. |
-| POST | `/api/autoprofiles/create` | Body `{minecraftVersion}`; Job (202, kind `autoprofile`) for exactly this version. 400 for an unknown version, 409 if the profile name already exists. |
-| POST | `/api/autoprofiles/check` | Job (202): one check, as with the timer. Also runs when the feature is switched off. 409 while a check is running. |
+| GET | `/api/syncpacks` | `{packs: [Pack], auto: Auto}` |
+| POST | `/api/syncpacks` | Body `{name, entries?}` → 201 Pack. 400 invalid, 409 name taken. |
+| GET / PATCH / DELETE | `/api/syncpacks/:id` | Pack; PATCH `{name?, entries?}` (entries replace the list); DELETE unlinks the pack everywhere, keeps the files as ordinary content and removes it from the new-version selection. |
+| POST | `/api/syncpacks/:id/sync` | Job (202, kind `syncpack`): every linked profile is brought up to date (entries that left the pack are removed, new ones installed). Busy profiles are skipped and listed. |
+| POST | `/api/syncpacks/from-profile` | Body `{profileId, name}` → 201 Pack from the profile's content with a known provider source. |
+| GET | `/api/profiles/:id/syncpacks` | `{packs: [{packId, name, files, overridden, declined, missing}]}` |
+| POST | `/api/profiles/:id/syncpacks` | Body `{packId, retry?}` → Job (202): link and install. `retry` clears `declined`. 409 while the game runs or the profile is busy. |
+| POST | `/api/profiles/:id/syncpacks/reconcile` | `{changes, packs}`: settles overrides now. |
+| DELETE | `/api/profiles/:id/syncpacks/:packId?removeFiles=true\|false` | `{removed, kept}`. Only the pack's own files are removed; the profile's files never are. |
+| GET | `/api/syncpacks/auto` | `{enabled, loader, versions, packs, seen, lastCheck, lastError, results}` (see below) |
+| POST | `/api/syncpacks/auto/create` | Body `{minecraftVersion}`; Job (202, kind `autoprofile`). 400 unknown version, 409 name exists. |
+| POST | `/api/syncpacks/auto/check` | Job (202): one check now. 409 while a check runs. |
 
-Flow:
+### New version → new profile
 
-- A timer thread (`autoprofiles.startBackground()` in `main.nv`) checks 30 s after startup and 30 s after the feature
-  was switched on, then every 60 minutes as long as it is on. Each check runs as a job.
-- The first check (after switching on, or after the first start with the feature on) only records: all versions in the Mojang manifest
-  are entered as seen, and no profile is created.
-- Later checks handle every version that has not been seen. If its type matches the setting (`release`, with `snapshots`
-  also `snapshot`), the profile is created; other versions are only noted as seen. Switching from `release` to
-  `snapshots` therefore does not backfill old snapshots.
-- Name: `<version> Performance`. If the name exists, the version ends as `skipped` with "already exists".
-- Loader: if the loader has no build for the version (Fabric meta 400, Quilt meta 404, Forge/NeoForge: empty list), the
-  version ends as `skipped` with the reason. Other errors (unreachable) end as `failed`; the version stays unseen
-  and is retried on the next check.
-- Mods: each entry is handled like a content installation (`providers.installContent`, newest matching version,
-  required dependencies on). A mod that cannot be installed is listed in the result's `reason`; the profile
-  remains `created`.
-- Default for Quilt, Forge, and NeoForge: there is no preset yet. The list is a single key; as long as
-  it is unchanged from the Fabric preset, another loader gets no mods, and the result states the reason.
-  Custom mods for that loader are set in `autoProfileMods`.
-- Errors do not stop the checker: an unreachable manifest sets `lastError`, and the next check tries again.
-- State: `<dataDir>/autoprofiles.json` (`baselined`, `seen`, `lastCheck`, `lastError`, `results`; the last 200 results).
-- Test switch: only with `--enable-test-routes` does the checker read `manifest.json` and `loaders.json` from the folder in
-  `VOLT_AUTOPROFILES_FIXTURES` instead of from the network. The tests use this.
-- Tests: `backend/tests/autoprofiles/run.sh` (baseline recording, new versions, release/snapshot filter, naming rule, missing loader,
-  Quilt rule, mod list validation, endpoints, error path, timer; about 50 s, no network, in the temporary data folder).
+Settings: `syncPackAutoEnabled` (`false`), `syncPackAutoLoader` (`fabric | quilt | forge | neoforge`),
+`syncPackAutoVersions` (`release | snapshots`), `syncPackAutoPacks` (list of pack ids).
 
+- A timer thread (`syncpacks.startBackground()` in `main.nv`) checks 30 s after startup and 30 s after the option was
+  switched on, then every 60 minutes while it is on; each check is a job.
+- The first check only records the versions of the Mojang manifest and creates nothing. Later checks create a
+  profile for each unseen version whose type matches (`release`, plus `snapshot` with `snapshots`).
+- Name: `<version> <pack names joined by " + ">` (just the version when no pack is selected), at most 64 characters.
+  An existing name ends as `skipped`. The profile shares `options` and `servers` (see "Shared folders").
+- The loader must have a build for the version (otherwise `skipped` with the reason; unreachable ends as `failed`
+  and is retried). The selected packs are applied to the new profile; what cannot be installed is listed in `reason`.
+- State: `<dataDir>/autoprofiles.json` (`baselined`, `seen`, `lastCheck`, `lastError`, `results`).
+
+### Migration
+
+On the first start after the update the automatic profiles of earlier versions are migrated once: the preset mods
+(`autoProfileMods`) become the pack "Performance", the switches move to the `syncPackAuto*` settings with the pack
+selected, and every profile the old checker created is linked to the pack with the preset mods it already has
+recorded as the pack's files (nothing is installed or changed). `syncpacks.json` then has `"migrated": true`.
+
+### Tests and fixtures
+
+`backend/tests/syncpacks/run.sh` (103 checks, about 50 s, no network): validation, apply with override, later
+override, declined files, sync, from-profile, unlink with and without files, new-version profiles with packs, the
+timer and the migration. With `--enable-test-routes`, `VOLT_SYNCPACKS_FIXTURES` (installs.json) replaces the
+provider installs and `VOLT_AUTOPROFILES_FIXTURES` (manifest.json, loaders.json) the manifest and loader lookups.
 
 ## Profile import (`imports/`)
 
@@ -714,7 +727,7 @@ Test option: `VOLT_IMPORT_HOME=<folder>` replaces the home directory and disable
 
 ## Synced folders (`core/synced.nv`)
 
-When a profile is created, you choose which folders and files are shared between profiles. The allowed folders are `shaderpacks`, `resourcepacks`, `saves`, `screenshots`, and `config`, and the allowed files are `options` (`options.txt`) and `servers` (`servers.dat`). Mods are not allowed, because they differ per version. The default is nothing; the automatically created profiles (`autoprofiles/create.nv`) get `["options", "servers"]`, while `POST /api/profiles` stays at nothing.
+When a profile is created, you choose which folders and files are shared between profiles. The allowed folders are `shaderpacks`, `resourcepacks`, `saves`, `screenshots`, and `config`, and the allowed files are `options` (`options.txt`) and `servers` (`servers.dat`). Mods are not allowed, because they differ per version. The default is nothing; the new-version profiles (`syncpacks/create.nv`) get `["options", "servers"]`, while `POST /api/profiles` stays at nothing.
 
 - `POST /api/profiles` accepts the optional field `"synced": ["saves"]` (array, no duplicates; empty or `null` means nothing is shared). Unknown key, duplicate entry, or not an array: 400 `bad_request`.
 - It is stored as `synced` (array). Older profiles without the field read `[]`. `GET` returns it.
@@ -725,7 +738,7 @@ When a profile is created, you choose which folders and files are shared between
 - Creating: the shared folder is `<dataDir>/synced/<key>/` (created if needed). In the new profile's game folder, the entry `<folder>` is created as a link to it: `ln -s` on Linux and macOS, a directory junction via `cmd /c mklink /J` on Windows (without admin rights). If the entry already exists (folder, file, or link), nothing is replaced: 409 `conflict` with "the folder <name> already exists in the new profile". If a link fails, creation responds with 500 `internal`; the profile is rolled back (links and profile folder are removed).
 - Files (`options` → `options.txt`, `servers` → `servers.dat`): the shared entry is `<dataDir>/synced/options.txt` or `servers.dat` (with the game's name). Link: `ln -s` on Linux and macOS; on Windows a hard link via `cmd /c mklink /H <profile file> <shared file>` (without admin rights, only on the same drive). A hard link is removed with `del`, which deletes only that name; the file remains. Enabling: if the shared file is missing, the profile's file is moved there; if it is already there, the profile's file is moved to `<gameDir>/.volt-sync-conflicts/<name>` (not overwritten, with the suffix "(2)" if the name is taken). If the profile has no file and the shared one is missing, an empty one is created (`"createdEmpty": true`). `syncReport`: `{"key": "options", "action": "enable", "status": "ok", "moved": 1, "conflicts": 0, "createdEmpty": false}`. Disabling: the link is removed and the shared file is copied into the game folder (the profile keeps a copy, the shared one remains); `{"key": "options", "action": "disable", "status": "ok", "copied": 1}`. If the copy fails, it is undone as with folders (status `failed`). Creating: if the entry exists in the game folder, 409 with "the file options.txt already exists in the new profile". The 409 when the game is running, the journal, and the deletion rules apply unchanged.
 - Deleting: only the profile's links are removed, in the managed folder and in the game folder (if changed via `PATCH`). On Linux, `removeAll` removes a link itself without following it. On Windows, a junction is removed with `cmd /c rmdir` before the profile folder is deleted, so that `removeAll` does not descend into the target. If a link remains, the profile folder is kept (warning in the log). The launcher never deletes shared content.
-- Tests: `backend/tests/synced/run.sh` (link and target, shared files, deletion with content preserved, 400/409/500, PATCH enable with merging and conflicts, PATCH disable with copy, failed copy, undo after a failed link, restart, profile without the field; files: enable with move, second profile via the same link, disable with copy, conflict in `.volt-sync-conflicts`, empty file, failed copy, undo, creation with 409 and with both files; in the temporary data folder). `backend/tests/autoprofiles/run.sh` verifies that automatically created profiles have `["options", "servers"]` with links. Not tested: the 409 when the game is running (no runtime hook wired up), the junction and the hard link on Windows and macOS at runtime.
+- Tests: `backend/tests/synced/run.sh` (link and target, shared files, deletion with content preserved, 400/409/500, PATCH enable with merging and conflicts, PATCH disable with copy, failed copy, undo after a failed link, restart, profile without the field; files: enable with move, second profile via the same link, disable with copy, conflict in `.volt-sync-conflicts`, empty file, failed copy, undo, creation with 409 and with both files; in the temporary data folder). `backend/tests/syncpacks/run.sh` verifies that new-version profiles have `["options", "servers"]` with links. Not tested: the 409 when the game is running (no runtime hook wired up), the junction and the hard link on Windows and macOS at runtime.
 
 ## Forge up to 1.12.2 (`launch/legacyforge.nv`)
 

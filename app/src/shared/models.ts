@@ -45,44 +45,104 @@ export interface Settings {
   discordApplicationId: string
   autoUpdate: boolean
   betaUpdates: boolean
-  /** Automatic profiles: one profile per new Minecraft version, built from the preset below. */
-  autoProfilesEnabled: boolean
-  autoProfileLoader: AutoProfileLoader
-  autoProfileVersions: AutoProfileVersions
-  /** The preset mods, installed in every new automatic profile (newest matching version each). */
-  autoProfileMods: AutoProfileMod[]
+  /** Synced packs: a new profile per new Minecraft version, with the selected packs (see SyncPackAuto). */
+  syncPackAutoEnabled: boolean
+  syncPackAutoLoader: SyncPackAutoLoader
+  syncPackAutoVersions: SyncPackAutoVersions
+  /** Ids of the packs installed into every new profile of the automatic creation. */
+  syncPackAutoPacks: string[]
 }
 
-export type AutoProfileLoader = 'fabric' | 'quilt' | 'forge' | 'neoforge'
-export type AutoProfileVersions = 'release' | 'snapshots'
+/** What a synced pack entry is. Data packs are not part of packs. */
+export type SyncPackKind = 'mod' | 'resourcepack' | 'shader'
+export const SYNC_PACK_KINDS: readonly SyncPackKind[] = ['mod', 'resourcepack', 'shader']
 
-/** One mod of the automatic-profile preset. Only Modrinth is supported. */
-export interface AutoProfileMod {
-  provider: 'modrinth'
+/** One content project of a synced pack. */
+export interface SyncPackEntry {
+  provider: 'modrinth' | 'curseforge'
   projectId: string
+  kind: SyncPackKind
   name: string
+  iconUrl: string | null
 }
 
-/** One outcome of an automatic-profile check or create, newest last. */
-export interface AutoProfileResult {
+/** A named list of content projects. `profiles` holds the ids of the profiles the pack is linked to. */
+export interface SyncPack {
+  id: string
+  name: string
+  entries: SyncPackEntry[]
+  profiles: string[]
+  createdAt: string
+}
+
+export type SyncPackAutoLoader = 'fabric' | 'quilt' | 'forge' | 'neoforge'
+export type SyncPackAutoVersions = 'release' | 'snapshots'
+
+/** One outcome of the automatic creation, newest last. `profileId` is set when a profile was created. */
+export interface SyncPackAutoResult {
   minecraftVersion: string
   status: 'created' | 'skipped' | 'failed'
-  reason: string
-  profileId?: string | null
+  reason: string | null
+  profileId: string | null
 }
 
-/** GET /api/autoprofiles: the current configuration, the progress so far and the last outcomes. */
-export interface AutoProfilesStatus {
+/** The automatic creation of profiles per new Minecraft version, with its progress and last outcomes. */
+export interface SyncPackAuto {
   enabled: boolean
-  loader: AutoProfileLoader
-  versions: AutoProfileVersions
-  mods: AutoProfileMod[]
-  /** How many Minecraft versions the launcher has already seen (and will not build profiles for). */
+  loader: SyncPackAutoLoader
+  versions: SyncPackAutoVersions
+  /** Pack ids used for the new profiles. */
+  packs: string[]
   seen: number
-  /** ISO 8601 time of the last check, or null when none ran yet. */
   lastCheck: string | null
   lastError: string | null
-  results: AutoProfileResult[]
+  results: SyncPackAutoResult[]
+}
+
+/** GET /api/syncpacks: every pack plus the automatic creation status. */
+export interface SyncPacksView {
+  packs: SyncPack[]
+  auto: SyncPackAuto
+}
+
+/** A file a synced pack installed into a profile. `dependency` marks files pulled in as required dependencies. */
+export interface ProfileSyncPackFile {
+  projectId: string
+  name: string
+  kind: SyncPackKind
+  fileName: string
+  dependency: boolean
+}
+
+/** A pack entry by project, as the profile shows it. */
+export interface ProfileSyncPackRef {
+  projectId: string
+  name: string
+  kind: SyncPackKind
+}
+
+/** One pack linked to a profile. */
+export interface ProfileSyncPack {
+  packId: string
+  name: string
+  files: ProfileSyncPackFile[]
+  /** In the profile already: the profile's own version wins over the pack's. */
+  overridden: ProfileSyncPackRef[]
+  /** Removed by the user from this profile; not installed again. */
+  declined: ProfileSyncPackRef[]
+  /** Pack entries that are not installed yet. */
+  missing: SyncPackEntry[]
+}
+
+/** GET /api/profiles/:id/syncpacks. */
+export interface ProfileSyncPacksView {
+  packs: ProfileSyncPack[]
+}
+
+/** DELETE /api/profiles/:id/syncpacks/:packId: the files that were removed and the ones kept. */
+export interface ProfileSyncPackRemoval {
+  removed: string[]
+  kept: string[]
 }
 
 export type DiscordState = 'disabled' | 'not_configured' | 'waiting_for_discord' | 'rejected' | 'connected'

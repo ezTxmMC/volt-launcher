@@ -1,0 +1,258 @@
+package syncpacks
+
+import core
+import providers
+
+// Synced packs (see store.nv, profile.nv, state.nv, check.nv, create.nv, migrate.nv).
+//
+//   GET    /api/syncpacks                      {packs: [Pack], auto: Auto}
+//   POST   /api/syncpacks                      {name, entries?} -> 201 Pack
+//   GET    /api/syncpacks/:id                  Pack
+//   PATCH  /api/syncpacks/:id                  {name?, entries?} -> Pack
+//   DELETE /api/syncpacks/:id                  {deleted}; the files stay in the profiles as ordinary content
+//   POST   /api/syncpacks/:id/sync             202 job: every linked profile is brought up to date
+//   POST   /api/syncpacks/from-profile         {profileId, name} -> 201 Pack (the provider-sourced content)
+//   GET    /api/syncpacks/auto                 the new-version profile settings, state and results
+//   POST   /api/syncpacks/auto/create          {minecraftVersion} -> 202 job (409 the profile name exists)
+//   POST   /api/syncpacks/auto/check           202 job (409 while a check runs)
+//
+//   GET    /api/profiles/:id/syncpacks         {packs: [ProfileSyncPack]}
+//   POST   /api/profiles/:id/syncpacks         {packId, retry?} -> 202 job: link and install
+//   POST   /api/profiles/:id/syncpacks/reconcile   {changes, packs}: the profile's own files win now
+//   DELETE /api/profiles/:id/syncpacks/:packId?removeFiles=true|false -> {removed, kept}
+//
+// Pack: {id, name, entries, profiles, createdAt}. The new-version settings (syncPackAutoEnabled,
+// syncPackAutoLoader, syncPackAutoVersions, syncPackAutoPacks) change through PATCH /api/settings.
+
+method route(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    if (segments[0] == "profiles") {
+        return profileRoute(verb, segments, query, body)
+    }
+    if (segments.length() == 1) {
+        if (verb == "GET") {
+            return core.ok({"packs": packsView(), "auto": autoOverview()})
+        }
+        if (verb == "POST") {
+            var created = packCreate(requireField(body, "name"), core.getOr(bodyMap(body), "entries", core.none()))
+            return core.respond(201, packView(created))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    var second = segments[1]
+    if (second == "auto") {
+        return autoRoute(verb, segments, body)
+    }
+    if (second == "from-profile") {
+        if (segments.length() != 2) {
+            return core.notFound("no such endpoint")
+        }
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        return core.respond(201, packView(packFromProfile(body)))
+    }
+    if (segments.length() == 2) {
+        if (verb == "GET") {
+            return core.ok(packView(packRequire(second)))
+        }
+        if (verb == "PATCH") {
+            return core.ok(packView(packUpdate(second, body)))
+        }
+        if (verb == "DELETE") {
+            return core.ok(packRemove(second))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 3 && segments[2] == "sync") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var pack = packRequire(second)
+        return core.respond(202, core.startJob("syncpack", "Pack synchronisieren: " + pack["name"], SpSyncJob{packId = second}))
+    }
+    return core.notFound("no such endpoint")
+}
+
+method bodyMap(object body): map<string, object> {
+    if (core.isMap(body)) {
+        return body
+    }
+    return {}
+}
+
+// A required body field (400 when it is missing).
+method requireField(object body, string key): object {
+    var value = core.getOr(bodyMap(body), key, core.none())
+    if (core.isNull(value)) {
+        core.badRequest("'" + key + "' is required")
+    }
+    return value
+}
+
+// A pack with the profiles it is linked to.
+method packView(map<string, object> pack): map<string, object> {
+    var view = core.copyJson(pack)
+    view["profiles"] = spLinkedProfiles("" + pack["id"])
+    return view
+}
+
+method packsView(): array {
+    var out = []
+    for (pack in packsAll()) {
+        out.append(packView(pack))
+    }
+    return out
+}
+
+// POST /api/syncpacks/from-profile
+method packFromProfile(object body): map<string, object> {
+    var profileId = "" + requireField(body, "profileId")
+    var entries = spEntriesFromProfile(profileId)
+    return packCreate(requireField(body, "name"), entries)
+}
+
+define class PackSettingsTask {
+    private array ids: get, set
+
+    method run(): object {
+        return core.patchSettings({"syncPackAutoPacks": ids})
+    }
+}
+
+// DELETE: the definition goes, every profile keeps the files and loses the link.
+method packRemove(string id): map<string, object> {
+    packRequire(id)
+    var unlinked = 0
+    for (profileId in spLinkedProfiles(id)) {
+        spUnlink(profileId, id, false)
+        unlinked = unlinked + 1
+    }
+    packDelete(id)
+    var remaining = []
+    for (other in autoPackIds()) {
+        if (other != id) {
+            remaining.append(other)
+        }
+    }
+    var outcome = core.runTrapped(PackSettingsTask{ids = remaining})
+    if (outcome.failed()) {
+        core.logWarn("syncpacks: cannot update syncPackAutoPacks: " + outcome.error())
+    }
+    return {"deleted": id, "unlinked": unlinked}
+}
+
+method autoRoute(string verb, array<string> segments, object body): map<string, object> {
+    if (segments.length() == 2) {
+        if (verb == "GET") {
+            return core.ok(autoOverview())
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 3 && segments[2] == "create") {
+        if (verb == "POST") {
+            return core.respond(202, autoStartCreate(body))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 3 && segments[2] == "check") {
+        if (verb == "POST") {
+            return core.respond(202, autoStartCheck())
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    return core.notFound("no such endpoint")
+}
+
+// The manifest entry of a version id, or null.
+method autoFindVersion(map<string, object> manifest, string id): object {
+    for (entry in manifest["versions"]) {
+        if (core.isMap(entry) && core.getOr(entry, "id", "") == id) {
+            return entry
+        }
+    }
+    return core.none()
+}
+
+// Validates the request and starts the job for one version.
+method autoStartCreate(object body): map<string, object> {
+    var requested = ""
+    if (core.isMap(body)) {
+        var value = core.getOr(body, "minecraftVersion", "")
+        if (core.isString(value)) {
+            requested = value.trim()
+        }
+    }
+    if (requested == "") {
+        core.badRequest("'minecraftVersion' is required")
+    }
+    var entry = autoFindVersion(autoManifest(), requested)
+    if (core.isNull(entry)) {
+        core.badRequest("unknown Minecraft version '" + requested + "'")
+    }
+    var name = autoProfileName(requested)
+    if (autoNameTaken(name)) {
+        core.conflict("a profile named '" + name + "' already exists")
+    }
+    return core.startJob("autoprofile", "Erstelle " + name, AutoProfileCreateJob{minecraftVersion = requested})
+}
+
+// Starts a check job unless one runs.
+method autoStartCheck(): map<string, object> {
+    if (autoClaimCheck() == false) {
+        core.conflict("a check is already running")
+    }
+    return core.startJob("autoprofile", "Prüfe die Minecraft-Versionen", AutoProfileCheckJob{})
+}
+
+// --- /api/profiles/:id/syncpacks -------------------------------------------------------------
+
+method profileRoute(string verb, array<string> segments, map<string, string> query, object body): map<string, object> {
+    // segments: profiles, :id, syncpacks, [reconcile | :packId]
+    var profileId = segments[1]
+    core.requireProfile(profileId)
+    if (segments.length() == 3) {
+        if (verb == "GET") {
+            return core.ok(spProfileView(profileId))
+        }
+        if (verb == "POST") {
+            return core.respond(202, startLink(profileId, body))
+        }
+        return core.methodNotAllowed(verb, segments)
+    }
+    if (segments.length() == 4 && segments[3] == "reconcile") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var changes = spReconcile(profileId)
+        return core.ok({"changes": changes, "packs": spProfileView(profileId)["packs"]})
+    }
+    if (segments.length() == 4) {
+        if (verb != "DELETE") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var remove = query.has("removeFiles") && query["removeFiles"] == "true"
+        if (remove && core.isGameRunning(profileId)) {
+            core.conflict("the game of this profile is running; stop it before removing files")
+        }
+        if (providers.busyWith(profileId) != "") {
+            core.conflict("this profile is busy (" + providers.busyWith(profileId) + ")")
+        }
+        return core.ok(spUnlink(profileId, segments[3], remove))
+    }
+    return core.notFound("no such endpoint")
+}
+
+// POST /api/profiles/:id/syncpacks
+method startLink(string profileId, object body): map<string, object> {
+    var packId = "" + requireField(body, "packId")
+    var pack = packRequire(packId)
+    var retry = core.getOr(bodyMap(body), "retry", false) == true
+    if (core.isGameRunning(profileId)) {
+        core.conflict("the game of this profile is running")
+    }
+    if (providers.busyWith(profileId) != "") {
+        core.conflict("this profile is busy (" + providers.busyWith(profileId) + ")")
+    }
+    var name = "" + core.profile(profileId)["name"]
+    return core.startJob("syncpack", "Pack " + pack["name"] + " → " + name, SpLinkJob{profileId = profileId, packId = packId, retry = retry})
+}

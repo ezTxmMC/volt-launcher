@@ -27,7 +27,15 @@ import type {
   AccountSession,
   AccountType,
   AccountsView,
-  AutoProfileResult,
+  SyncPack,
+  SyncPackAuto,
+  SyncPackAutoResult,
+  SyncPackEntry,
+  SyncPackKind,
+  ProfileSyncPack,
+  ProfileSyncPackFile,
+  ProfileSyncPackRef,
+  ProfileSyncPackRemoval,
   BackupInfo,
   CurrentSkin,
   LogChunk,
@@ -82,28 +90,13 @@ const DEFAULT_SETTINGS: Settings = {
   discordApplicationId: '',
   autoUpdate: true,
   betaUpdates: false,
-  autoProfilesEnabled: false,
-  autoProfileLoader: 'fabric',
-  autoProfileVersions: 'release',
-  autoProfileMods: []
+  syncPackAutoEnabled: false,
+  syncPackAutoLoader: 'fabric',
+  syncPackAutoVersions: 'release',
+  syncPackAutoPacks: []
 }
 
 let settings: Settings = { ...DEFAULT_SETTINGS }
-
-/** Automatic profiles: what the mock backend has seen and built; the configuration lives in the settings. */
-const autoProfileState: { seen: number; lastCheck: string | null; lastError: string | null; results: AutoProfileResult[] } = {
-  seen: 14,
-  lastCheck: agoIso(12),
-  lastError: null,
-  results: [
-    { minecraftVersion: '1.20.4', status: 'created', reason: 'Profil mit Preset angelegt', profileId: 'a1b2c3d4e5f6' },
-    { minecraftVersion: '1.20.6', status: 'failed', reason: 'Sodium hat keine Version für 1.20.6', profileId: null },
-    { minecraftVersion: '1.21.1', status: 'skipped', reason: 'Vor der Aktivierung gemerkt', profileId: null }
-  ]
-}
-
-/** Releases the mock create route accepts; the versions route above lists the same ones. */
-const MOCK_RELEASES = ['1.21.1', '1.20.4']
 
 /** Profile fields the mock does not vary (see docs/ARCHITECTURE.md, Profile). */
 const PROFILE_EXTRAS = {
@@ -484,6 +477,175 @@ function projectVersions(project: ProjectSummary, gameVersion: string | null, lo
 }
 
 // ---------- Routing ----------
+
+// ---------- Synced packs ----------
+
+const PACK_PERFORMANCE = 'b1c2d3e4f5a1'
+const PACK_LOOKS = 'b1c2d3e4f5a2'
+
+interface MockPackRow {
+  id: string
+  name: string
+  entries: SyncPackEntry[]
+  createdAt: string
+}
+
+/** One pack as linked to one profile: the files it installed and the entries the profile decided about. */
+interface MockLink {
+  packId: string
+  files: ProfileSyncPackFile[]
+  overridden: ProfileSyncPackRef[]
+  declined: ProfileSyncPackRef[]
+}
+
+const syncEntry = (provider: SyncPackEntry['provider'], projectId: string, kind: SyncPackKind, name: string): SyncPackEntry => ({
+  provider,
+  projectId,
+  kind,
+  name,
+  iconUrl: null
+})
+
+const syncPackRows: MockPackRow[] = [
+  {
+    id: PACK_PERFORMANCE,
+    name: 'Performance',
+    entries: [
+      syncEntry('modrinth', 'AANobbMI', 'mod', 'Sodium'),
+      syncEntry('modrinth', 'gvQqBUqZ', 'mod', 'Lithium'),
+      syncEntry('modrinth', 'uXXizFIs', 'mod', 'FerriteCore'),
+      syncEntry('modrinth', '5ZwdcRci', 'mod', 'ImmediatelyFast'),
+      syncEntry('modrinth', 'NNAgCjsB', 'mod', 'Entity Culling'),
+      syncEntry('modrinth', 'nmDcB62a', 'mod', 'ModernFix')
+    ],
+    createdAt: agoIso(60 * 24 * 9)
+  },
+  {
+    id: PACK_LOOKS,
+    name: 'Grafik',
+    entries: [syncEntry('modrinth', 'HVnmMxH1', 'shader', 'Complementary Shaders'), syncEntry('modrinth', 'TZ4pkBrJ', 'resourcepack', 'Faithful 32x')],
+    createdAt: agoIso(60 * 24 * 2)
+  }
+]
+
+/** Survival has the Performance pack: Lithium is its own version (overridden), ModernFix was removed (declined). */
+const syncPackLinks = new Map<string, MockLink[]>([
+  [
+    'a1b2c3d4e5f6',
+    [
+      {
+        packId: PACK_PERFORMANCE,
+        files: [
+          { projectId: 'AANobbMI', name: 'Sodium', kind: 'mod', fileName: 'sodium-fabric-0.6.0.jar', dependency: false },
+          { projectId: 'uXXizFIs', name: 'FerriteCore', kind: 'mod', fileName: 'ferritecore-7.0.0.jar', dependency: false },
+          { projectId: '5ZwdcRci', name: 'ImmediatelyFast', kind: 'mod', fileName: 'immediatelyfast-1.3.0.jar', dependency: false }
+        ],
+        overridden: [{ projectId: 'gvQqBUqZ', name: 'Lithium', kind: 'mod' }],
+        declined: [{ projectId: 'nmDcB62a', name: 'ModernFix', kind: 'mod' }]
+      }
+    ]
+  ]
+])
+
+function syncPackRowOf(id: string | undefined): MockPackRow {
+  const found = syncPackRows.find((row) => row.id === id)
+  if (!found) throw new MockError(`HTTP 404: Pack ${id ?? ''} nicht gefunden`)
+  return found
+}
+
+function syncPackNameTaken(name: string, exceptId?: string): boolean {
+  return syncPackRows.some((row) => row.id !== exceptId && row.name.toLowerCase() === name.toLowerCase())
+}
+
+/** Profiles that have the pack linked, in the order of the profiles list. */
+function profilesLinkedTo(packId: string): string[] {
+  return [...syncPackLinks.entries()].filter(([, links]) => links.some((link) => link.packId === packId)).map(([profileId]) => profileId)
+}
+
+function syncPackView(row: MockPackRow): SyncPack {
+  return { id: row.id, name: row.name, entries: row.entries.map((entry) => ({ ...entry })), profiles: profilesLinkedTo(row.id), createdAt: row.createdAt }
+}
+
+function syncFileName(entry: SyncPackEntry): string {
+  const slug = entry.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  return entry.kind === 'mod' ? `${slug}-1.0.0.jar` : `${slug}-1.0.0.zip`
+}
+
+function syncFileOf(entry: SyncPackEntry, dependency: boolean): ProfileSyncPackFile {
+  return { projectId: entry.projectId, name: entry.name, kind: entry.kind, fileName: syncFileName(entry), dependency }
+}
+
+/** Brings a link up to date with its pack: removed entries leave the profile, new ones are installed unless decided otherwise. */
+function reconcileLink(link: MockLink): void {
+  const row = syncPackRowOf(link.packId)
+  const inPack = (projectId: string): boolean => row.entries.some((entry) => entry.projectId === projectId)
+  link.files = link.files.filter((file) => inPack(file.projectId))
+  link.overridden = link.overridden.filter((ref) => inPack(ref.projectId))
+  link.declined = link.declined.filter((ref) => inPack(ref.projectId))
+  for (const entry of row.entries) {
+    const decided =
+      link.files.some((file) => file.projectId === entry.projectId) ||
+      link.overridden.some((ref) => ref.projectId === entry.projectId) ||
+      link.declined.some((ref) => ref.projectId === entry.projectId)
+    if (!decided) link.files.push(syncFileOf(entry, false))
+  }
+}
+
+function profileSyncPackView(link: MockLink): ProfileSyncPack {
+  const row = syncPackRowOf(link.packId)
+  const missing = row.entries.filter(
+    (entry) =>
+      !link.files.some((file) => file.projectId === entry.projectId) &&
+      !link.overridden.some((ref) => ref.projectId === entry.projectId) &&
+      !link.declined.some((ref) => ref.projectId === entry.projectId)
+  )
+  return { packId: row.id, name: row.name, files: link.files.map((file) => ({ ...file })), overridden: link.overridden, declined: link.declined, missing }
+}
+
+function linksOf(profileId: string | undefined): MockLink[] {
+  profileById(profileId)
+  return syncPackLinks.get(profileId ?? '') ?? []
+}
+
+/** Pack entries the profile's own mods carry a known source for; used by "create from profile". */
+function entriesFromProfile(profileId: string): SyncPackEntry[] {
+  const seen = new Set<string>()
+  const entries: SyncPackEntry[] = []
+  for (const file of modsOf(profileId)) {
+    const source = file.source
+    if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge') || seen.has(source.projectId)) continue
+    seen.add(source.projectId)
+    entries.push({ provider: source.provider, projectId: source.projectId, kind: 'mod', name: source.name, iconUrl: null })
+  }
+  return entries
+}
+
+const syncPackAutoState: { seen: number; lastCheck: string | null; lastError: string | null; results: SyncPackAutoResult[] } = {
+  seen: 14,
+  lastCheck: agoIso(12),
+  lastError: null,
+  results: [
+    { minecraftVersion: '1.20.4', status: 'created', reason: 'Profil mit 1 Pack angelegt', profileId: 'b2c3d4e5f6a1' },
+    { minecraftVersion: '1.20.6', status: 'failed', reason: 'Der Loader hat für 1.20.6 keine Version', profileId: null },
+    { minecraftVersion: '1.21.1', status: 'skipped', reason: 'Vor der Aktivierung gemerkt', profileId: null }
+  ]
+}
+
+function syncPackAutoView(): SyncPackAuto {
+  return {
+    enabled: settings.syncPackAutoEnabled,
+    loader: settings.syncPackAutoLoader,
+    versions: settings.syncPackAutoVersions,
+    packs: [...settings.syncPackAutoPacks],
+    seen: syncPackAutoState.seen,
+    lastCheck: syncPackAutoState.lastCheck,
+    lastError: syncPackAutoState.lastError,
+    results: syncPackAutoState.results.map((result) => ({ ...result }))
+  }
+}
+
+/** Releases the mock create route accepts; the versions route above lists the same ones. */
+const MOCK_RELEASES = ['1.21.1', '1.20.4']
 
 type Query = URLSearchParams
 type Handler = (match: string[], body: Record<string, unknown>, query: Query) => unknown | Promise<unknown>
@@ -1453,34 +1615,23 @@ function logoAnswer(profile: Profile): { kind: 'custom' | 'modpack' | 'vanilla' 
   return { kind: 'loader', loader: profile.loader, dataUrl: null }
 }
 
-const autoProfileRoutes: Array<[HttpMethod, RegExp, Handler]> = [
-  [
-    'GET',
-    /^\/api\/autoprofiles$/,
-    () => ({
-      enabled: settings.autoProfilesEnabled,
-      loader: settings.autoProfileLoader,
-      versions: settings.autoProfileVersions,
-      mods: settings.autoProfileMods,
-      seen: autoProfileState.seen,
-      lastCheck: autoProfileState.lastCheck,
-      lastError: autoProfileState.lastError,
-      results: autoProfileState.results
-    })
-  ],
+const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
+  // The fixed paths come first: "auto" would otherwise match the pack id pattern.
+  ['GET', /^\/api\/syncpacks$/, () => ({ packs: syncPackRows.map(syncPackView), auto: syncPackAutoView() })],
+  ['GET', /^\/api\/syncpacks\/auto$/, () => syncPackAutoView()],
   [
     'POST',
-    /^\/api\/autoprofiles\/check$/,
+    /^\/api\/syncpacks\/auto\/check$/,
     () =>
-      startJob('autoprofiles-check', 'Automatische Profile prüfen', 1500, () => {
-        autoProfileState.lastCheck = nowIso()
-        // The mock sees one new version per check; the first check after activation builds its profile.
+      startJob('autoprofile', 'Neue Minecraft-Versionen prüfen', 1500, () => {
+        syncPackAutoState.lastCheck = nowIso()
+        // The mock sees one new version per check; with the automatic creation on it gets a profile.
         const version = '1.21.2'
-        if (!autoProfileState.results.some((result) => result.minecraftVersion === version)) {
-          autoProfileState.seen += 1
-          autoProfileState.results.push(
-            settings.autoProfilesEnabled
-              ? { minecraftVersion: version, status: 'created', reason: 'Profil mit Preset angelegt', profileId: hex(12) }
+        if (!syncPackAutoState.results.some((result) => result.minecraftVersion === version)) {
+          syncPackAutoState.seen += 1
+          syncPackAutoState.results.push(
+            settings.syncPackAutoEnabled
+              ? { minecraftVersion: version, status: 'created', reason: 'Profil mit den gewählten Packs angelegt', profileId: hex(12) }
               : { minecraftVersion: version, status: 'skipped', reason: 'Automatik ist aus', profileId: null }
           )
         }
@@ -1489,18 +1640,134 @@ const autoProfileRoutes: Array<[HttpMethod, RegExp, Handler]> = [
   ],
   [
     'POST',
-    /^\/api\/autoprofiles\/create$/,
+    /^\/api\/syncpacks\/auto\/create$/,
     (_m, body) => {
       const version = String(body['minecraftVersion'] ?? '')
       if (!MOCK_RELEASES.includes(version)) throw new MockError(`HTTP 400: Unbekannte Version ${version}`)
-      if (autoProfileState.results.some((result) => result.minecraftVersion === version && result.status === 'created')) {
+      if (syncPackAutoState.results.some((result) => result.minecraftVersion === version && result.status === 'created')) {
         throw new MockError(`HTTP 409: Ein Profil für ${version} existiert bereits`)
       }
-      return startJob('autoprofiles-create', `Profil für ${version} erstellen`, 2000, () => {
+      return startJob('autoprofile', `Profil für ${version} erstellen`, 2000, () => {
         const profileId = hex(12)
-        autoProfileState.results.push({ minecraftVersion: version, status: 'created', reason: 'Profil mit Preset angelegt', profileId })
+        syncPackAutoState.results.push({ minecraftVersion: version, status: 'created', reason: 'Profil mit den gewählten Packs angelegt', profileId })
         return { profileId, minecraftVersion: version }
       })
+    }
+  ],
+  [
+    'POST',
+    /^\/api\/syncpacks\/from-profile$/,
+    (_m, body) => {
+      const name = String(body['name'] ?? '').trim()
+      if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
+      if (syncPackNameTaken(name)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+      const row: MockPackRow = {
+        id: hex(12),
+        name,
+        entries: entriesFromProfile(String(body['profileId'] ?? '')),
+        createdAt: nowIso()
+      }
+      syncPackRows.push(row)
+      return syncPackView(row)
+    }
+  ],
+  [
+    'GET',
+    /^\/api\/syncpacks\/(\w+)$/,
+    (m) => syncPackView(syncPackRowOf(m[1]))
+  ],
+  [
+    'POST',
+    /^\/api\/syncpacks$/,
+    (_m, body) => {
+      const name = String(body['name'] ?? '').trim()
+      if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
+      if (syncPackNameTaken(name)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+      const entries = Array.isArray(body['entries']) ? (body['entries'] as SyncPackEntry[]) : []
+      const row: MockPackRow = { id: hex(12), name, entries: entries.map((entry) => ({ ...entry })), createdAt: nowIso() }
+      syncPackRows.push(row)
+      return syncPackView(row)
+    }
+  ],
+  [
+    'PATCH',
+    /^\/api\/syncpacks\/(\w+)$/,
+    (m, body) => {
+      const row = syncPackRowOf(m[1])
+      const name = typeof body['name'] === 'string' ? body['name'].trim() : undefined
+      if (name !== undefined) {
+        if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
+        if (syncPackNameTaken(name, row.id)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+        row.name = name
+      }
+      if (Array.isArray(body['entries'])) row.entries = (body['entries'] as SyncPackEntry[]).map((entry) => ({ ...entry }))
+      // Linked profiles see the change on their next sync, as with the backend.
+      return syncPackView(row)
+    }
+  ],
+  [
+    'DELETE',
+    /^\/api\/syncpacks\/(\w+)$/,
+    (m) => {
+      const row = syncPackRowOf(m[1])
+      // The files stay in the profiles as ordinary content: only the links go.
+      for (const links of syncPackLinks.values()) {
+        const remaining = links.filter((link) => link.packId !== row.id)
+        links.splice(0, links.length, ...remaining)
+      }
+      syncPackRows.splice(syncPackRows.indexOf(row), 1)
+      return {}
+    }
+  ],
+  [
+    'POST',
+    /^\/api\/syncpacks\/(\w+)\/sync$/,
+    (m) => {
+      const row = syncPackRowOf(m[1])
+      const linked = profilesLinkedTo(row.id).length
+      return startJob('syncpack', `Synchronisiere „${row.name}“`, 2000, () => {
+        for (const links of syncPackLinks.values()) {
+          for (const link of links) if (link.packId === row.id) reconcileLink(link)
+        }
+        return { packId: row.id, profiles: linked }
+      })
+    }
+  ],
+  ['GET', /^\/api\/profiles\/(\w+)\/syncpacks$/, (m) => ({ packs: linksOf(m[1]).map(profileSyncPackView) })],
+  [
+    'POST',
+    /^\/api\/profiles\/(\w+)\/syncpacks$/,
+    (m, body) => {
+      const profile = profileById(m[1])
+      const row = syncPackRowOf(String(body['packId'] ?? ''))
+      if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: Das Profil ist beschäftigt')
+      if (linksOf(profile.id).some((link) => link.packId === row.id)) throw new MockError('HTTP 409: Das Pack ist schon verknüpft')
+      return startJob('syncpack', `Installiere Pack „${row.name}“`, 2500, () => {
+        const link: MockLink = { packId: row.id, files: [], overridden: [], declined: [] }
+        reconcileLink(link)
+        const links = syncPackLinks.get(profile.id) ?? []
+        syncPackLinks.set(profile.id, [...links, link])
+        return { packId: row.id, installed: link.files.length }
+      })
+    }
+  ],
+  [
+    'DELETE',
+    /^\/api\/profiles\/(\w+)\/syncpacks\/(\w+)$/,
+    (m, _body, query) => {
+      const profile = profileById(m[1])
+      if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: Das Spiel läuft')
+      const links = syncPackLinks.get(profile.id) ?? []
+      const link = links.find((candidate) => candidate.packId === m[2])
+      if (!link) throw new MockError('HTTP 404: Das Pack ist nicht verknüpft')
+      const names = link.files.map((file) => file.fileName)
+      const removeFiles = query.get('removeFiles') === 'true'
+      syncPackLinks.set(
+        profile.id,
+        links.filter((candidate) => candidate !== link)
+      )
+      const answer: ProfileSyncPackRemoval = removeFiles ? { removed: names, kept: [] } : { removed: [], kept: names }
+      return answer
     }
   ]
 ]
@@ -1569,7 +1836,7 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
   ...skinRoutes,
   ...contentRoutes,
   ...gameDataRoutes,
-  ...autoProfileRoutes,
+  ...syncPackRoutes,
   ['GET', /^\/api\/settings$/, () => settings],
   [
     'PATCH',

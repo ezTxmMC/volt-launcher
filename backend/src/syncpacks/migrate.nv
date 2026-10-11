@@ -1,0 +1,172 @@
+package syncpacks
+
+import os
+import path
+import core
+
+// Migration of the automatic profiles of earlier versions (settings autoProfilesEnabled,
+// autoProfileLoader, autoProfileVersions, autoProfileMods and autoprofiles.json):
+//
+//   - the preset mods become the pack "Performance" (kind mod);
+//   - the switches move to syncPackAutoEnabled / -Loader / -Versions / -Packs;
+//   - every profile the old checker created is linked to the pack, and the preset mods it
+//     already has are recorded as the pack's files (nothing is installed or changed).
+//
+// It runs once (syncpacks.json has "migrated": true afterwards). The old keys are still in
+// settings.json at that point: core.loadSettings only drops them from memory.
+
+final MIGRATE_PACK_NAME = "Performance"
+final MIGRATE_DEFAULT_PRESET = ["AANobbMI", "gvQqBUqZ", "uXXizFIs", "5ZwdcRci", "NNAgCjsB", "nmDcB62a", "fQEb0iXm"]
+
+define class MigrateTask {
+    method run(): object {
+        migrateRun()
+        return true
+    }
+}
+
+define class MigrateSettingsTask {
+    private map<string, object> patch: get, set
+
+    method run(): object {
+        return core.patchSettings(patch)
+    }
+}
+
+// Whether the stored preset is the old built-in default (the same projects in the same order).
+method migrateIsDefaultPreset(array stored): bool {
+    if (stored.length() != MIGRATE_DEFAULT_PRESET.length()) {
+        return false
+    }
+    var i = 0
+    while (i < stored.length()) {
+        if (core.isMap(stored[i]) == false || "" + core.getOr(stored[i], "projectId", "") != MIGRATE_DEFAULT_PRESET[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The profile ids the old checker created (and that still exist).
+method migrateAutoProfiles(): array {
+    var out = []
+    for (row in autoOverview()["results"]) {
+        if (core.isMap(row) == false || core.getOr(row, "status", "") != "created") {
+            continue
+        }
+        var profileId = core.getOr(row, "profileId", core.none())
+        if (core.isString(profileId) == false || out.contains("" + profileId)) {
+            continue
+        }
+        if (core.isNull(core.findProfile("" + profileId)) == false) {
+            out.append("" + profileId)
+        }
+    }
+    return out
+}
+
+// Records the entries a profile already has as the pack's files.
+method migrateLink(string profileId, string packId, array entries) {
+    var record = spRecordRead(profileId)
+    var state = spStateOf(record, packId)
+    var owned = spOwned(profileId, "mods")
+    for (entry in entries) {
+        var projectId = "" + entry["projectId"]
+        if (owned.has(projectId) == false || owned[projectId].length() == 0) {
+            continue
+        }
+        state["files"].append({
+            "projectId": projectId, "provider": "" + entry["provider"], "kind": "mod", "folder": "mods",
+            "fileName": "" + owned[projectId][0], "sha1": "", "name": "" + entry["name"], "dependency": false
+        })
+    }
+    spRecordWrite(profileId, record)
+}
+
+method migrateRun() {
+    var raw = core.readJsonFile(core.settingsFile(), {})
+    if (core.isMap(raw) == false) {
+        raw = {}
+    }
+    var hadPreset = core.isArray(core.getOr(raw, "autoProfileMods", core.none()))
+    var enabled = core.getOr(raw, "autoProfilesEnabled", false) == true
+    var hadState = os.isFile(autoStatePath())
+    if (hadPreset == false && enabled == false && hadState == false) {
+        return
+    }
+    var loader = "" + core.getOr(raw, "autoProfileLoader", "fabric")
+    if (["fabric", "quilt", "forge", "neoforge"].contains(loader) == false) {
+        loader = "fabric"
+    }
+    var versions = "" + core.getOr(raw, "autoProfileVersions", "release")
+    if (["release", "snapshots"].contains(versions) == false) {
+        versions = "release"
+    }
+    var stored = []
+    var storedRaw = core.getOr(raw, "autoProfileMods", core.none())
+    if (core.isArray(storedRaw)) {
+        stored = storedRaw
+    }
+    // The untouched default is the Fabric preset: it never applied to the other loaders.
+    var entries = []
+    if (loader == "fabric" || migrateIsDefaultPreset(stored) == false) {
+        for (item in stored) {
+            var outcome = core.runTrapped(PackEntryTask{raw = {
+                "provider": core.getOr(item, "provider", "modrinth"), "projectId": core.getOr(item, "projectId", ""),
+                "kind": "mod", "name": core.getOr(item, "name", ""), "iconUrl": core.none()
+            }})
+            if (outcome.failed() == false) {
+                entries.append(outcome.result())
+            }
+        }
+    }
+    var packIds = []
+    var pack = core.none()
+    if (entries.length() > 0) {
+        var made = core.runTrapped(MigratePackTask{entries = entries})
+        if (made.failed()) {
+            core.logWarn("syncpacks: migration could not create the pack: " + made.error())
+            return
+        }
+        pack = made.result()
+        packIds.append("" + pack["id"])
+    }
+    var patch = {
+        "syncPackAutoEnabled": enabled, "syncPackAutoLoader": loader,
+        "syncPackAutoVersions": versions, "syncPackAutoPacks": packIds
+    }
+    var saved = core.runTrapped(MigrateSettingsTask{patch = patch})
+    if (saved.failed()) {
+        core.logWarn("syncpacks: migration could not save the settings: " + saved.error())
+    }
+    var linked = 0
+    if (core.isNull(pack) == false) {
+        for (profileId in migrateAutoProfiles()) {
+            migrateLink(profileId, "" + pack["id"], entries)
+            linked = linked + 1
+        }
+    }
+    core.logInfo("syncpacks: migrated the automatic profiles (" + entries.length() + " entries, " + linked + " profiles linked)")
+}
+
+define class MigratePackTask {
+    private array entries: get, set
+
+    method run(): object {
+        return packCreate(MIGRATE_PACK_NAME, entries)
+    }
+}
+
+// Runs the migration once. A failure is logged and the next start tries again.
+method spMigrate() {
+    if (packsAreMigrated()) {
+        return
+    }
+    var outcome = core.runTrapped(MigrateTask{})
+    if (outcome.failed()) {
+        core.logWarn("syncpacks: migration failed: " + outcome.error())
+        return
+    }
+    packsMarkMigrated()
+}

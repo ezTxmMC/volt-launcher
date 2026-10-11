@@ -1,4 +1,4 @@
-package autoprofiles
+package syncpacks
 
 import json
 import os
@@ -6,10 +6,11 @@ import path
 import thread
 import core
 
-// Automatic profiles: a background checker (check.nv) reads Mojang's version
-// manifest and creates a "<version> Performance" profile with the preset mods
-// (create.nv) for every new version of the selected kind. Settings:
-// autoProfilesEnabled, autoProfileLoader, autoProfileVersions, autoProfileMods.
+// New-version profiles: a background checker (check.nv) reads Mojang's version manifest and
+// creates a profile with the selected synced packs applied (create.nv) for every new version of
+// the selected kind. Settings: syncPackAutoEnabled, syncPackAutoLoader, syncPackAutoVersions,
+// syncPackAutoPacks (the pack ids). The state file keeps its old name, autoprofiles.json, so a
+// launcher that had the automatic profiles carries on without checking every version again.
 //
 // State: <dataDir>/autoprofiles.json
 //   {"baselined": bool, "seen": [version ids], "lastCheck": ISO | null,
@@ -58,11 +59,11 @@ method autoFixtureDir(): string {
 // --- settings ---------------------------------------------------------------------------
 
 method autoEnabled(): bool {
-    return core.setting("autoProfilesEnabled") == true
+    return core.setting("syncPackAutoEnabled") == true
 }
 
 method autoLoaderSetting(): string {
-    var value = core.setting("autoProfileLoader")
+    var value = core.setting("syncPackAutoLoader")
     if (core.isString(value)) {
         return "" + value
     }
@@ -70,19 +71,25 @@ method autoLoaderSetting(): string {
 }
 
 method autoVersionsSetting(): string {
-    var value = core.setting("autoProfileVersions")
+    var value = core.setting("syncPackAutoVersions")
     if (core.isString(value)) {
         return "" + value
     }
     return "release"
 }
 
-method autoModsSetting(): array {
-    var value = core.setting("autoProfileMods")
+// The ids of the packs a new-version profile gets (ids of packs that no longer exist are dropped).
+method autoPackIds(): array {
+    var value = core.setting("syncPackAutoPacks")
+    var out = []
     if (core.isArray(value)) {
-        return value
+        for (id in value) {
+            if (core.isString(id) && core.isNull(packFind("" + id)) == false && out.contains("" + id) == false) {
+                out.append("" + id)
+            }
+        }
     }
-    return []
+    return out
 }
 
 // Whether a version of this manifest type gets a profile (release always, snapshots when chosen).
@@ -243,7 +250,7 @@ method autoRecordResult(string minecraftVersion, map<string, object> result) {
     }
 }
 
-// Only one check runs at a time (the timer and POST /api/autoprofiles/check share it).
+// Only one check runs at a time (the timer and POST /api/syncpacks/auto/check share it).
 method autoClaimCheck(): bool {
     var claimed = false
     sync (autoLock) {
@@ -280,9 +287,21 @@ method autoReleaseName(string name) {
     }
 }
 
-// The profile name rule: "<version> Performance".
+// The profile name rule: "<version> <pack names joined by ' + '>", or just the version when
+// no pack is selected (at most 64 characters).
 method autoProfileName(string minecraftVersion): string {
-    return minecraftVersion + " Performance"
+    var names = []
+    for (id in autoPackIds()) {
+        names.append("" + packFind(id)["name"])
+    }
+    var name = minecraftVersion
+    if (names.length() > 0) {
+        name = minecraftVersion + " " + names.join(" + ")
+    }
+    if (name.length() > 64) {
+        name = name.substring(0, 64).trim()
+    }
+    return name
 }
 
 method autoNameTaken(string name): bool {
@@ -296,7 +315,7 @@ method autoNameTaken(string name): bool {
 
 // --- reading ------------------------------------------------------------------------------
 
-// GET /api/autoprofiles: the settings, the state and the last 50 results (newest first).
+// GET /api/syncpacks/auto: the settings, the state and the last 50 results (newest first).
 method autoOverview(): map<string, object> {
     var seenCount = 0
     var lastCheck = ""
@@ -323,7 +342,7 @@ method autoOverview(): map<string, object> {
         "enabled": autoEnabled(),
         "loader": autoLoaderSetting(),
         "versions": autoVersionsSetting(),
-        "mods": autoModsSetting(),
+        "packs": autoPackIds(),
         "seen": seenCount,
         "lastCheck": autoNullable(lastCheck),
         "lastError": autoNullable(lastError),

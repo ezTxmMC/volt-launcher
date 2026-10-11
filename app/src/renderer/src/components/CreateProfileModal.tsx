@@ -5,11 +5,13 @@ import type { Loader, SyncedFolder } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api, errorMessage } from '@/lib/api'
 import { useAsync } from '@/lib/hooks'
+import { useJobs } from '@/state/jobs'
 import { useSettings } from '@/state/settings'
 import { useToast } from '@/state/toast'
 import { Button } from './ui/Button'
 import { Modal } from './ui/Modal'
 import { FinishStep } from './profile/create/FinishStep'
+import { linkSyncPacks } from './profile/linkSyncPacks'
 import { StepBar, type WizardStep } from './profile/create/StepBar'
 import { StepPanel } from './profile/create/StepPanel'
 import { TypeStep } from './profile/create/TypeStep'
@@ -26,6 +28,7 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
   const toast = useToast()
   const navigate = useNavigate()
   const { settings } = useSettings()
+  const { track } = useJobs()
 
   const [step, setStep] = useState<WizardStep>(1)
   const [direction, setDirection] = useState<1 | -1>(1)
@@ -34,6 +37,7 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
   const [loaderVersion, setLoaderVersion] = useState('')
   const [name, setName] = useState('')
   const [synced, setSynced] = useState<SyncedFolder[]>([])
+  const [selectedPacks, setSelectedPacks] = useState<string[]>([])
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<VersionFilter>('releases')
   const [busy, setBusy] = useState(false)
@@ -44,6 +48,11 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
   const loadProfiles = useCallback(() => api.profiles.list(), [])
   const profiles = useAsync(loadProfiles)
   const existingNames = profiles.data?.map((profile) => profile.name)
+
+  // The synced packs to offer; none selected by default.
+  const loadPacks = useCallback(() => api.syncpacks.list(), [])
+  const packs = useAsync(loadPacks)
+  const syncPacks = packs.data?.packs ?? []
 
   const canNext = step === 1 || (step === 2 && minecraftVersion !== '')
   const canCreate = step === 3 && nameProblem(name, existingNames) === null && !busy
@@ -90,6 +99,10 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
         ...(loader !== 'vanilla' && loaderVersion !== '' ? { loaderVersion } : {})
       })
       toast.success(t('profiles.created', { name: profile.name }))
+      // Linking runs after the wizard has closed; the profile is busy while each pack installs.
+      if (selectedPacks.length > 0) {
+        linkSyncPacks(profile.id, selectedPacks, track).catch((error: unknown) => toast.error(error))
+      }
       onClose()
       void navigate(`/profiles/${profile.id}`)
     } catch (error) {
@@ -155,6 +168,9 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
           )}
           {step === 3 && (
             <FinishStep
+              syncPacks={syncPacks}
+              selectedPacks={selectedPacks}
+              onSelectedPacks={setSelectedPacks}
               loader={loader}
               minecraftVersion={minecraftVersion}
               loaderVersion={loaderVersion}

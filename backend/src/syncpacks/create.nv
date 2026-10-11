@@ -1,16 +1,15 @@
-package autoprofiles
+package syncpacks
 
 import launch
 import path
-import providers
 import core
 
 // Creating the profile of one Minecraft version: the name rule, the loader build
-// check and the preset mods. The background check (check.nv) and the manual
-// POST /api/autoprofiles/create both come through autoCreateForVersion.
+// check and the selected synced packs. The background check (check.nv) and the manual
+// POST /api/syncpacks/auto/create both come through autoCreateForVersion.
 //
 // The result of one version is {status, reason, profileId}:
-//   created   the profile exists; reason is null or names the mods that were not installed
+//   created   the profile exists; reason is null or names what the packs could not install
 //   skipped   the name is taken, or the loader has no build for the version (reason says why)
 //   failed    the lookup or the profile could not be made now (the checker tries again later)
 
@@ -60,34 +59,6 @@ method autoFixtureLoaderBuild(string dir, string loader, string minecraftVersion
     return ""
 }
 
-// The mods a profile of `loader` gets from the stored list. The stored list is the Fabric
-// preset until the user chooses other mods, so it does not apply to the other loaders.
-method autoModsFor(string loader, array stored): array {
-    if (loader == "fabric" || autoIsDefaultPreset(stored) == false) {
-        return stored
-    }
-    return []
-}
-
-// Whether the stored list is the built-in default (the same projects in the same order).
-method autoIsDefaultPreset(array stored): bool {
-    var preset = core.defaultSettings()["autoProfileMods"]
-    if (core.isArray(preset) == false || preset.length() != stored.length()) {
-        return false
-    }
-    var i = 0
-    while (i < stored.length()) {
-        if (core.isMap(stored[i]) == false || core.isMap(preset[i]) == false) {
-            return false
-        }
-        if (("" + core.getOr(stored[i], "projectId", "")) != ("" + core.getOr(preset[i], "projectId", ""))) {
-            return false
-        }
-        i = i + 1
-    }
-    return true
-}
-
 method autoOutcome(string status, object reason, object profileId): map<string, object> {
     return {"status": status, "reason": reason, "profileId": profileId}
 }
@@ -124,21 +95,34 @@ define class AutoCreateTask {
 
     method run(): object {
         var loader = autoLoaderSetting()
-        var stored = autoModsSetting()
-        var mods = autoModsFor(loader, stored)
-        var reasons = []
-        if (loader != "fabric" && mods.length() == 0 && stored.length() > 0) {
-            reasons.append("the Fabric preset does not apply to " + loader + "; choose mods in autoProfileMods")
-        }
+        var packIds = autoPackIds()
         // The loader must have a build for this version before a profile is made.
         autoLoaderBuild(loader, minecraftVersion)
         core.jobProgress(jobId, 0.05, "Erstelle " + profileName)
-        // Every automatic profile shares the options and the server list (core/synced.nv).
+        // Every new-version profile shares the options and the server list (core/synced.nv).
         var profile = core.createProfile({"name": profileName, "minecraftVersion": minecraftVersion, "loader": loader, "synced": ["options", "servers"]})
         var profileId = "" + profile["id"]
-        core.logInfo("autoprofiles: created '" + profileName + "' (" + loader + ")")
-        for (note in autoInstallPreset(jobId, profileId, mods)) {
-            reasons.append(note)
+        core.logInfo("syncpacks: created '" + profileName + "' (" + loader + ")")
+        var reasons = []
+        var done = 0
+        for (packId in packIds) {
+            var pack = packFind(packId)
+            if (core.isNull(pack)) {
+                continue
+            }
+            core.jobProgress(jobId, 0.1 + 0.85 * done / packIds.length(), "Pack " + pack["name"])
+            var outcome = core.runTrapped(AutoApplyTask{jobId = jobId, profileId = profileId, pack = pack})
+            if (outcome.failed()) {
+                if (core.isCancelFailure(outcome.error())) {
+                    core.raiseCancelled()
+                }
+                reasons.append("pack '" + pack["name"] + "' failed: " + core.decodeFailure(outcome.error())["message"])
+            } else {
+                for (note in outcome.result()["skipped"]) {
+                    reasons.append("" + note)
+                }
+            }
+            done = done + 1
         }
         var reason = core.none()
         if (reasons.length() > 0) {
@@ -148,68 +132,17 @@ define class AutoCreateTask {
     }
 }
 
-// Installs the preset mods into the profile. A mod that cannot be installed is noted and
-// skipped and does not fail the profile; only a cancel gets through.
-method autoInstallPreset(string jobId, string profileId, array mods): array {
-    if (mods.length() == 0) {
-        return []
-    }
-    providers.claimBusy(profileId, "autoprofile")
-    var outcome = core.runTrapped(AutoModsTask{jobId = jobId, profileId = profileId, mods = mods})
-    providers.releaseBusy(profileId)
-    if (outcome.failed()) {
-        core.raise(outcome.error())
-    }
-    return outcome.result()
-}
-
-define class AutoModsTask {
+define class AutoApplyTask {
     private string jobId: get, set
     private string profileId: get, set
-    private array mods: get, set
+    private map<string, object> pack: get, set
 
-    // The notes of the mods that were not installed.
     method run(): object {
-        var notes = []
-        var total = mods.length()
-        var done = 0
-        for (entry in mods) {
-            var projectId = "" + core.getOr(entry, "projectId", "")
-            var label = "" + core.getOr(entry, "name", "")
-            if (label == "") {
-                label = projectId
-            }
-            core.jobProgress(jobId, 0.1 + 0.8 * done / total, "Installiere " + label)
-            var step = core.runTrapped(AutoModTask{
-                jobId = jobId, profileId = profileId,
-                provider = "" + core.getOr(entry, "provider", "modrinth"), projectId = projectId
-            })
-            if (step.failed()) {
-                if (core.isCancelFailure(step.error())) {
-                    core.raiseCancelled()
-                }
-                var message = "" + core.decodeFailure(step.error())["message"]
-                notes.append(label + " not installed: " + message)
-            }
-            done = done + 1
-        }
-        return notes
+        return spApplyBusy(jobId, profileId, pack, false)
     }
 }
 
-// One mod: the newest version that fits the profile, its required dependencies included.
-define class AutoModTask {
-    private string jobId: get, set
-    private string profileId: get, set
-    private string provider: get, set
-    private string projectId: get, set
-
-    method run(): object {
-        return providers.installContent(jobId, profileId, provider, projectId, "", "mod", true, "")
-    }
-}
-
-// POST /api/autoprofiles/create: the job for one version (the route checked the version and the name).
+// POST /api/syncpacks/auto/create: the job for one version (the route checked the version and the name).
 define class AutoProfileCreateJob based JobBody {
     private string minecraftVersion: get, set
 

@@ -1,0 +1,344 @@
+package syncpacks
+
+import json
+import path
+import thread
+import core
+
+// Synced packs: named lists of content projects (mods, resource packs, shaders) that can be
+// added to any profile. The definitions live in <dataDir>/syncpacks.json:
+//
+//   {"migrated": bool, "packs": [{"id", "name", "createdAt",
+//       "entries": [{"provider", "projectId", "kind", "name", "iconUrl"}]}]}
+//
+// An entry names a project, not a file: the version that fits the profile (Minecraft version
+// and loader) is chosen when the pack is applied (profile.nv). What a profile got from a pack
+// is recorded on the profile's side, in <gameDir>/.volt/syncpacks.json.
+//
+// Nothing inside a sync block raises (see core/errors.nv).
+
+var packLock = thread.mutex()
+var packList = []
+var packsMigrated = false
+
+final PACK_MAX_ENTRIES = 200
+final PACK_MAX_PACKS = 64
+final PACK_MAX_NAME = 64
+
+method packsFile(): string {
+    return path.join(core.dataDir(), "syncpacks.json")
+}
+
+method packKinds(): array {
+    return ["mod", "resourcepack", "shader"]
+}
+
+// The game folder of a content kind ("" for an unknown kind).
+method packKindFolder(string kind): string {
+    if (kind == "mod") {
+        return "mods"
+    }
+    if (kind == "resourcepack") {
+        return "resourcepacks"
+    }
+    if (kind == "shader") {
+        return "shaderpacks"
+    }
+    return ""
+}
+
+// The content kind of a game folder ("" for an unknown folder).
+method packFolderKind(string folder): string {
+    if (folder == "mods") {
+        return "mod"
+    }
+    if (folder == "resourcepacks") {
+        return "resourcepack"
+    }
+    if (folder == "shaderpacks") {
+        return "shader"
+    }
+    return ""
+}
+
+// --- validation -------------------------------------------------------------------------
+
+// One entry, checked and reduced to its fields. Raises 400 for a bad entry.
+method packCheckEntry(object raw): map<string, object> {
+    if (core.isMap(raw) == false) {
+        core.badRequest("every entry must be an object {provider, projectId, kind, name}")
+    }
+    var provider = "" + core.getOr(raw, "provider", "")
+    if (provider != "modrinth" && provider != "curseforge") {
+        core.badRequest("an entry's provider must be modrinth or curseforge")
+    }
+    var projectId = "" + core.getOr(raw, "projectId", "")
+    if (core.isProjectIdText(projectId) == false) {
+        core.badRequest("an entry needs a projectId (letters, digits, '-', '_' and '.')")
+    }
+    var kind = "" + core.getOr(raw, "kind", "")
+    if (packKinds().contains(kind) == false) {
+        core.badRequest("an entry's kind must be mod, resourcepack or shader")
+    }
+    var name = ""
+    var rawName = core.getOr(raw, "name", "")
+    if (core.isString(rawName)) {
+        name = ("" + rawName).trim()
+    }
+    if (name == "") {
+        name = projectId
+    }
+    if (name.length() > 120) {
+        name = name.substring(0, 120)
+    }
+    var iconUrl = core.none()
+    var rawIcon = core.getOr(raw, "iconUrl", core.none())
+    if (core.isString(rawIcon)) {
+        var text = ("" + rawIcon).trim()
+        if ((text.startsWith("https://") || text.startsWith("http://")) && text.length() <= 500) {
+            iconUrl = text
+        }
+    }
+    return {"provider": provider, "projectId": projectId, "kind": kind, "name": name, "iconUrl": iconUrl}
+}
+
+// The entry list, checked; duplicates (same provider, project and kind) are dropped.
+method packCheckEntries(object value): array {
+    if (core.isArray(value) == false) {
+        core.badRequest("'entries' must be a list")
+    }
+    if (value.length() > PACK_MAX_ENTRIES) {
+        core.badRequest("a pack holds at most " + PACK_MAX_ENTRIES + " entries")
+    }
+    var out = []
+    var keys = []
+    for (raw in value) {
+        var entry = packCheckEntry(raw)
+        var key = "" + entry["provider"] + "|" + entry["projectId"] + "|" + entry["kind"]
+        if (keys.contains(key) == false) {
+            keys.append(key)
+            out.append(entry)
+        }
+    }
+    return out
+}
+
+method packCheckName(object value): string {
+    if (core.isString(value) == false) {
+        core.badRequest("'name' must be a string")
+    }
+    var name = ("" + value).trim()
+    if (name == "") {
+        core.badRequest("'name' must not be empty")
+    }
+    if (name.length() > PACK_MAX_NAME) {
+        core.badRequest("'name' is longer than " + PACK_MAX_NAME + " characters")
+    }
+    return name
+}
+
+// --- persistence ------------------------------------------------------------------------
+
+// Writes the file. Call with packLock held; never raises.
+method packSaveLocked() {
+    var state = {"migrated": packsMigrated, "packs": packList}
+    var problem = core.writeFileAtomic(packsFile(), json.pretty(state) + "\n")
+    if (problem != "") {
+        core.logWarn("syncpacks: cannot save the packs: " + problem)
+    }
+}
+
+// A stored pack, repaired: null when it is unusable.
+method packSanitize(object stored): object {
+    if (core.isMap(stored) == false) {
+        return core.none()
+    }
+    var id = core.getOr(stored, "id", "")
+    var name = core.getOr(stored, "name", "")
+    if (core.isString(id) == false || core.isString(name) == false || ("" + id) == "") {
+        return core.none()
+    }
+    var entries = []
+    var rawEntries = core.getOr(stored, "entries", [])
+    if (core.isArray(rawEntries)) {
+        for (raw in rawEntries) {
+            var outcome = core.runTrapped(PackEntryTask{raw = raw})
+            if (outcome.failed() == false) {
+                entries.append(outcome.result())
+            }
+        }
+    }
+    var createdAt = core.getOr(stored, "createdAt", "")
+    if (core.isString(createdAt) == false) {
+        createdAt = ""
+    }
+    return {"id": "" + id, "name": "" + name, "createdAt": createdAt, "entries": entries}
+}
+
+define class PackEntryTask {
+    private object raw: get, set
+
+    method run(): object {
+        return packCheckEntry(raw)
+    }
+}
+
+// Loads syncpacks.json (a missing or broken file gives no packs). Called once at startup.
+method packsLoad() {
+    var stored = core.readJsonFile(packsFile(), {})
+    var packs = []
+    var migrated = false
+    if (core.isMap(stored)) {
+        migrated = core.getOr(stored, "migrated", false) == true
+        var rawPacks = core.getOr(stored, "packs", [])
+        if (core.isArray(rawPacks)) {
+            for (raw in rawPacks) {
+                var pack = packSanitize(raw)
+                if (core.isNull(pack) == false) {
+                    packs.append(pack)
+                }
+            }
+        }
+    }
+    sync (packLock) {
+        packList = packs
+        packsMigrated = migrated
+    }
+}
+
+method packsAreMigrated(): bool {
+    var done = false
+    sync (packLock) {
+        done = packsMigrated
+    }
+    return done
+}
+
+method packsMarkMigrated() {
+    sync (packLock) {
+        packsMigrated = true
+        packSaveLocked()
+    }
+}
+
+// --- reading ----------------------------------------------------------------------------
+
+// A copy of every pack.
+method packsAll(): array {
+    var text = ""
+    sync (packLock) {
+        text = json.stringify(packList)
+    }
+    return json.parse(text)
+}
+
+// A copy of one pack, or null.
+method packFind(string id): object {
+    for (pack in packsAll()) {
+        if (pack["id"] == id) {
+            return pack
+        }
+    }
+    return core.none()
+}
+
+method packRequire(string id): map<string, object> {
+    var pack = packFind(id)
+    if (core.isNull(pack)) {
+        core.notFound("synced pack '" + id + "' not found")
+    }
+    return pack
+}
+
+// Whether another pack already has this name (case-insensitive).
+method packNameTaken(string name, string exceptId): bool {
+    var wanted = name.toLower()
+    for (pack in packsAll()) {
+        if (pack["id"] != exceptId && ("" + pack["name"]).toLower() == wanted) {
+            return true
+        }
+    }
+    return false
+}
+
+// --- writing ----------------------------------------------------------------------------
+
+// Creates a pack. Raises 400 for a bad name or entry list and 409 for a taken name.
+method packCreate(object rawName, object rawEntries): map<string, object> {
+    var name = packCheckName(rawName)
+    var entries = []
+    if (core.isNull(rawEntries) == false) {
+        entries = packCheckEntries(rawEntries)
+    }
+    if (packNameTaken(name, "")) {
+        core.conflict("a synced pack named '" + name + "' already exists")
+    }
+    var pack = {"id": core.newId(), "name": name, "createdAt": core.nowIso(), "entries": entries}
+    var full = false
+    sync (packLock) {
+        if (packList.length() >= PACK_MAX_PACKS) {
+            full = true
+        } else {
+            packList.append(pack)
+            packSaveLocked()
+        }
+    }
+    if (full) {
+        core.conflict("at most " + PACK_MAX_PACKS + " synced packs are possible")
+    }
+    return core.copyJson(pack)
+}
+
+// Changes the name and/or the entry list of a pack.
+method packUpdate(string id, object patch): map<string, object> {
+    if (core.isMap(patch) == false) {
+        core.badRequest("expected a JSON object with 'name' and/or 'entries'")
+    }
+    var current = packRequire(id)
+    var name = "" + current["name"]
+    var entries = current["entries"]
+    if (patch.has("name")) {
+        name = packCheckName(patch["name"])
+        if (packNameTaken(name, id)) {
+            core.conflict("a synced pack named '" + name + "' already exists")
+        }
+    }
+    if (patch.has("entries")) {
+        entries = packCheckEntries(patch["entries"])
+    }
+    var text = ""
+    sync (packLock) {
+        for (pack in packList) {
+            if (pack["id"] == id) {
+                pack["name"] = name
+                pack["entries"] = entries
+                text = json.stringify(pack)
+            }
+        }
+        packSaveLocked()
+    }
+    if (text == "") {
+        core.notFound("synced pack '" + id + "' not found")
+    }
+    return json.parse(text)
+}
+
+// Removes a pack definition. Returns false when it did not exist.
+method packDelete(string id): bool {
+    var found = false
+    sync (packLock) {
+        var kept = []
+        for (pack in packList) {
+            if (pack["id"] == id) {
+                found = true
+            } else {
+                kept.append(pack)
+            }
+        }
+        if (found) {
+            packList = kept
+            packSaveLocked()
+        }
+    }
+    return found
+}

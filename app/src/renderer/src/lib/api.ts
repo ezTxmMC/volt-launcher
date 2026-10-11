@@ -41,9 +41,14 @@ import type {
   Skin,
   SkinLibrary,
   CurrentSkin,
-  AutoProfilesStatus,
   ImportItem,
-  ImportScan
+  ImportScan,
+  SyncPack,
+  SyncPackAuto,
+  SyncPackEntry,
+  SyncPacksView,
+  ProfileSyncPackRemoval,
+  ProfileSyncPacksView
 } from '@shared/models'
 import type {
   DiscordStatus,
@@ -152,13 +157,26 @@ export const api = {
   discord: {
     status: () => request<DiscordStatus>('GET', '/api/integrations/discord')
   },
-  autoprofiles: {
-    status: () => request<AutoProfilesStatus>('GET', '/api/autoprofiles'),
-    /** Job: looks for new Minecraft versions and builds the profiles that are due. */
-    check: () => request<Job>('POST', '/api/autoprofiles/check'),
-    /** Job: builds the profile for one version now. 400 unknown version, 409 the name exists. */
-    create: (minecraftVersion: string) =>
-      request<Job>('POST', '/api/autoprofiles/create', { minecraftVersion })
+  /** Synced packs: named content lists that profiles install. Jobs run the sync and the automatic creation. */
+  syncpacks: {
+    list: () => request<SyncPacksView>('GET', '/api/syncpacks'),
+    /** 409 when the name is taken, 400 for an empty name. */
+    create: (name: string, entries?: SyncPackEntry[]) =>
+      request<SyncPack>('POST', '/api/syncpacks', entries ? { name, entries } : { name }),
+    /** `entries` replaces the whole list. */
+    update: (id: string, patch: { name?: string; entries?: SyncPackEntry[] }) =>
+      request<SyncPack>('PATCH', `/api/syncpacks/${enc(id)}`, patch),
+    /** The files stay in the profiles as ordinary content. */
+    remove: (id: string) => request<unknown>('DELETE', `/api/syncpacks/${enc(id)}`),
+    /** Job: brings every linked profile up to date with the pack. */
+    sync: (id: string) => request<Job>('POST', `/api/syncpacks/${enc(id)}/sync`),
+    fromProfile: (profileId: string, name: string) =>
+      request<SyncPack>('POST', '/api/syncpacks/from-profile', { profileId, name }),
+    auto: () => request<SyncPackAuto>('GET', '/api/syncpacks/auto'),
+    /** Job: builds the profile for one version now. */
+    autoCreate: (minecraftVersion: string) => request<Job>('POST', '/api/syncpacks/auto/create', { minecraftVersion }),
+    /** Job: looks for new Minecraft versions now. */
+    autoCheck: () => request<Job>('POST', '/api/syncpacks/auto/check')
   },
   java: {
     runtimes: () => request<JavaRuntimes>('GET', '/api/java/runtimes'),
@@ -196,7 +214,18 @@ export const api = {
     verify: (id: string, repair: boolean) => request<Job>('POST', `${profilePath(id)}/verify`, { repair }),
     verifyReport: (id: string) => request<{ report: VerifyReport | null }>('GET', `${profilePath(id)}/verify`),
     /** The profile's logo for the card and the header: custom icon, modpack icon, vanilla block or loader. */
-    logo: (id: string) => request<ProfileLogo>('GET', `${profilePath(id)}/logo`)
+    logo: (id: string) => request<ProfileLogo>('GET', `${profilePath(id)}/logo`),
+    syncPacks: {
+      list: (id: string) => request<ProfileSyncPacksView>('GET', `${profilePath(id)}/syncpacks`),
+      /** Job: links the pack and installs it. 409 while the profile is busy. */
+      link: (id: string, packId: string) => request<Job>('POST', `${profilePath(id)}/syncpacks`, { packId }),
+      /** Keeps or removes the pack's files in the profile. */
+      unlink: (id: string, packId: string, removeFiles: boolean) =>
+        request<ProfileSyncPackRemoval>(
+          'DELETE',
+          `${profilePath(id)}/syncpacks/${enc(packId)}${query({ removeFiles: removeFiles ? 'true' : 'false' })}`
+        )
+    }
   },
   versions: {
     minecraft: (flags: { includeSnapshots?: boolean; includeBetas?: boolean; includeAlphas?: boolean }) =>

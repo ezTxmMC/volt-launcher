@@ -1,0 +1,694 @@
+package syncpacks
+
+import json
+import os
+import path
+import thread
+import core
+import mods
+import providers
+
+// A pack applied to one profile. What a profile got from its packs is recorded in
+// <gameDir>/.volt/syncpacks.json:
+//
+//   {"packs": {"<packId>": {
+//       "files":      [{"projectId", "provider", "kind", "folder", "fileName", "sha1", "name", "dependency"}],
+//       "overridden": [{"projectId", "name", "kind"}],   the profile has its own copy: it wins
+//       "declined":   [{"projectId", "name", "kind"}]    the user removed the pack's file: not reinstalled
+//   }}}
+//
+// The profile always wins over the pack:
+//   - a project the profile already has is not installed from the pack (overridden);
+//   - a project added to the profile later (another file of the same project) replaces the
+//     pack's file at the next reconcile (before every launch and before every apply);
+//   - a pack file the user deleted stays deleted (declined).
+// A pack file that was updated in place (the same project under a new file name) stays the
+// pack's file: the record follows it.
+//
+// Nothing inside a sync block raises (see core/errors.nv).
+
+var recordLock = thread.mutex()
+
+final SP_FIXTURES_ENV = "VOLT_SYNCPACKS_FIXTURES"
+
+method spRecordPath(string profileId): string {
+    return path.join(core.profileDir(profileId), ".volt", "syncpacks.json")
+}
+
+// --- the record of a profile ------------------------------------------------------------
+
+// {"packs": {packId: state}} of a profile; a missing or odd file gives no packs. Never raises.
+method spRecordRead(string profileId): map<string, object> {
+    var file = spRecordPath(profileId)
+    var text = ""
+    sync (recordLock) {
+        var stored = core.readJsonFile(file, {})
+        var packs = {}
+        if (core.isMap(stored) && stored.has("packs") && core.isMap(stored["packs"])) {
+            packs = stored["packs"]
+        }
+        text = json.stringify({"packs": packs})
+    }
+    return json.parse(text)
+}
+
+method spRecordWrite(string profileId, map<string, object> record) {
+    var file = spRecordPath(profileId)
+    var problem = ""
+    sync (recordLock) {
+        problem = core.writeFileAtomic(file, json.pretty(record) + "\n")
+    }
+    if (problem != "") {
+        core.internal("cannot save " + file + ": " + problem)
+    }
+}
+
+// The state of a pack in a record, with every list present (a new state when it was not there).
+method spStateOf(map<string, object> record, string packId): map<string, object> {
+    var packs = record["packs"]
+    var state = {}
+    if (packs.has(packId) && core.isMap(packs[packId])) {
+        state = packs[packId]
+    }
+    for (key in ["files", "overridden", "declined"]) {
+        if (state.has(key) == false || core.isArray(state[key]) == false) {
+            state[key] = []
+        }
+    }
+    packs[packId] = state
+    return state
+}
+
+// --- helpers ---------------------------------------------------------------------------
+
+method spBaseName(string name): string {
+    if (name.endsWith(".disabled")) {
+        return name.substring(0, name.length() - 9)
+    }
+    return name
+}
+
+method spRef(string projectId, string name, string kind): map<string, object> {
+    return {"projectId": projectId, "name": name, "kind": kind}
+}
+
+method spRefsHave(array refs, string projectId, string kind): bool {
+    for (ref in refs) {
+        if (core.isMap(ref) && "" + core.getOr(ref, "projectId", "") == projectId && "" + core.getOr(ref, "kind", "") == kind) {
+            return true
+        }
+    }
+    return false
+}
+
+method spRefsAdd(array refs, string projectId, string name, string kind) {
+    if (spRefsHave(refs, projectId, kind) == false) {
+        refs.append(spRef(projectId, name, kind))
+    }
+}
+
+method spRefsWithout(array refs, string projectId, string kind): array {
+    var out = []
+    for (ref in refs) {
+        if (core.isMap(ref) == false) {
+            continue
+        }
+        if ("" + core.getOr(ref, "projectId", "") == projectId && "" + core.getOr(ref, "kind", "") == kind) {
+            continue
+        }
+        out.append(ref)
+    }
+    return out
+}
+
+// Whether a pack entry list names this project and kind.
+method spEntriesHave(array entries, string projectId, string kind): bool {
+    for (entry in entries) {
+        if ("" + entry["projectId"] == projectId && "" + entry["kind"] == kind) {
+            return true
+        }
+    }
+    return false
+}
+
+method spFilesHave(array files, string projectId, string kind): bool {
+    for (file in files) {
+        if ("" + core.getOr(file, "projectId", "") == projectId && "" + core.getOr(file, "kind", "") == kind) {
+            return true
+        }
+    }
+    return false
+}
+
+// projectId -> the names of its files in one folder of a profile, from the content store
+// (the file must still be there, enabled or disabled).
+method spOwned(string profileId, string folder): map<string, object> {
+    var loc = mods.contentLoc(profileId, folder, "")
+    var store = mods.loadStore(loc)
+    var out = {}
+    for (sha in store) {
+        var entry = store[sha]
+        if (core.isMap(entry) == false) {
+            continue
+        }
+        var source = core.getOr(entry, "source", core.none())
+        if (core.isMap(source) == false) {
+            continue
+        }
+        var projectId = "" + core.getOr(source, "projectId", "")
+        var fileName = "" + core.getOr(entry, "fileName", "")
+        if (projectId == "" || fileName == "") {
+            continue
+        }
+        var base = spBaseName(fileName)
+        var plain = path.join(loc.dir(), base)
+        if (os.isFile(plain) || os.isFile(plain + ".disabled")) {
+            if (out.has(projectId) == false) {
+                out[projectId] = []
+            }
+            if (out[projectId].contains(base) == false) {
+                out[projectId].append(base)
+            }
+        }
+    }
+    return out
+}
+
+method spRemoveFile(string profileId, string folder, string fileName) {
+    var plain = path.join(core.profileDir(profileId), folder, path.basename(spBaseName(fileName)))
+    if (os.isFile(plain)) {
+        os.remove(plain)
+    }
+    if (os.isFile(plain + ".disabled")) {
+        os.remove(plain + ".disabled")
+    }
+}
+
+method spFilePresent(string profileId, string folder, string fileName): bool {
+    var plain = path.join(core.profileDir(profileId), folder, path.basename(spBaseName(fileName)))
+    return os.isFile(plain) || os.isFile(plain + ".disabled")
+}
+
+// --- reconcile --------------------------------------------------------------------------
+
+// Brings the record in line with the files: a project the profile has its own copy of wins
+// (the pack's file goes), an updated file is followed, a deleted file is declined.
+// Local work only, so it is cheap enough to run before every launch. Returns the number of changes.
+method spReconcile(string profileId): integer {
+    var record = spRecordRead(profileId)
+    var packs = record["packs"]
+    var changes = 0
+    var ownedCache = {}
+    for (packId in packs) {
+        var state = spStateOf(record, packId)
+        var kept = []
+        for (file in state["files"]) {
+            if (core.isMap(file) == false) {
+                changes = changes + 1
+                continue
+            }
+            var folder = "" + core.getOr(file, "folder", "")
+            var projectId = "" + core.getOr(file, "projectId", "")
+            var fileName = spBaseName("" + core.getOr(file, "fileName", ""))
+            var kind = "" + core.getOr(file, "kind", "")
+            var name = "" + core.getOr(file, "name", projectId)
+            if (folder == "" || projectId == "" || fileName == "") {
+                changes = changes + 1
+                continue
+            }
+            if (ownedCache.has(folder) == false) {
+                ownedCache[folder] = spOwned(profileId, folder)
+            }
+            var owned = ownedCache[folder]
+            var others = []
+            if (owned.has(projectId)) {
+                for (other in owned[projectId]) {
+                    if (other != fileName) {
+                        others.append(other)
+                    }
+                }
+            }
+            var present = spFilePresent(profileId, folder, fileName)
+            if (present && others.length() > 0) {
+                // The profile has its own copy of the project: it wins, the pack's file goes.
+                spRemoveFile(profileId, folder, fileName)
+                spRefsAdd(state["overridden"], projectId, name, kind)
+                changes = changes + 1
+            } else if (present == false && others.length() > 0) {
+                // The file was updated under a new name: the pack's file is that one now.
+                file["fileName"] = others[0]
+                file["sha1"] = ""
+                kept.append(file)
+                changes = changes + 1
+            } else if (present == false) {
+                // The user deleted it: it stays deleted.
+                if (core.getOr(file, "dependency", false) != true) {
+                    spRefsAdd(state["declined"], projectId, name, kind)
+                }
+                changes = changes + 1
+            } else {
+                kept.append(file)
+            }
+        }
+        state["files"] = kept
+    }
+    if (changes > 0) {
+        spRecordWrite(profileId, record)
+    }
+    return changes
+}
+
+define class SpReconcileTask {
+    private string profileId: get, set
+
+    method run(): object {
+        return spReconcile(profileId)
+    }
+}
+
+// Called before a launch: reconcile when the profile has packs. A problem never stops a launch.
+method beforeLaunch(string profileId) {
+    if (core.isId(profileId) == false || os.isFile(spRecordPath(profileId)) == false) {
+        return
+    }
+    var outcome = core.runTrapped(SpReconcileTask{profileId = profileId})
+    if (outcome.failed()) {
+        core.logWarn("syncpacks: reconcile before launch of " + profileId + " failed: " + outcome.error())
+    }
+}
+
+// --- applying ---------------------------------------------------------------------------
+
+method spFixtureDir(): string {
+    if (core.testRoutes() == false) {
+        return ""
+    }
+    return os.env(SP_FIXTURES_ENV)
+}
+
+// Test stand-in for a provider install: installs.json maps a project id to
+// {"fileName", "content", "dependencies": [{"projectId", "fileName", "content"}]}.
+method spFixtureInstall(string dir, string profileId, string provider, string projectId, string kind): map<string, object> {
+    var table = core.readJsonFile(path.join(dir, "installs.json"), {})
+    if (core.isMap(table) == false || table.has(projectId) == false || core.isMap(table[projectId]) == false) {
+        core.notFound("no version of '" + projectId + "' fits this profile")
+    }
+    var folder = packKindFolder(kind)
+    var target = core.ensureDir(path.join(core.profileDir(profileId), folder))
+    var spec = table[projectId]
+    var rows = [{"projectId": projectId, "fileName": "" + spec["fileName"], "content": "" + core.getOr(spec, "content", "x"), "dependency": false}]
+    var deps = core.getOr(spec, "dependencies", [])
+    if (core.isArray(deps)) {
+        for (dep in deps) {
+            rows.append({"projectId": "" + dep["projectId"], "fileName": "" + dep["fileName"], "content": "" + core.getOr(dep, "content", "x"), "dependency": true})
+        }
+    }
+    var installed = []
+    var loc = mods.contentLoc(profileId, folder, "")
+    for (row in rows) {
+        var file = path.join(target, path.basename("" + row["fileName"]))
+        os.writeFile(file, "" + row["content"])
+        var source = {"provider": provider, "projectId": row["projectId"], "versionId": "fixture", "versionNumber": "1", "name": row["projectId"]}
+        mods.recordSource(loc, path.basename(file), mods.sha1Hex(os.readFile(file)), source)
+        installed.append({"projectId": row["projectId"], "versionId": "fixture", "fileName": path.basename(file), "folder": folder, "dependency": row["dependency"]})
+    }
+    return {"profileId": profileId, "installed": installed, "skipped": []}
+}
+
+define class SpInstallTask {
+    private string jobId: get, set
+    private string profileId: get, set
+    private string provider: get, set
+    private string projectId: get, set
+    private string kind: get, set
+
+    method run(): object {
+        var dir = spFixtureDir()
+        if (dir != "") {
+            return spFixtureInstall(dir, profileId, provider, projectId, kind)
+        }
+        return providers.installContent(jobId, profileId, provider, projectId, "", kind, true, "")
+    }
+}
+
+define class SpPresentTask {
+    private string provider: get, set
+    private string dir: get, set
+
+    method run(): object {
+        return providers.presentProjects(provider, dir)
+    }
+}
+
+// Whether a folder holds archives the content store knows nothing about (so the project they
+// belong to is only known by asking the provider about their hashes).
+method spHasUnknownFiles(string profileId, string folder, map<string, object> owned): bool {
+    var dir = path.join(core.profileDir(profileId), folder)
+    if (os.isDir(dir) == false) {
+        return false
+    }
+    var known = []
+    for (projectId in owned) {
+        for (name in owned[projectId]) {
+            known.append(name)
+        }
+    }
+    for (name in os.listDir(dir)) {
+        var lower = name.toLower()
+        var isArchive = lower.endsWith(".jar") || lower.endsWith(".jar.disabled") || lower.endsWith(".zip") || lower.endsWith(".zip.disabled")
+        if (isArchive && known.contains(spBaseName(name)) == false) {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether a provider lookup of the folder named this project.
+method spIdentifiedHas(map<string, object> identified, string folder, string projectId): bool {
+    for (provider in ["modrinth", "curseforge"]) {
+        var key = folder + "|" + provider
+        if (identified.has(key) && identified[key].contains(projectId)) {
+            return true
+        }
+    }
+    return false
+}
+
+// Applies one pack to a profile: removes what left the pack, installs what is missing and
+// leaves the profile's own content alone. Raises only for a cancelled job; a project that
+// cannot be installed is noted in "skipped". The caller holds the profile's busy claim.
+method spApply(string jobId, string profileId, map<string, object> pack, bool retryDeclined): map<string, object> {
+    var profile = core.requireProfile(profileId)
+    spReconcile(profileId)
+    var record = spRecordRead(profileId)
+    var packId = "" + pack["id"]
+    var state = spStateOf(record, packId)
+    if (retryDeclined) {
+        state["declined"] = []
+    }
+    var entries = pack["entries"]
+    var installed = []
+    var overridden = []
+    var skipped = []
+    var removed = []
+
+    // What left the pack goes (the dependencies of an entry stay as ordinary files).
+    var kept = []
+    for (tracked in state["files"]) {
+        var isDependency = core.getOr(tracked, "dependency", false) == true
+        var gone = isDependency == false && spEntriesHave(entries, "" + tracked["projectId"], "" + tracked["kind"]) == false
+        if (gone) {
+            spRemoveFile(profileId, "" + tracked["folder"], "" + tracked["fileName"])
+            removed.append("" + core.getOr(tracked, "name", tracked["projectId"]))
+        } else {
+            kept.append(tracked)
+        }
+    }
+    state["files"] = kept
+
+    var ownedCache = {}
+    var identified = {}
+    var total = entries.length()
+    var index = 0
+    for (entry in entries) {
+        core.checkCancelled(jobId)
+        var projectId = "" + entry["projectId"]
+        var kind = "" + entry["kind"]
+        var name = "" + entry["name"]
+        var folder = packKindFolder(kind)
+        index = index + 1
+        core.jobProgress(jobId, 0.05 + 0.9 * index / total, name)
+        if (spFilesHave(state["files"], projectId, kind) || spRefsHave(state["declined"], projectId, kind)) {
+            continue
+        }
+        if (ownedCache.has(folder) == false) {
+            ownedCache[folder] = spOwned(profileId, folder)
+        }
+        var owned = ownedCache[folder]
+        var has = owned.has(projectId)
+        if (has == false) {
+            // Files the content store does not know: ask the provider which projects they are.
+            var key = folder + "|" + entry["provider"]
+            if (identified.has(key) == false) {
+                identified[key] = []
+                if (spHasUnknownFiles(profileId, folder, owned)) {
+                    var found = core.runTrapped(SpPresentTask{provider = "" + entry["provider"], dir = path.join(core.profileDir(profileId), folder)})
+                    if (found.failed()) {
+                        skipped.append("could not check the files in " + folder + ": " + core.decodeFailure(found.error())["message"])
+                    } else {
+                        identified[key] = found.result()
+                    }
+                }
+            }
+            has = identified[key].contains(projectId)
+        }
+        if (has) {
+            spRefsAdd(state["overridden"], projectId, name, kind)
+            overridden.append(name)
+            continue
+        }
+        var outcome = core.runTrapped(SpInstallTask{
+            jobId = jobId, profileId = profileId, provider = "" + entry["provider"], projectId = projectId, kind = kind
+        })
+        if (outcome.failed()) {
+            if (core.isCancelFailure(outcome.error())) {
+                core.raiseCancelled()
+            }
+            skipped.append(name + " not installed: " + core.decodeFailure(outcome.error())["message"])
+            continue
+        }
+        var result = outcome.result()
+        for (row in result["installed"]) {
+            var rowFolder = "" + row["folder"]
+            var fileName = "" + row["fileName"]
+            var sha1 = ""
+            var diskFile = path.join(core.profileDir(profileId), rowFolder, fileName)
+            if (os.isFile(diskFile)) {
+                sha1 = mods.sha1Hex(os.readFile(diskFile))
+            }
+            var rowName = name
+            if (row["dependency"] == true) {
+                rowName = "" + row["projectId"]
+            }
+            state["files"].append({
+                "projectId": "" + row["projectId"], "provider": "" + entry["provider"], "kind": packFolderKind(rowFolder),
+                "folder": rowFolder, "fileName": fileName, "sha1": sha1, "name": rowName, "dependency": row["dependency"]
+            })
+            // The new file is the profile's now: later entries see it as present.
+            if (ownedCache.has(rowFolder)) {
+                ownedCache[rowFolder] = spOwned(profileId, rowFolder)
+            }
+        }
+        for (note in result["skipped"]) {
+            skipped.append(name + ": " + note)
+        }
+        installed.append(name)
+        spRecordWrite(profileId, record)
+    }
+
+    // A project that is no longer the profile's own is the pack's again at the next apply.
+    var stillOverridden = []
+    for (ref in state["overridden"]) {
+        var refFolder = packKindFolder("" + ref["kind"])
+        if (ownedCache.has(refFolder) == false) {
+            ownedCache[refFolder] = spOwned(profileId, refFolder)
+        }
+        if (ownedCache[refFolder].has("" + ref["projectId"]) || spIdentifiedHas(identified, refFolder, "" + ref["projectId"])) {
+            stillOverridden.append(ref)
+        }
+    }
+    state["overridden"] = stillOverridden
+    spRecordWrite(profileId, record)
+    core.logInfo("syncpacks: pack '" + pack["name"] + "' applied to " + profile["name"] + ": "
+        + installed.length() + " installed, " + overridden.length() + " overridden, " + skipped.length() + " skipped")
+    return {
+        "profileId": profileId, "packId": packId, "installed": installed,
+        "overridden": overridden, "removed": removed, "skipped": skipped
+    }
+}
+
+define class SpApplyTask {
+    private string jobId: get, set
+    private string profileId: get, set
+    private map<string, object> pack: get, set
+    private bool retry: get, set
+
+    method run(): object {
+        return spApply(jobId, profileId, pack, retry)
+    }
+}
+
+// spApply under the profile's busy claim.
+method spApplyBusy(string jobId, string profileId, map<string, object> pack, bool retry): map<string, object> {
+    providers.claimBusy(profileId, "syncpack")
+    var outcome = core.runTrapped(SpApplyTask{jobId = jobId, profileId = profileId, pack = pack, retry = retry})
+    providers.releaseBusy(profileId)
+    if (outcome.failed()) {
+        core.raise(outcome.error())
+    }
+    return outcome.result()
+}
+
+// POST /api/profiles/:id/syncpacks: link and apply (the route checked the pack and that the profile is free).
+define class SpLinkJob based JobBody {
+    private string profileId: get, set
+    private string packId: get, set
+    private bool retry: get, set
+
+    method execute(string jobId): object {
+        return spApplyBusy(jobId, profileId, packRequire(packId), retry)
+    }
+}
+
+// POST /api/syncpacks/:id/sync: every profile the pack is linked to.
+define class SpSyncJob based JobBody {
+    private string packId: get, set
+
+    method execute(string jobId): object {
+        var pack = packRequire(packId)
+        var results = []
+        var skipped = []
+        var profiles = spLinkedProfiles(packId)
+        var index = 0
+        for (profileId in profiles) {
+            core.checkCancelled(jobId)
+            index = index + 1
+            core.jobProgress(jobId, 0.9 * index / profiles.length(), "" + core.profile(profileId)["name"])
+            if (providers.busyWith(profileId) != "" || core.isGameRunning(profileId)) {
+                skipped.append(profileId)
+                continue
+            }
+            results.append(spApplyBusy(jobId, profileId, pack, false))
+        }
+        return {"packId": packId, "profiles": results, "skipped": skipped}
+    }
+}
+
+// --- reading ----------------------------------------------------------------------------
+
+// The profiles that have this pack linked (their record names it).
+method spLinkedProfiles(string packId): array {
+    var out = []
+    for (p in core.profiles()) {
+        var id = "" + p["id"]
+        var file = spRecordPath(id)
+        if (os.isFile(file) == false) {
+            continue
+        }
+        var record = spRecordRead(id)
+        if (record["packs"].has(packId)) {
+            out.append(id)
+        }
+    }
+    return out
+}
+
+// GET /api/profiles/:id/syncpacks
+method spProfileView(string profileId): map<string, object> {
+    core.requireProfile(profileId)
+    var record = spRecordRead(profileId)
+    var out = []
+    for (packId in record["packs"]) {
+        var pack = packFind(packId)
+        if (core.isNull(pack)) {
+            continue
+        }
+        var state = spStateOf(record, packId)
+        var files = []
+        for (file in state["files"]) {
+            files.append({
+                "projectId": "" + file["projectId"], "name": "" + core.getOr(file, "name", file["projectId"]),
+                "kind": "" + file["kind"], "fileName": "" + file["fileName"], "dependency": core.getOr(file, "dependency", false) == true
+            })
+        }
+        var missing = []
+        for (entry in pack["entries"]) {
+            var projectId = "" + entry["projectId"]
+            var kind = "" + entry["kind"]
+            var installedAlready = spFilesHave(state["files"], projectId, kind)
+            var overriddenAlready = spRefsHave(state["overridden"], projectId, kind)
+            var declinedAlready = spRefsHave(state["declined"], projectId, kind)
+            if (installedAlready == false && overriddenAlready == false && declinedAlready == false) {
+                missing.append(entry)
+            }
+        }
+        out.append({
+            "packId": packId, "name": pack["name"], "files": files,
+            "overridden": state["overridden"], "declined": state["declined"], "missing": missing
+        })
+    }
+    return {"packs": out}
+}
+
+// --- unlinking and creating from a profile ---------------------------------------------
+
+// DELETE /api/profiles/:id/syncpacks/:packId. With removeFiles the files of the pack go,
+// otherwise they stay as ordinary content. Returns the names of both kinds.
+method spUnlink(string profileId, string packId, bool removeFiles): map<string, object> {
+    core.requireProfile(profileId)
+    var record = spRecordRead(profileId)
+    if (record["packs"].has(packId) == false) {
+        core.notFound("the pack is not linked to this profile")
+    }
+    var state = spStateOf(record, packId)
+    var removed = []
+    var keptNames = []
+    for (file in state["files"]) {
+        var fileName = "" + file["fileName"]
+        if (removeFiles) {
+            spRemoveFile(profileId, "" + file["folder"], fileName)
+            removed.append(fileName)
+        } else {
+            keptNames.append(fileName)
+        }
+    }
+    record["packs"].remove(packId)
+    spRecordWrite(profileId, record)
+    return {"removed": removed, "kept": keptNames}
+}
+
+// Links a profile to a pack without installing anything (an empty state).
+method spLinkEmpty(string profileId, string packId) {
+    var record = spRecordRead(profileId)
+    spStateOf(record, packId)
+    spRecordWrite(profileId, record)
+}
+
+// POST /api/syncpacks/from-profile: a pack of the provider-sourced content of a profile.
+method spEntriesFromProfile(string profileId): array {
+    core.requireProfile(profileId)
+    var entries = []
+    var keys = []
+    for (folder in ["mods", "resourcepacks", "shaderpacks"]) {
+        var loc = mods.contentLoc(profileId, folder, "")
+        var store = mods.loadStore(loc)
+        for (sha in store) {
+            var item = store[sha]
+            if (core.isMap(item) == false) {
+                continue
+            }
+            var source = core.getOr(item, "source", core.none())
+            var fileName = "" + core.getOr(item, "fileName", "")
+            if (core.isMap(source) == false || fileName == "") {
+                continue
+            }
+            var base = spBaseName(fileName)
+            if (os.isFile(path.join(loc.dir(), base)) == false && os.isFile(path.join(loc.dir(), base + ".disabled")) == false) {
+                continue
+            }
+            var provider = "" + core.getOr(source, "provider", "")
+            var projectId = "" + core.getOr(source, "projectId", "")
+            var kind = packFolderKind(folder)
+            var key = provider + "|" + projectId + "|" + kind
+            if ((provider != "modrinth" && provider != "curseforge") || projectId == "" || keys.contains(key)) {
+                continue
+            }
+            keys.append(key)
+            entries.append({
+                "provider": provider, "projectId": projectId, "kind": kind,
+                "name": "" + core.getOr(source, "name", projectId), "iconUrl": core.none()
+            })
+        }
+    }
+    return entries
+}

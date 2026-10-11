@@ -8,7 +8,7 @@ import core
 import migration
 import server
 import system
-import autoprofiles
+import syncpacks
 
 // volt-backend - the local HTTP service of VoltLauncher (docs/ARCHITECTURE.md).
 //
@@ -68,7 +68,7 @@ method main(array<string> arguments) {
     core.init(dataDir, cli.flag(parsed, "enable-test-routes"))
     migration.startup(dataDir, legacyDir)
     system.systemStartBackground()
-    autoprofiles.startBackground()
+    syncpacks.startBackground()
     server.serve(port, token)
     return 0
 }
