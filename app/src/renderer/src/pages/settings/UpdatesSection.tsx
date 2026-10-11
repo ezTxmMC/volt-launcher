@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Icon } from '@iconify/react'
+import type { UpdateKindInfo } from '@shared/bridge'
 import type { UpdateDownloadResult, UpdateInfo } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api, errorMessage } from '@/lib/api'
@@ -12,9 +13,12 @@ import { ErrorNotice } from '@/components/ui/Feedback'
 import { SettingsCard, ToggleRow } from '@/components/settings/SettingsParts'
 
 /** Where the launcher reads its releases from. Fixed by the backend; shown read-only. */
-const UPDATE_SOURCE = 'cdn.volt-launcher.app'
+const UPDATE_SOURCE = 'github.com/ezTxmMC/volt-launcher/releases'
 
-/** Updates: the update channel, the release check, the installer download and the release page. */
+/** Flatpak and manual installs cannot be replaced by the launcher: it only downloads the file. */
+const downloadOnly = (kind: UpdateKindInfo['kind'] | undefined): boolean => kind === 'flatpak' || kind === 'manual'
+
+/** Updates: the update channel, the release check, the one-click update and the release page. */
 export function UpdatesSection() {
   const { t, language } = useI18n()
   const { settings, update } = useSettings()
@@ -25,6 +29,12 @@ export function UpdatesSection() {
   const [checkError, setCheckError] = useState<string | null>(null)
   const [downloadJobId, setDownloadJobId] = useState<string | null>(null)
   const [downloaded, setDownloaded] = useState<UpdateDownloadResult | null>(null)
+  const [installKind, setInstallKind] = useState<UpdateKindInfo | null>(null)
+  const [applying, setApplying] = useState(false)
+  const [installError, setInstallError] = useState<string | null>(null)
+  const [installManual, setInstallManual] = useState(false)
+  /** Set by "Jetzt aktualisieren": the download that finishes next is installed right away. */
+  const installAfterDownload = useRef(false)
 
   const check = useCallback(async (force: boolean): Promise<void> => {
     setChecking(true)
@@ -43,12 +53,55 @@ export function UpdatesSection() {
     void check(false)
   }, [check])
 
+  // How this copy was installed decides the button. Without the bridge (plain browser) it is a download.
+  useEffect(() => {
+    if (!window.volt) return
+    window.volt.update
+      .kind()
+      .then(setInstallKind)
+      .catch(() => setInstallKind({ kind: 'manual', asset: 'installer' }))
+  }, [])
+
+  const install = useCallback(async (result: UpdateDownloadResult): Promise<void> => {
+    setDownloaded(result)
+    setApplying(true)
+    setInstallError(null)
+    setInstallManual(false)
+    if (!window.volt) {
+      setApplying(false)
+      setInstallManual(true)
+      return
+    }
+    try {
+      const outcome = await window.volt.update.apply(result.path)
+      // On success the launcher quits and restarts, so the "installing" state stays on screen.
+      if (outcome.ok) return
+      setApplying(false)
+      if (outcome.manual) setInstallManual(true)
+      else setInstallError(outcome.message || '')
+    } catch (error) {
+      setApplying(false)
+      setInstallError(errorMessage(error))
+    }
+  }, [])
+
   useJobFinished(
-    useCallback((job) => {
-      if (job.kind === 'update-download' && job.state === 'done' && job.result) {
-        setDownloaded(job.result as unknown as UpdateDownloadResult)
-      }
-    }, [])
+    useCallback(
+      (job) => {
+        if (job.kind !== 'update-download') return
+        if (job.state === 'done' && job.result) {
+          const result = job.result as unknown as UpdateDownloadResult
+          setDownloaded(result)
+          if (installAfterDownload.current) {
+            installAfterDownload.current = false
+            void install(result)
+          }
+        } else if (job.state !== 'running') {
+          installAfterDownload.current = false
+        }
+      },
+      [install]
+    )
   )
 
   const apply = async (patch: Parameters<typeof update>[0], recheck = false): Promise<void> => {
@@ -60,13 +113,18 @@ export function UpdatesSection() {
     }
   }
 
-  const startDownload = async (): Promise<void> => {
+  /** Downloads the asset for this install kind; with `installAfter` the file is installed once it is there. */
+  const startDownload = async (installAfter: boolean): Promise<void> => {
     try {
-      const job = await api.updates.download()
+      installAfterDownload.current = installAfter
+      setInstallError(null)
+      setInstallManual(false)
+      const job = await api.updates.download(installKind?.asset)
       track(job)
       setDownloadJobId(job.id)
       setDownloaded(null)
     } catch (error) {
+      installAfterDownload.current = false
       toast.error(error)
     }
   }
@@ -92,6 +150,8 @@ export function UpdatesSection() {
   const downloadJob = downloadJobId ? jobs.find((job) => job.id === downloadJobId) : undefined
   const downloading = downloadJob?.state === 'running'
   const downloadFailed = downloadJob?.state === 'failed'
+  const busy = downloading || applying
+  const oneClick = installKind !== null && !downloadOnly(installKind.kind)
   const notes = info?.notes.trim() ?? ''
 
   return (
@@ -133,6 +193,11 @@ export function UpdatesSection() {
             <div className="flex flex-wrap items-center gap-2">
               <Icon icon="lucide:arrow-up-circle" className="size-4 shrink-0 text-accent" />
               <span className="font-semibold">{t('settings.updates.available', { version: info.latestVersion })}</span>
+              {info.channel === 'dev' && (
+                <span className="rounded-[5px] border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-bold text-sky-300">
+                  {t('settings.updates.devBuild')}
+                </span>
+              )}
               {info.prerelease && (
                 <span className="rounded-[5px] border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[11px] font-bold text-amber-300">
                   {t('settings.updates.prerelease')}
@@ -152,16 +217,33 @@ export function UpdatesSection() {
 
             <div className="flex flex-wrap items-center gap-2">
               {info.downloadable ? (
-                <Button
-                  variant="primary"
-                  icon={downloading ? 'lucide:loader-circle' : 'lucide:download'}
-                  loading={downloading}
-                  disabled={downloading}
-                  onClick={() => void startDownload()}
-                >
-                  {downloading ? t('settings.updates.downloading') : t('settings.updates.download')}
-                  {info.assetSize > 0 && <span className="font-normal text-subtle">({formatBytes(info.assetSize, language)})</span>}
-                </Button>
+                oneClick ? (
+                  <Button
+                    variant="primary"
+                    icon={busy ? 'lucide:loader-circle' : 'lucide:refresh-cw'}
+                    loading={busy}
+                    disabled={busy}
+                    onClick={() => void startDownload(true)}
+                  >
+                    {applying
+                      ? t('settings.updates.installing')
+                      : downloading
+                        ? t('settings.updates.downloading')
+                        : t('settings.updates.installNow')}
+                    {info.assetSize > 0 && !busy && <span className="font-normal text-subtle">({formatBytes(info.assetSize, language)})</span>}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="primary"
+                    icon={downloading ? 'lucide:loader-circle' : 'lucide:download'}
+                    loading={downloading}
+                    disabled={downloading}
+                    onClick={() => void startDownload(false)}
+                  >
+                    {downloading ? t('settings.updates.downloading') : t('settings.updates.download')}
+                    {info.assetSize > 0 && <span className="font-normal text-subtle">({formatBytes(info.assetSize, language)})</span>}
+                  </Button>
+                )
               ) : (
                 <span className="text-[13px] text-subtle">{t('settings.updates.noAsset')}</span>
               )}
@@ -176,6 +258,13 @@ export function UpdatesSection() {
             </div>
 
             {downloadFailed && <ErrorNotice message={`${t('settings.updates.downloadFailed')}: ${downloadJob?.error ?? ''}`} />}
+            {installError !== null && <ErrorNotice message={`${t('settings.updates.installFailed')}: ${installError}`} />}
+            {installManual && (
+              <div className="flex items-start gap-2 text-[13px] leading-[1.5] text-muted">
+                <Icon icon="lucide:info" className="mt-0.5 size-4 shrink-0 text-subtle" />
+                <span>{t('settings.updates.manualInstall')}</span>
+              </div>
+            )}
             {downloaded && (
               <div className="grid gap-1 text-[13px] text-muted">
                 <span>{t('settings.updates.downloaded', { file: downloaded.fileName })}</span>

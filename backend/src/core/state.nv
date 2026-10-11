@@ -6,8 +6,9 @@ import path
 
 // Process wide configuration, fixed once at startup by main.
 
-final VERSION = "0.1.0"
+final VERSION = "0.1.2"
 
+var appVersion = ""
 var dataDirectory = ""
 var testRoutesEnabled = false
 
@@ -25,8 +26,17 @@ method dataDir(): string {
     return dataDirectory
 }
 
+// The version of the launcher. The app passes its own (--app-version, from package.json), which is
+// what the updater compares; the constant is the fallback for a backend started on its own.
 method version(): string {
+    if (appVersion != "") {
+        return appVersion
+    }
     return VERSION
+}
+
+method setAppVersion(string value) {
+    appVersion = value
 }
 
 method testRoutes(): bool {

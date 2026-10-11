@@ -1882,7 +1882,8 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       assetSize: 98_000_000,
       prerelease: false,
       reason: '',
-      checksumSha512: hex(128)
+      checksumSha512: hex(128),
+      channel: 'dev'
     })
   ],
   [
@@ -2367,7 +2368,12 @@ export function installMockBridge(): void {
       return Promise.resolve()
     },
     isMaximized: () => Promise.resolve(false),
-    onMaximizedChange: () => () => undefined
+    onMaximizedChange: () => () => undefined,
+    // A plain browser cannot install anything: the UI shows the download-only flow.
+    update: {
+      kind: () => Promise.resolve({ kind: 'manual', asset: 'installer' }),
+      apply: () => Promise.resolve({ ok: false, manual: true })
+    }
   }
   window.volt = bridge
 }

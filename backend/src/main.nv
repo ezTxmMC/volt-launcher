@@ -12,7 +12,7 @@ import syncpacks
 
 // volt-backend - the local HTTP service of VoltLauncher (docs/ARCHITECTURE.md).
 //
-//   volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--enable-test-routes]
+//   volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--enable-test-routes]
 //   volt-backend --migration-dry-run --data-dir <scratch> --legacy-dir <old folder>
 //
 // Started by the Electron main process; listens on 127.0.0.1 only, prints
@@ -21,7 +21,7 @@ import syncpacks
 // dir); a migration from there runs once at start (migration/).
 
 method usage() {
-    eprintln "usage: volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--enable-test-routes]"
+    eprintln "usage: volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--enable-test-routes]"
     eprintln "       volt-backend --migration-dry-run --data-dir <scratch dir> --legacy-dir <old folder>"
 }
 
@@ -65,6 +65,10 @@ method main(array<string> arguments) {
         return 2
     }
 
+    var appVersion = cli.option(parsed, "app-version", "")
+    if (appVersion != "" && appVersion != "true") {
+        core.setAppVersion(appVersion)
+    }
     core.init(dataDir, cli.flag(parsed, "enable-test-routes"))
     migration.startup(dataDir, legacyDir)
     system.systemStartBackground()

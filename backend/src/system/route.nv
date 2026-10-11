@@ -26,7 +26,7 @@ method route(string verb, array<string> segments, map<string, string> query, obj
         return systemDirectoriesRoute(verb, segments)
     }
     if (first == "updates") {
-        return systemUpdatesRoute(verb, segments, query)
+        return systemUpdatesRoute(verb, segments, query, body)
     }
     if (first == "integrations") {
         return systemIntegrationsRoute(verb, segments)

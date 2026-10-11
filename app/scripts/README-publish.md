@@ -1,5 +1,17 @@
 # Publishing the packages to the CDN
 
+**Transition only.** From 0.1.2 on, the launcher updates from GitHub releases (`release.yml` uploads the
+installers and `latest.json`). Launchers older than 0.1.2 still read this CDN, so 0.1.2 has to be published
+here once, so that they can update to it. After that this script is no longer needed.
+
+To publish the packages of a GitHub release instead of building locally:
+
+```bash
+gh release download 0.1.2 -R ezTxmMC/volt-launcher -D release-gh
+node scripts/publish-cdn.mjs --dir release-gh --dry-run
+VOLT_CDN_USER=<user> VOLT_CDN_CONFIRM=yes node scripts/publish-cdn.mjs --dir release-gh
+```
+
 `scripts/publish-cdn.mjs` uploads the packages from `app/release/` to the CDN and updates
 `latest.json`, which the VoltLauncher updater reads. It is adapted from the Lumen IDE script.
 

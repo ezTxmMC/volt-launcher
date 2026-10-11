@@ -1,6 +1,6 @@
 {
   "name": "volt-launcher-app",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "homepage": "https://github.com/Volt-Launcher/volt-launcher",
   "description": "Volt Launcher - Electron frontend",
   "private": true,

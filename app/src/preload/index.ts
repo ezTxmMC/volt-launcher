@@ -6,6 +6,8 @@ import {
   type HttpMethod,
   IPC,
   type SignInEnvelope,
+  type UpdateApplyResult,
+  type UpdateKindInfo,
   type VoltBridge
 } from '@shared/bridge'
 import type { Job } from '@shared/models'
@@ -50,6 +52,10 @@ const bridge: VoltBridge = {
     return () => {
       ipcRenderer.removeListener(IPC.maximizedChangedEvent, listener)
     }
+  },
+  update: {
+    kind: () => ipcRenderer.invoke(IPC.updateKind) as Promise<UpdateKindInfo>,
+    apply: (filePath) => ipcRenderer.invoke(IPC.updateApply, filePath) as Promise<UpdateApplyResult>
   }
 }
 

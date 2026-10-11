@@ -41,6 +41,11 @@ function freePort(): Promise<number> {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
+/** Same folder as the old Java launcher (~/.voltlauncher), so existing installs are picked up. */
+export function launcherDataDir(): string {
+  return join(homedir(), '.voltlauncher')
+}
+
 function errorMessageOf(body: unknown, fallback: string): string {
   if (typeof body === 'object' && body !== null && 'error' in body) {
     const error = (body as { error: unknown }).error
@@ -110,14 +115,17 @@ export class BackendManager {
     try {
       this.port = await freePort()
       this.token = randomBytes(32).toString('hex')
-      // Same folder as the old Java launcher (~/.voltlauncher), so existing installs are picked up.
-      const dataDir = join(homedir(), '.voltlauncher')
+      const dataDir = launcherDataDir()
       mkdirSync(dataDir, { recursive: true })
 
-      const child = spawn(binary, ['--port', String(this.port), '--token', this.token, '--data-dir', dataDir], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
-      })
+      const child = spawn(
+        binary,
+        ['--port', String(this.port), '--token', this.token, '--data-dir', dataDir, '--app-version', app.getVersion()],
+        {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true
+        }
+      )
       this.child = child
       child.stdout?.on('data', (chunk: Buffer) => this.appendLog(chunk))
       child.stderr?.on('data', (chunk: Buffer) => this.appendLog(chunk))

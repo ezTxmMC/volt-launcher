@@ -178,6 +178,8 @@ export interface UpdateInfo {
   reason: string
   /** SHA-512 of the installer from the release (hex), or "" when the release has none. */
   checksumSha512: string
+  /** Release channel of the offered version; 'dev' builds are marked in the UI. */
+  channel: 'stable' | 'dev'
 }
 
 export interface UpdateDownloadResult {

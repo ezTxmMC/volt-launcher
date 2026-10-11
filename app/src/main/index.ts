@@ -1,8 +1,15 @@
 import { join } from 'node:path'
 import { BrowserWindow, app, dialog, ipcMain, shell } from 'electron'
-import { type ApiEnvelope, HTTP_METHODS, type HttpMethod, IPC, type SignInEnvelope } from '@shared/bridge'
+import {
+  type ApiEnvelope,
+  HTTP_METHODS,
+  type HttpMethod,
+  IPC,
+  type SignInEnvelope
+} from '@shared/bridge'
 import { ApiRequestError, BackendManager } from './backend'
 import { signInWithMicrosoft } from './signin'
+import { applyUpdate, updateKind } from './updater'
 
 const backend = new BackendManager()
 let mainWindow: BrowserWindow | null = null
@@ -67,6 +74,9 @@ function registerIpc(): void {
     const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options)
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
+
+  ipcMain.handle(IPC.updateKind, () => updateKind())
+  ipcMain.handle(IPC.updateApply, (_event, filePath: unknown) => applyUpdate(filePath))
 
   backend.onChange((status) => {
     mainWindow?.webContents.send(IPC.backendStatusEvent, status)

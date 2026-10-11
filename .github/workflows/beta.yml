@@ -1,0 +1,100 @@
+# Beta workflow: every commit pushed to master builds all installers with the next version and a
+# -dev.<first 10 characters of the commit> suffix and, when every build succeeded, replaces the rolling
+# pre-release "dev". The launcher's updater (beta updates on) reads its latest.json, so it always
+# gets the latest successful commit. A failed build leaves the previous dev release in place. Runs are
+# queued, not cancelled, so every commit gets its build and an older one never overwrites a newer one.
+#
+# Version: the latest release tag (0.1.1) bumped to the next patch (0.1.2), or to the next minor (0.2.0)
+# when a commit since that tag starts with "feat:" / "feature:" or contains "#minor".
+
+name: Beta
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute the next version
+        id: next
+        run: |
+          LAST=$(git tag --list --sort=-v:refname | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          if [ -n "$LAST" ]; then
+            BASE="${LAST#v}"
+            SUBJECTS=$(git log --format=%s "$LAST..HEAD")
+          else
+            BASE=$(node -p "require('./app/package.json').version" | cut -d- -f1)
+            SUBJECTS=$(git log --format=%s)
+          fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          if printf '%s\n' "$SUBJECTS" | grep -qiE '^(feat|feature)(\(.*\))?!?:|#minor'; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+          VERSION="$MAJOR.$MINOR.$PATCH-dev.${GITHUB_SHA:0:10}"
+          echo "Latest release: ${LAST:-none}; building $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          path: assets
+          merge-multiple: true
+
+      - name: Write the manifest and the checksums
+        run: |
+          node app/scripts/make-manifest.mjs --dir assets --version "$VERSION" --out assets/latest.json \
+            --notes "Dev build of master, commit ${GITHUB_SHA:0:10}"
+          (cd assets && sha256sum $(ls | grep -v '^latest.json$') > SHA256SUMS.txt)
+
+      - name: Replace the rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --cleanup-tag --yes || true
+          gh release create dev assets/* \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Dev build $VERSION" \
+            --notes "Automatic build of master (commit ${GITHUB_SHA:0:10}). Version $VERSION. Not for production use."

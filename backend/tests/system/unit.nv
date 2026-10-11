@@ -79,8 +79,8 @@ method main(array<string> arguments) {
     var expectedHex = os.readFile(path.join(fixtures, "update.sha512")).trim()
     var manifestText = os.readFile(path.join(fixtures, "manifest.json"))
     var payloadSize = os.fileSize(payloadPath)
-    var page = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest/"
-    var feed = "https://cdn.volt-launcher.app/download/volt-launcher/version/latest"
+    var page = "https://github.com/ezTxmMC/volt-launcher/releases/latest"
+    var feed = "https://github.com/ezTxmMC/volt-launcher/releases/latest/download"
 
     // --- fixed settings: defaults
     core.init(dataDir, false)
@@ -142,14 +142,14 @@ method main(array<string> arguments) {
     check("manifest: notes when the manifest version matches", linux["notes"] == "Fixture notes")
     check("manifest: publishedAt is the platform releaseDate", linux["publishedAt"] == "2026-10-01T10:00:00.000Z")
     check("manifest: assetName and assetSize", linux["assetName"] == "VoltLauncher-0.2.0.AppImage" && linux["assetSize"] == payloadSize)
-    check("manifest: downloadUrl is <feed>/<platform>/<name>", linux["downloadUrl"] == feed + "/linux_amd64/VoltLauncher-0.2.0.AppImage")
+    check("manifest: downloadUrl is <feed>/<name>", linux["downloadUrl"] == feed + "/VoltLauncher-0.2.0.AppImage")
     check("manifest: downloadable with a SHA-512", linux["downloadable"] == true && linux["reason"] == "")
     check("manifest: checksumSha512 is the hex of the manifest value", linux["checksumSha512"] == expectedHex)
     check("manifest: releaseUrl is the release page", linux["releaseUrl"] == page)
     check("manifest: not a pre-release", linux["prerelease"] == false)
 
     var windows = system.systemUpdateFromManifest(manifestText, "windows_x86_64", "0.1.0", false)
-    check("manifest: file name with a space is percent-encoded in the URL", windows["downloadUrl"] == feed + "/windows_x86_64/VoltLauncher%20Setup%200.2.0.exe")
+    check("manifest: file name with a space is percent-encoded in the URL", windows["downloadUrl"] == feed + "/VoltLauncher%20Setup%200.2.0.exe")
     check("manifest: no update entry -> files[0] is the installer", windows["assetName"] == "VoltLauncher Setup 0.2.0.exe" && windows["downloadable"] == true)
 
     var mac = system.systemUpdateFromManifest(manifestText, "macos_arm64", "0.1.0", false)
@@ -172,6 +172,19 @@ method main(array<string> arguments) {
     check("manifest: invalid JSON -> not available with a reason", broken["available"] == false && broken["reason"].contains("not valid JSON"))
     var noPlatforms = system.systemUpdateFromManifest("{\"version\": \"0.2.0\"}", "linux_amd64", "0.1.0", false)
     check("manifest: no platforms -> not available with a reason", noPlatforms["available"] == false && noPlatforms["reason"].contains("no platforms"))
+
+    // --- the dev channel (rolling pre-release of the beta branch)
+    var dev = system.systemUpdateFromManifestFor(manifestText, "linux_amd64", "0.1.0", true, "dev")
+    check("dev: channel is reported", dev["channel"] == "dev" && linux["channel"] == "stable")
+    check("dev: files lie flat next to the manifest", dev["downloadUrl"] == system.SYSTEM_DEV_FEED + "/VoltLauncher-0.2.0.AppImage")
+    check("dev: the release page is the dev release", dev["releaseUrl"] == system.SYSTEM_DEV_RELEASE_PAGE)
+    check("manifest: every file with size and sha512 is listed as an asset", linux["assets"].length() >= 1 && linux["assets"][0]["name"] == "VoltLauncher-0.2.0.AppImage")
+    check("dev: a different dev build of a later core version is newer", system.systemDevNewer("0.1.2-dev.bbbbbbbbbb", "0.1.1"))
+    check("dev: a different dev build of the same core is newer for a dev build", system.systemDevNewer("0.1.2-dev.bbbbbbbbbb", "0.1.2-dev.aaaaaaaaaa"))
+    check("dev: the same dev build is not newer", system.systemDevNewer("0.1.2-dev.aaaaaaaaaa", "0.1.2-dev.aaaaaaaaaa") == false)
+    check("dev: a dev build is not newer than the release of its core", system.systemDevNewer("0.1.2-dev.bbbbbbbbbb", "0.1.2") == false)
+    check("dev: an older core is not newer", system.systemDevNewer("0.1.1-dev.bbbbbbbbbb", "0.1.2-dev.aaaaaaaaaa") == false)
+    check("dev: a release is higher than a dev build of its core", system.systemCompareVersions("0.1.2", "0.1.2-dev.bbbbbbbbbb") == 1)
 
     // --- SHA-512: base64 of the manifest value and the hex digest of the file
     check("sha512: manifest base64 decodes to the file digest", system.systemSha512Hex(json.parse(manifestText)["platforms"]["linux_amd64"]["update"]["sha512"]) == expectedHex)

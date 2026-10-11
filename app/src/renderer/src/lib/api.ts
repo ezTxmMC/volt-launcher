@@ -57,7 +57,7 @@ import type {
   PlatformInfo,
   UpdateInfo
 } from '@shared/models'
-import type { HttpMethod } from '@shared/bridge'
+import type { HttpMethod, UpdateAssetKind } from '@shared/bridge'
 
 function bridge() {
   if (!window.volt) throw new Error('The Electron bridge (window.volt) is not available.')
@@ -149,8 +149,8 @@ export const api = {
   },
   updates: {
     check: (force = false) => request<UpdateInfo>('GET', force ? '/api/updates?force=1' : '/api/updates'),
-    /** Job; its result is an UpdateDownloadResult. */
-    download: () => request<Job>('POST', '/api/updates/download'),
+    /** Job; its result is an UpdateDownloadResult. `kind` picks the asset (default: the installer). */
+    download: (kind?: UpdateAssetKind) => request<Job>('POST', '/api/updates/download', kind ? { kind } : undefined),
     /** Answers the release page address; the renderer opens it. */
     openRelease: () => request<{ url: string }>('POST', '/api/updates/open-release')
   },

@@ -2,6 +2,24 @@
 
 import type { Job } from './models'
 
+/** How this copy of the launcher was installed; decides how an update is applied. */
+export type InstallKind = 'nsis' | 'appimage' | 'deb' | 'rpm' | 'flatpak' | 'mac-app' | 'manual'
+
+/** Which backend download the install kind needs (`POST /api/updates/download` `kind`). */
+export type UpdateAssetKind = 'installer' | 'deb' | 'rpm'
+
+export interface UpdateKindInfo {
+  kind: InstallKind
+  asset: UpdateAssetKind
+}
+
+/** Outcome of applying a downloaded update. `manual` means the user has to install the file themselves. */
+export interface UpdateApplyResult {
+  ok: boolean
+  manual?: boolean
+  message?: string
+}
+
 export type BackendState = 'starting' | 'ready' | 'error'
 
 export interface BackendStatus {
@@ -50,6 +68,13 @@ export interface VoltBridge {
   isMaximized(): Promise<boolean>
   /** Subscribes to maximise and restore changes. Returns an unsubscribe function. */
   onMaximizedChange(callback: (maximized: boolean) => void): () => void
+  /** One-click updates. The main process decides how to install, the renderer only passes the file. */
+  update: {
+    /** Install kind of this copy and the backend asset it needs. */
+    kind(): Promise<UpdateKindInfo>
+    /** Installs a file downloaded into the updates folder and restarts the launcher (or explains why not). */
+    apply(filePath: string): Promise<UpdateApplyResult>
+  }
 }
 
 export const IPC = {
@@ -66,7 +91,9 @@ export const IPC = {
   maximize: 'volt:maximize',
   close: 'volt:close',
   isMaximized: 'volt:is-maximized',
-  maximizedChangedEvent: 'volt:maximized-changed-event'
+  maximizedChangedEvent: 'volt:maximized-changed-event',
+  updateKind: 'volt:update-kind',
+  updateApply: 'volt:update-apply'
 } as const
 
 /** What the main process returns for `volt:sign-in`; the preload turns failures into thrown errors. */

@@ -1,0 +1,234 @@
+# Reusable build: the Novus backend for all targets and the installers of every platform, uploaded as
+# the artifacts backend-dist and assets-<target>. Called by release.yml (tag push) and beta.yml
+# (push to master). With `version`, app/package.json gets that version before the build.
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build; empty keeps the version in app/package.json'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  NOVUS_VERSION: v0.1.0-pre.alpha.8
+  ZIG_VERSION: 0.16.0
+  NODE_VERSION: 22
+  PNPM_VERSION: 10
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download novusc
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/novusc" \
+            "https://github.com/ezTxmMC/novus/releases/download/${NOVUS_VERSION}/novusc-x86_64-linux-musl"
+          chmod +x "$RUNNER_TEMP/bin/novusc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/novusc" version
+
+      - name: Smoke test the host build
+        run: backend/scripts/smoke.sh --build
+
+      - name: Cross compile all targets
+        run: backend/scripts/build-release.sh
+
+      - name: Pack backend binaries
+        run: tar -C backend -czf backend-dist.tar.gz dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist
+          path: backend-dist.tar.gz
+          if-no-files-found: error
+
+  linux:
+    needs: backend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm flatpak flatpak-builder
+          # Ubuntu 24.04 blocks the unprivileged user namespaces flatpak-builder needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --noninteractive flathub \
+            org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 org.electronjs.Electron2.BaseApp//24.08
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Set the app version
+        if: inputs.version != ''
+        working-directory: app
+        run: npm pkg set version="${{ inputs.version }}"
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs ${{ matrix.target }}
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.zip' -o -name '*.tar.gz' -o -name '*.flatpak' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.target }}
+          path: upload/*
+          if-no-files-found: error
+
+  windows:
+    needs: backend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Set the app version
+        if: inputs.version != ''
+        working-directory: app
+        run: npm pkg set version="${{ inputs.version }}"
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs win-x64 win-arm64
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-windows
+          path: upload/*
+          if-no-files-found: error
+
+  mac:
+    needs: backend
+    runs-on: macos-14
+    env:
+      # Builds are unsigned. Add signing and notarization secrets to this job to change that.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+
+      - name: Unpack backend binaries
+        run: tar -xzf backend-dist.tar.gz -C backend
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: Set the app version
+        if: inputs.version != ''
+        working-directory: app
+        run: npm pkg set version="${{ inputs.version }}"
+
+      - name: Install and build app
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package
+        working-directory: app
+        run: node scripts/package.mjs mac-arm64
+
+      - name: Collect installers
+        run: |
+          mkdir -p upload
+          find app/release -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-mac
+          path: upload/*
+          if-no-files-found: error

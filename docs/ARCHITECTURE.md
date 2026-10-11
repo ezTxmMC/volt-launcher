@@ -402,7 +402,7 @@ The keys of the old UI are mapped onto the model; new additions are: `minMemoryM
 `discordPresence`, `discordApplicationId`, `autoUpdate`, `betaUpdates`.
 `bridgeUrl` and `discordApplicationId` are fixed (launcher default value): `PATCH /api/settings` with either of these keys
 responds with 400 `bad_request` ("… is fixed by the launcher") and changes nothing; values stored in `settings.json` are
-ignored on load. `GET /api/settings` shows both. The key `updateRepository` has been removed; updates come from the CDN (see below).
+ignored on load. `GET /api/settings` shows both. The key `updateRepository` has been removed; updates come from GitHub releases (see below).
 The old option "Hide on launch" has been merged into `closeOnLaunch`.
 
 | Method | Path | Description |
@@ -412,22 +412,37 @@ The old option "Hide on launch" has been merged into `closeOnLaunch`.
 | POST | `/api/settings/directories/:id/open` | Creates the folder and responds with `{path}`; the UI opens it via Electron |
 | GET | `/api/updates[?force=1]` | `UpdateInfo` (cache 10 min); manifest unreachable or not yet published (HTTP 404): `available: false` with the reason in `reason` |
 | POST | `/api/updates/download` | Job (202); result `{path, fileName, directory, verified}`; target `<dataDir>/updates/` |
-| POST | `/api/updates/open-release` | `{url}` of the release page (`https://cdn.volt-launcher.app/download/volt-launcher/version/latest/`) |
+| POST | `/api/updates/open-release` | `{url}` of the release page (`https://github.com/ezTxmMC/volt-launcher/releases/latest`) |
 | GET | `/api/integrations/discord` | `{state, message, transport, configured, enabled}`; `state` = `disabled | not_configured | waiting_for_discord | rejected | connected` |
 | GET | `/api/java/runtimes` | `{detected, managed, installable, configured, installing}` |
 | POST | `/api/java/runtimes/:major/install` | Job (202); result `{majorVersion, javaPath}`; one installation per version |
 | GET | `/api/platforms` | `[{id, displayName}]` of the loaders |
 
-`UpdateInfo`: `{available, currentVersion, latestVersion, name, notes, publishedAt, releaseUrl, assetName, downloadable, assetSize, prerelease, reason, checksumSha512}`; `checksumSha512` is the hex value.
+`UpdateInfo`: `{available, currentVersion, latestVersion, name, notes, publishedAt, releaseUrl, assetName, downloadable, assetSize, prerelease, channel, assets, reason, checksumSha512}`; `checksumSha512` is the hex value, `channel` is `stable` or `dev`, `assets` lists the files of the platform (`{name, assetSize, checksumSha512}`). `POST /api/updates/download` takes an optional `{kind: installer | deb | rpm}`: `installer` (default) is the manifest's `update` file, `deb`/`rpm` the package of that type for package installs.
 
-Updates come from the CDN: `https://cdn.volt-launcher.app/download/volt-launcher/version/latest/latest.json` (fixed, `system/updates.nv`),
-in the format of Lumen IDE's publishing script: `product`, `version`, `releaseDate`, `notes`, `platforms.<platform>` with
+Updates come from GitHub releases: `https://github.com/ezTxmMC/volt-launcher/releases/latest/download/latest.json` (fixed, `system/updates.nv`;
+`releases/latest` is the newest non-pre-release; the release workflow uploads the manifest next to the installers) in Lumen IDE's format: `product`, `version`, `releaseDate`, `notes`, `platforms.<platform>` with
 `version`, `releaseDate`, `update: {name, size, sha512}` and `files: [{name, size, sha512}]`. Platforms: `linux_amd64`, `linux_aarch64`,
 `windows_x86_64`, `windows_arm64`, `macos_arm64`; the machine's platform is derived from `os.platform()` and `uname -m` or `PROCESSOR_ARCHITECTURE`.
-The installer is `update`, otherwise the first entry of `files`, and is located at `<feed>/<platform>/<name>`. A version is newer if it is greater
+The installer is `update`, otherwise the first entry of `files`, and is located at `<feed>/<name>` (flat, next to the manifest). A version is newer if it is greater
 according to Lumen's `compareVersions` (prereleases only with `betaUpdates`). Size and SHA-512 are verified: the base64 value from the
 manifest is decoded to hex and compared with the file's hex digest (`sha512sum`, `shasum -a 512`, or `certutil`). If the
 check fails, the file is deleted and the job fails.
+
+**Dev channel.** With `betaUpdates` on, the rolling GitHub pre-release `dev` (the latest successfully built commit of `master`) is checked as well
+(`https://github.com/ezTxmMC/volt-launcher/releases/download/dev/latest.json`, same manifest format, files flat next to it).
+The higher version wins; a release of a core version is higher than its dev builds. A different dev build of a later core
+version, or of the same core while the running build is itself a pre-release, counts as newer. `.github/workflows/beta.yml` replaces
+the release after every commit to `master` whose builds all succeed, with version `<next>-dev.<first 10 characters of the commit>` (next patch
+after the latest release tag, or next minor when a commit since then starts with `feat:` or contains `#minor`).
+`app/scripts/make-manifest.mjs` writes its `latest.json`.
+
+**Version of the running launcher.** The app passes its own version to the backend with `--app-version` (`core.version()`), because
+that is what the updater compares; without the flag the constant in `core/state.nv` is used.
+
+**Installing.** The Electron main process applies the downloaded file (`app/src/main/updater.ts`) by installation kind: NSIS
+(silent `/S --updated --force-run`), AppImage (replaced in place and relaunched), macOS (the .app is replaced from the ZIP and
+reopened), deb and rpm (`pkexec dpkg -i` / `rpm -U`); Flatpak and unknown installs only show the file.
 
 Discord: Rich Presence over the local IPC socket (Unix socket using `$XDG_RUNTIME_DIR`, `$TMPDIR`, `/tmp`, as well as
 Flatpak and Snap subfolders; Windows named pipe `\\.\pipe\discord-ipc-N`). The socket calls are a small C block
