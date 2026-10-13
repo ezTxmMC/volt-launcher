@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Icon } from '@iconify/react'
+import { Link } from 'react-router'
 import type { Profile, ProfileSyncPack } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
@@ -10,9 +11,11 @@ import { useToast } from '@/state/toast'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { ErrorNotice } from '@/components/ui/Feedback'
-import { Modal } from '@/components/ui/Modal'
 import { Card } from '@/components/ui/Page'
 import { Select } from '@/components/ui/Select'
+import { SyncResultSummary } from '@/components/packs/SyncResultSummary'
+import { UnlinkPackDialog } from '@/components/packs/UnlinkPackDialog'
+import { useSyncRun } from '@/components/packs/useSyncRun'
 
 const STATUS_POLL_MS = 3000
 
@@ -23,7 +26,7 @@ const STATUS_POLL_MS = 3000
 export function ProfileSyncPacks({ profile }: { profile: Profile }) {
   const { t } = useI18n()
   const toast = useToast()
-  const { jobs, track } = useJobs()
+  const { jobs } = useJobs()
 
   const loadLinked = useCallback(() => api.profiles.syncPacks.list(profile.id), [profile.id])
   const linked = useAsync(loadLinked)
@@ -33,7 +36,7 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
   const { data: game, reload: reloadGame } = useAsync(loadGame)
 
   const [picked, setPicked] = useState('')
-  const [linking, setLinking] = useState(false)
+  const run = useSyncRun()
   const [removing, setRemoving] = useState<ProfileSyncPack | null>(null)
 
   useEffect(() => {
@@ -52,24 +55,17 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
 
   const syncRunning = jobs.some((job) => job.kind === 'syncpack' && job.state === 'running')
   const gameBusy = game ? game.running || game.phase !== 'idle' : false
-  const blocked = gameBusy || syncRunning || linking
+  const blocked = gameBusy || syncRunning || run.running
 
   const packs = linked.data?.packs ?? []
   const linkedIds = new Set(packs.map((pack) => pack.packId))
   const available = (all.data?.packs ?? []).filter((pack) => !linkedIds.has(pack.id))
   const chosen = available.some((pack) => pack.id === picked) ? picked : (available[0]?.id ?? '')
 
-  const link = async (): Promise<void> => {
-    if (chosen === '' || blocked) return
-    setLinking(true)
-    try {
-      track(await api.profiles.syncPacks.link(profile.id, chosen))
-      setPicked('')
-    } catch (error) {
-      toast.error(error)
-    } finally {
-      setLinking(false)
-    }
+  const link = async (packId: string, retry: boolean): Promise<void> => {
+    if (packId === '' || blocked) return
+    await run.start(() => api.profiles.syncPacks.link(profile.id, packId, retry))
+    setPicked('')
   }
 
   return (
@@ -86,6 +82,7 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
       {!gameBusy && syncRunning && <p className="text-[13px] text-subtle">{t('profile.syncpacks.busy')}</p>}
 
       {linked.error && <ErrorNotice message={linked.error} onRetry={linked.reload} />}
+      {run.summary && <SyncResultSummary summary={run.summary} onDismiss={run.dismiss} />}
 
       {linked.data !== undefined && packs.length === 0 && (
         <p className="rounded-[10px] border border-line px-3.5 py-3 text-[13px] text-subtle">{t('profile.syncpacks.empty')}</p>
@@ -95,10 +92,37 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
         <section key={pack.packId} className="grid gap-3 rounded-[10px] border border-line bg-surface-2 p-3.5">
           <header className="flex min-w-0 items-center justify-between gap-3">
             <h4 className="min-w-0 truncate font-semibold">{pack.name}</h4>
-            <Button size="sm" variant="ghost" icon="lucide:unlink" disabled={blocked} onClick={() => setRemoving(pack)}>
-              {t('profile.syncpacks.remove')}
-            </Button>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <Link to={`/packs?pack=${encodeURIComponent(pack.packId)}`} className="text-[12.5px] font-medium text-accent hover:underline">
+                {t('profile.syncpacks.open')}
+              </Link>
+              <Button
+                size="sm"
+                variant={pack.failed.length > 0 ? 'primary' : 'ghost'}
+                icon="lucide:rotate-cw"
+                disabled={blocked}
+                onClick={() => void link(pack.packId, true)}
+              >
+                {t('profile.syncpacks.retry')}
+              </Button>
+              <Button size="sm" variant="ghost" icon="lucide:unlink" disabled={blocked} onClick={() => setRemoving(pack)}>
+                {t('profile.syncpacks.remove')}
+              </Button>
+            </div>
           </header>
+
+          {pack.failed.length > 0 && (
+            <ul className="grid gap-1 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2">
+              {pack.failed.map((failure) => (
+                <li key={`${failure.kind}:${failure.projectId}`} className="flex items-start gap-2 text-[13px] text-warning">
+                  <Icon icon="lucide:triangle-alert" className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+                  <span className="min-w-0 break-words">
+                    <span className="font-semibold">{failure.name}</span>: {failure.reason}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
 
           {pack.files.length === 0 && pack.overridden.length === 0 ? (
             <p className="text-[13px] text-subtle">{t('profile.syncpacks.noFiles')}</p>
@@ -144,22 +168,38 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
                   options={available.map((pack) => ({ value: pack.id, label: pack.name }))}
                 />
               </div>
-              <Button variant="secondary" icon="lucide:plus" disabled={blocked || chosen === ''} loading={linking} onClick={() => void link()}>
+              <Button
+                variant="secondary"
+                icon="lucide:plus"
+                disabled={blocked || chosen === ''}
+                loading={run.running}
+                onClick={() => void link(chosen, false)}
+              >
                 {t('profile.syncpacks.add')}
               </Button>
             </div>
           ) : (
             <p className="text-[13px] text-subtle">
-              {all.data.packs.length === 0 ? t('profile.syncpacks.noPacks') : t('profile.syncpacks.noneLeft')}
+              {all.data.packs.length === 0 ? (
+                <>
+                  {t('profile.syncpacks.noPacks')}{' '}
+                  <Link to="/packs" className="font-medium text-accent hover:underline">
+                    {t('profile.syncpacks.openPacks')}
+                  </Link>
+                </>
+              ) : (
+                t('profile.syncpacks.noneLeft')
+              )}
             </p>
           )}
         </div>
       )}
 
       {removing && (
-        <UnlinkDialog
+        <UnlinkPackDialog
           profileId={profile.id}
-          pack={removing}
+          packId={removing.packId}
+          packName={removing.name}
           onClose={() => setRemoving(null)}
           onDone={(removed, kept) => {
             setRemoving(null)
@@ -169,55 +209,5 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
         />
       )}
     </Card>
-  )
-}
-
-/** Asks what happens to the pack's files: keep them as ordinary content, or remove them from the profile. */
-function UnlinkDialog({
-  profileId,
-  pack,
-  onClose,
-  onDone
-}: {
-  profileId: string
-  pack: ProfileSyncPack
-  onClose: () => void
-  onDone: (removed: number, kept: number) => void
-}) {
-  const { t } = useI18n()
-  const toast = useToast()
-  const [busy, setBusy] = useState(false)
-
-  const unlink = async (removeFiles: boolean): Promise<void> => {
-    setBusy(true)
-    try {
-      const result = await api.profiles.syncPacks.unlink(profileId, pack.packId, removeFiles)
-      onDone(result.removed.length, result.kept.length)
-    } catch (error) {
-      toast.error(error)
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Modal
-      title={t('profile.syncpacks.removeTitle', { name: pack.name })}
-      onClose={onClose}
-      footer={
-        <>
-          <Button variant="ghost" disabled={busy} onClick={onClose}>
-            {t('common.cancel')}
-          </Button>
-          <Button variant="secondary" icon="lucide:link" loading={busy} onClick={() => void unlink(false)}>
-            {t('profile.syncpacks.keep')}
-          </Button>
-          <Button variant="danger" icon="lucide:trash-2" disabled={busy} onClick={() => void unlink(true)}>
-            {t('profile.syncpacks.removeFiles')}
-          </Button>
-        </>
-      }
-    >
-      <p className="text-muted">{t('profile.syncpacks.removeMessage')}</p>
-    </Modal>
   )
 }

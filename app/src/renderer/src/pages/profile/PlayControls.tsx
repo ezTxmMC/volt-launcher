@@ -7,6 +7,7 @@ import { JobRow } from '@/components/JobRow'
 import { useLaunchProfile } from '@/components/home/hooks/useLaunchProfile'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
+import { useGames, useLaunchBlock } from '@/state/games'
 import { useJobFinished, useJobs } from '@/state/jobs'
 import { useSettings } from '@/state/settings'
 import { useToast } from '@/state/toast'
@@ -30,7 +31,8 @@ function followRunningGame(profileId: string): void {
         if (status.running) return
         clearInterval(timer)
         followedGames.delete(profileId)
-        void volt.showWindow()
+        // Another profile's game may still hide the launcher; it comes back when the last one exits.
+        if (followedGames.size === 0) void volt.showWindow()
       },
       () => undefined // keep waiting; the next tick tries again
     )
@@ -45,6 +47,8 @@ export function PlayControls({ profile, onChanged }: { profile: Profile; onChang
   const { jobs, track } = useJobs()
   const launchGame = useLaunchProfile()
   const { settings } = useSettings()
+  const { stop: stopGame } = useGames()
+  const launchBlock = useLaunchBlock(profile.id)
   const loadStatus = useCallback(() => api.game.status(profile.id), [profile.id])
   const { data: game, reload: reloadStatus } = useAsync(loadStatus)
   const [jobIds, setJobIds] = useState<readonly string[]>([])
@@ -102,7 +106,7 @@ export function PlayControls({ profile, onChanged }: { profile: Profile; onChang
   const stop = async (): Promise<void> => {
     setStarting('stop')
     try {
-      await api.game.stop(profile.id)
+      await stopGame(profile.id)
       reloadStatus()
     } catch (error) {
       toast.error(error)
@@ -139,7 +143,8 @@ export function PlayControls({ profile, onChanged }: { profile: Profile; onChang
             <Button
               variant="launch"
               icon="lucide:play"
-              disabled={busy}
+              disabled={busy || launchBlock.blocked}
+              title={launchBlock.reason}
               loading={starting === 'launch'}
               onClick={() => void start('launch')}
             >

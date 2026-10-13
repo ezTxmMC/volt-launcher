@@ -1,10 +1,11 @@
 import type { ContentKind } from '@shared/models'
+import { Icon } from '@iconify/react'
 import { useI18n } from '@/i18n'
 import { Button } from '@/components/ui/Button'
 import { FilterSection } from './FilterSection'
 import { GameVersionFilter } from './GameVersionFilter'
 import { CategoryFilter, EnvironmentFilter, LicenseFilter, LoaderFilter } from './SectionFilters'
-import { usesLoader } from './model'
+import { loaderLabel, usesLoader } from './model'
 import type { ResolvedFilters } from './model'
 
 /** Filter values as the URL holds them (the search text and the sort are read by the page). */
@@ -33,17 +34,19 @@ interface DiscoverSidebarProps {
   /** Narrow screens only: the sidebar is a drawer, and this closes it. */
   drawerOpen: boolean
   onClose: () => void
+  /** Set in a profile's Discover: version and loader are the profile's and cannot be changed here. */
+  lock?: { gameVersion: string; loader: string | null }
 }
 
 /**
  * Filter sidebar: collapsible sections, each shown only when the provider supports it for this kind.
  * Beside 1100 px it is a sticky column; below, it is a drawer that the toolbar's Filters button opens.
  */
-export function DiscoverSidebar({ kind, filters, values, hasActive, onChange, onReset, drawerOpen, onClose }: DiscoverSidebarProps) {
+export function DiscoverSidebar({ kind, filters, values, hasActive, onChange, onReset, drawerOpen, onClose, lock }: DiscoverSidebarProps) {
   const { t } = useI18n()
   const { supports } = filters
-  const showVersion = supports.gameVersion
-  const showLoader = supports.loader && usesLoader(kind) && filters.loaders.length > 0
+  const showVersion = supports.gameVersion && !lock
+  const showLoader = supports.loader && usesLoader(kind) && filters.loaders.length > 0 && !lock
   const showCategory = supports.categories && filters.categories.length > 0
   const showEnvironment = supports.environment === true && kind === 'mod'
   const showLicense = supports.openSource === true
@@ -74,6 +77,28 @@ export function DiscoverSidebar({ kind, filters, values, hasActive, onChange, on
           />
         </div>
       </div>
+
+      {lock && (
+        <FilterSection title={t('discover.section.profile')}>
+          <ul className="grid gap-1.5 px-1.5 py-1 text-[13.5px] text-muted">
+            {supports.gameVersion && (
+              <li className="flex items-center gap-2">
+                <Icon icon="lucide:gamepad-2" aria-hidden="true" className="size-3.5 shrink-0" />
+                {t('discover.locked.version', { version: lock.gameVersion })}
+              </li>
+            )}
+            {supports.loader && usesLoader(kind) && lock.loader && (
+              <li className="flex items-center gap-2">
+                <Icon icon="lucide:puzzle" aria-hidden="true" className="size-3.5 shrink-0" />
+                {t('discover.locked.loader', { loader: loaderLabel(lock.loader) })}
+              </li>
+            )}
+            {!(supports.loader && usesLoader(kind)) && (
+              <li className="text-[12.5px] text-subtle">{t('discover.locked.noLoader')}</li>
+            )}
+          </ul>
+        </FilterSection>
+      )}
 
       {showVersion && (
         <FilterSection title={t('discover.section.gameVersion')}>

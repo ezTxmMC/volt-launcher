@@ -28,6 +28,8 @@ export interface Settings {
   javaRuntimes: JavaRuntimeOverride[]
   closeOnLaunch: boolean
   openLogsOnLaunch: boolean
+  /** Several profiles may run at the same time (default true). Off: a second launch is answered with 409. */
+  multiProfile: boolean
   downloadThreads: number
   backupsToKeep: number
   backupBeforePackUpdate: boolean
@@ -121,6 +123,11 @@ export interface ProfileSyncPackRef {
   kind: SyncPackKind
 }
 
+/** An entry the last apply could not install, with the reason the backend gave. */
+export interface ProfileSyncPackFailure extends ProfileSyncPackRef {
+  reason: string
+}
+
 /** One pack linked to a profile. */
 export interface ProfileSyncPack {
   packId: string
@@ -130,7 +137,9 @@ export interface ProfileSyncPack {
   overridden: ProfileSyncPackRef[]
   /** Removed by the user from this profile; not installed again. */
   declined: ProfileSyncPackRef[]
-  /** Pack entries that are not installed yet. */
+  /** What the last apply could not install (no fitting version, no mod loader, ...). */
+  failed: ProfileSyncPackFailure[]
+  /** Pack entries that are not installed yet (failed entries are not listed here). */
   missing: SyncPackEntry[]
 }
 
@@ -285,6 +294,13 @@ export interface SyncReportEntry {
   moved: number
   conflicts: number
   status: string
+}
+
+/** One entry of POST /api/profiles/:id/synced/heal: a detached link that was linked again, or why it could not be. */
+export interface SyncHealEntry {
+  key: SyncedFolder
+  status: 'healed' | 'failed'
+  message?: string
 }
 
 /** What PATCH /api/profiles/:id answers for `synced`: the profile plus the report of the folders that changed. */
@@ -469,6 +485,8 @@ export interface Job {
   message: string
   error: string | null
   result: Record<string, unknown> | null
+  /** The profile the job works on; null while it is not known yet (a pack install before the profile exists). */
+  profileId: string | null
   createdAt: string
   finishedAt: string | null
 }
@@ -579,6 +597,22 @@ export interface GameStatus {
   stopping: boolean
   phase: GamePhase
   lastExit: { exitCode: number; crashed: boolean; endedAt: string; seconds: number } | null
+}
+
+/** One running game of `GET /api/games` (running games only, oldest first). */
+export interface RunningGame {
+  profileId: string
+  name: string
+  pid: number | null
+  /** ISO time the game process started. */
+  startedAt: string
+  uptimeSeconds: number
+  stopping: boolean
+}
+
+export interface RunningGamesView {
+  games: RunningGame[]
+  multiProfile: boolean
 }
 
 /**

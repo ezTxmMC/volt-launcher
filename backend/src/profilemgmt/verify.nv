@@ -159,6 +159,7 @@ define class VerifyJob based JobBody {
     private bool repair: get, set
 
     method execute(string jobId): object {
+        core.jobSetProfile(jobId, profileId)
         var outcome = core.runTrapped(VerifyTask{profileId = profileId, repair = repair, jobId = jobId})
         launch.launchReleaseProfile(profileId)
         if (outcome.failed()) {

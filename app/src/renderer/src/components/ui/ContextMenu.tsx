@@ -12,6 +12,8 @@ export interface ContextMenuItem {
   /** Destructive action, drawn in the danger colour. */
   danger?: boolean
   disabled?: boolean
+  /** Tooltip, e.g. why the entry is disabled. */
+  title?: string
   onSelect: () => void
 }
 
@@ -150,6 +152,7 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
             role="menuitem"
             tabIndex={-1}
             disabled={entry.disabled}
+            title={entry.title}
             onPointerEnter={() => {
               if (!entry.disabled) setActive(index)
             }}

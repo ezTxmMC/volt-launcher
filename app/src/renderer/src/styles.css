@@ -363,6 +363,23 @@
   .volt-indeterminate {
     animation: shimmer 1.6s ease-in-out infinite;
   }
+  /* Progress fill: accent gradient with a moving sheen. */
+  .volt-progress-fill {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  }
+  .volt-progress-fill::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.35), transparent);
+    transform: translateX(-100%);
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+  .volt-indeterminate.volt-progress-fill::after {
+    display: none;
+  }
 
   /* Tabs (Tabs.tsx): the pill behind the active tab slides to it. */
   .volt-tab-indicator {
@@ -386,6 +403,10 @@
   :root[data-no-animations] .volt-skeleton::after {
     opacity: 0;
   }
+  :root[data-no-animations] .volt-progress-fill::after {
+    animation: none;
+    display: none;
+  }
   :root[data-no-animations] .volt-indeterminate {
     width: 100%;
     opacity: 0.35;
@@ -397,6 +418,10 @@
     }
     .volt-skeleton::after {
       opacity: 0;
+    }
+    .volt-progress-fill::after {
+      animation: none;
+      display: none;
     }
     .volt-indeterminate {
       width: 100%;

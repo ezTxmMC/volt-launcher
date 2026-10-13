@@ -58,6 +58,7 @@ final SYSTEM_URL_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 var systemUpdateLock = thread.mutex()
 var systemUpdateCache = {}       // the last UpdateInfo, with downloadUrl
 var systemUpdateCachedAt = 0     // unix seconds of that check
+var systemUpdateCachedBeta = false // whether beta updates were on for it
 
 // --- platforms ------------------------------------------------------------------
 
@@ -545,12 +546,15 @@ method systemUpdateCheck(bool force): map<string, object> {
     var now = time.now()
     var text = ""
     var cachedAt = 0
+    var cachedBeta = false
     sync (systemUpdateLock) {
         text = json.stringify(systemUpdateCache)
         cachedAt = systemUpdateCachedAt
+        cachedBeta = systemUpdateCachedBeta
     }
     var cached = json.parse(text)
-    if (force == false && cached.has("latestVersion") && now - cachedAt < SYSTEM_UPDATE_CACHE_SECONDS) {
+    var betaNow = core.setting("betaUpdates") == true
+    if (force == false && cachedBeta == betaNow && cached.has("latestVersion") && now - cachedAt < SYSTEM_UPDATE_CACHE_SECONDS) {
         return cached
     }
     var outcome = core.runTrapped(SystemUpdateFetchTask{})
@@ -566,6 +570,7 @@ method systemUpdateCheck(bool force): map<string, object> {
     sync (systemUpdateLock) {
         systemUpdateCache = copy
         systemUpdateCachedAt = now
+        systemUpdateCachedBeta = betaNow
     }
     return json.parse(stored)
 }

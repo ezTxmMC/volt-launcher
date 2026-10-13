@@ -148,3 +148,52 @@ method zipReadNamed(string data, map<string, object> entries, string name, integ
     }
     return zipRead(data, entries[name], limit)
 }
+
+// Like zipEntries, but only the entries whose name is in `wanted` are collected. Nothing is built
+// for the other entries (a big jar has thousands), so reading the metadata of a jar stays cheap.
+method zipEntriesNamed(string data, array wanted): map<string, object> {
+    var eocd = findEocd(data)
+    if (eocd < 0) {
+        core.raise("not a zip archive (no end of central directory record)")
+    }
+    var count = le16(data, eocd + 10)
+    var directorySize = le32(data, eocd + 12)
+    var directoryOffset = le32(data, eocd + 16)
+    if (count == 0xFFFF || directorySize == 0xFFFFFFFF || directoryOffset == 0xFFFFFFFF) {
+        core.raise("zip64 archives are not supported")
+    }
+    if (directoryOffset + directorySize > eocd) {
+        core.raise("central directory lies outside the archive")
+    }
+    var lengths = []
+    for (name in wanted) {
+        lengths.append(bytes.size(name))
+    }
+    var found = {}
+    var at = directoryOffset
+    var i = 0
+    while (i < count) {
+        if (at + 46 > eocd || le32(data, at) != CENTRAL_SIGNATURE) {
+            core.raise("broken central directory at entry " + i)
+        }
+        var nameLength = le16(data, at + 28)
+        if (at + 46 + nameLength > eocd) {
+            core.raise("broken central directory at entry " + i)
+        }
+        if (lengths.contains(nameLength)) {
+            var name = bytes.slice(data, at + 46, at + 46 + nameLength)
+            if (wanted.contains(name)) {
+                found[name] = {
+                    "flags": le16(data, at + 8),
+                    "method": le16(data, at + 10),
+                    "compressedSize": le32(data, at + 20),
+                    "size": le32(data, at + 24),
+                    "offset": le32(data, at + 42)
+                }
+            }
+        }
+        at = at + 46 + nameLength + le16(data, at + 30) + le16(data, at + 32)
+        i = i + 1
+    }
+    return found
+}

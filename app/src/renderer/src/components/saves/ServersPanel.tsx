@@ -9,6 +9,7 @@ import { useToast } from '@/state/toast'
 import { JobRow } from '@/components/JobRow'
 import { ConfirmModal } from '@/components/ConfirmModal'
 import { Stagger } from '@/components/motion/Stagger'
+import { useLaunchBlock } from '@/state/games'
 import { launchFailureText, useGameBusy, useLaunchProfile } from '@/components/home/hooks/useLaunchProfile'
 import { Badge } from '@/components/ui/Badge'
 import { Button, IconButton } from '@/components/ui/Button'
@@ -39,7 +40,8 @@ export function ServersPanel({ profile }: { profile: Profile }) {
   })
 
   const ownJobs = jobs.filter((job) => jobIds.includes(job.id) && job.state === 'running')
-  const joinDisabled = gameBusy || ownJobs.length > 0 || joining !== null
+  const launchBlock = useLaunchBlock(profile.id)
+  const joinDisabled = gameBusy || launchBlock.blocked || ownJobs.length > 0 || joining !== null
 
   const join = async (server: ServerInfo): Promise<void> => {
     setJoining(server.index)
@@ -107,7 +109,7 @@ export function ServersPanel({ profile }: { profile: Profile }) {
                   variant="primary"
                   size="sm"
                   icon="lucide:play"
-                  title={t('quickPlay.joinTitle', { address: server.address })}
+                  title={launchBlock.reason ?? t('quickPlay.joinTitle', { address: server.address })}
                   disabled={joinDisabled}
                   loading={joining === server.index}
                   onClick={() => void join(server)}

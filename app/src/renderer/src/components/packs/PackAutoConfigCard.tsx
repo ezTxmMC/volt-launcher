@@ -13,7 +13,7 @@ import { SYNC_AUTO_LOADERS, autoLoaderOrDefault, autoVersionsOrDefault, packIdsO
  * The switch, loader, version kind and the packs of the automatic profiles. Everything is saved with one
  * settings PATCH.
  */
-export function SyncPackAutoConfigCard({ packs }: { packs: readonly SyncPack[] }) {
+export function PackAutoConfigCard({ packs }: { packs: readonly SyncPack[] }) {
   const { t } = useI18n()
   const { settings, update } = useSettings()
   const toast = useToast()

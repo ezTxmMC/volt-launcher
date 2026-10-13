@@ -10,6 +10,7 @@ import { useToast } from '@/state/toast'
 import { ConfirmModal } from '@/components/ConfirmModal'
 import { Stagger } from '@/components/motion/Stagger'
 import { JobRow } from '@/components/JobRow'
+import { useLaunchBlock } from '@/state/games'
 import { launchFailureText, useGameBusy, useLaunchProfile } from '@/components/home/hooks/useLaunchProfile'
 import { Badge } from '@/components/ui/Badge'
 import { Button, IconButton } from '@/components/ui/Button'
@@ -39,6 +40,7 @@ export function WorldsPanel({ profile }: { profile: Profile }) {
   const [jobIds, setJobIds] = useState<readonly string[]>([])
   const launchGame = useLaunchProfile()
   const { busy: gameBusy, reload: reloadGame } = useGameBusy(profile.id)
+  const launchBlock = useLaunchBlock(profile.id)
   // Folder name of the world whose launch request is in flight; the launch job shows in the activity list.
   const [starting, setStarting] = useState<string | null>(null)
 
@@ -123,8 +125,8 @@ export function WorldsPanel({ profile }: { profile: Profile }) {
                   variant="primary"
                   size="sm"
                   icon="lucide:play"
-                  title={t('quickPlay.playTitle', { name: world.name })}
-                  disabled={gameBusy || !world.readable || starting !== null}
+                  title={launchBlock.reason ?? t('quickPlay.playTitle', { name: world.name })}
+                  disabled={gameBusy || launchBlock.blocked || !world.readable || starting !== null}
                   loading={starting === world.folderName}
                   onClick={() => void play(world)}
                 >

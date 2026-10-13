@@ -1,16 +1,20 @@
 import { type MouseEvent, useState } from 'react'
 import { Link } from 'react-router'
 import { Icon } from '@iconify/react'
-import type { Profile } from '@shared/models'
+import type { Job, Profile, ProfileListItem } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
-import { formatRelative } from '@/lib/format'
+import { formatClock, formatRelative } from '@/lib/format'
+import { jobActivityLabel, jobProgress, phaseActivityLabel } from '@/lib/jobLabels'
 import { LOADER_NAMES } from '@/lib/labels'
+import { useGames } from '@/state/games'
 import { useToast } from '@/state/toast'
 import { ConfirmModal } from './ConfirmModal'
+import { useUptime } from './games/RunningGameRow'
 import { ProfileContextMenu } from './profile/ProfileContextMenu'
 import { ART_STYLE, ProfileLogo } from './profile/logo/ProfileLogo'
 import { Badge } from './ui/Badge'
+import { ProgressBar } from './ui/Feedback'
 
 /** Shows the chosen icon, or the initial on the card art when there is none. */
 export function ProfileAvatar({
@@ -39,6 +43,21 @@ export function ProfileAvatar({
   )
 }
 
+/** "Läuft" badge with the live running time of the game (from the running games list). */
+function RunningBadge({ profileId }: { profileId: string }) {
+  const { t } = useI18n()
+  const { entryOf } = useGames()
+  const startedAt = entryOf(profileId)?.startedAt ?? null
+  const uptime = useUptime(startedAt)
+  return (
+    <span className="absolute top-2 left-2 inline-flex items-center gap-1 rounded-[4px] bg-success-soft px-1.5 py-0.5 text-[11px] font-semibold text-success">
+      <span className="size-1.5 rounded-full bg-success" />
+      {t('profiles.running')}
+      {uptime !== null && <span className="tabular-nums">{`· ${formatClock(uptime)}`}</span>}
+    </span>
+  )
+}
+
 /** Compact play time: "3 h 20 min", "45 min", "0 min". */
 export function formatPlaytime(ms: number): string {
   const minutes = Math.floor(ms / 60000)
@@ -54,6 +73,8 @@ export interface ProfileCardProps {
   onToggleFavourite?: (profile: Profile) => void
   /** Called after the card's context menu changed the profile list (favourite, delete). */
   onChanged?: () => void
+  /** The running job that works on this profile (install, update, launch ...): the card shows its progress. */
+  job?: Job
 }
 
 /**
@@ -61,10 +82,14 @@ export interface ProfileCardProps {
  * accent values that are the same in both themes (the old `--accent-border-hover` token was never
  * defined, so the border fell back to the text colour: white in the dark theme).
  */
-export function ProfileCard({ profile, running = false, onToggleFavourite, onChanged }: ProfileCardProps) {
+export function ProfileCard({ profile, running = false, onToggleFavourite, onChanged, job }: ProfileCardProps) {
   const { t, language } = useI18n()
   const toast = useToast()
   const favourite = profile.favourite === true
+  const phase = 'phase' in profile ? (profile as ProfileListItem).phase : 'idle'
+  const phaseLabel = phaseActivityLabel(phase)
+  const busyLabel = job ? jobActivityLabel(job.kind) : phaseLabel
+  const busy = busyLabel !== null
   const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
@@ -83,16 +108,11 @@ export function ProfileCard({ profile, running = false, onToggleFavourite, onCha
     <div className="relative h-48" onContextMenu={openMenu}>
       <Link
         to={`/profiles/${profile.id}`}
-        className="flex h-full flex-col overflow-hidden rounded-xl border border-line bg-[var(--card-solid)] text-left backface-hidden transition-[transform,border-color] duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:translate-y-[var(--motion-lift)] hover:border-[rgba(0,178,255,0.4)] hover:shadow-[inset_0_0_0_9999px_rgba(0,178,255,0.06)]"
+        className="relative flex h-full flex-col overflow-hidden rounded-xl border border-line bg-[var(--card-solid)] text-left backface-hidden transition-[transform,border-color] duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:translate-y-[var(--motion-lift)] hover:border-[rgba(0,178,255,0.4)] hover:shadow-[inset_0_0_0_9999px_rgba(0,178,255,0.06)]"
       >
         <div className="relative h-[100px] shrink-0 overflow-hidden rounded-t-xl border-b border-black/40" style={ART_STYLE}>
           <ProfileLogo profile={profile} />
-          {running && (
-            <span className="absolute top-2 left-2 inline-flex items-center gap-1 rounded-[4px] bg-success-soft px-1.5 py-0.5 text-[11px] font-semibold text-success">
-              <span className="size-1.5 rounded-full bg-success" />
-              {t('profiles.running')}
-            </span>
-          )}
+          {running && <RunningBadge profileId={profile.id} />}
         </div>
         <div className="flex min-h-0 flex-1 flex-col justify-center px-3 py-2.5">
           <h3 className="mb-1.5 truncate text-[15.5px] leading-[1.35] font-semibold" title={profile.name}>
@@ -109,6 +129,23 @@ export function ProfileCard({ profile, running = false, onToggleFavourite, onCha
               : t('profiles.neverPlayed')}
           </p>
         </div>
+        {busyLabel && (
+          <div
+            className="pointer-events-none absolute inset-x-0 bottom-0 flex h-[92px] flex-col justify-center gap-1.5 border-t border-line bg-[var(--card-solid)]/90 px-3 backdrop-blur-sm"
+            role="status"
+          >
+            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-accent">
+              <Icon icon="lucide:loader-circle" className="size-3.5 animate-spin" />
+              {t(busyLabel)}
+            </span>
+            <ProgressBar
+              value={jobProgress(job)}
+              label={job?.title ?? t(busyLabel)}
+              showPercent
+              caption={job?.message || undefined}
+            />
+          </div>
+        )}
       </Link>
       {onToggleFavourite && (
         <button
@@ -129,7 +166,7 @@ export function ProfileCard({ profile, running = false, onToggleFavourite, onCha
       {menuAt && (
         <ProfileContextMenu
           profile={profile}
-          running={running}
+          running={running || busy}
           x={menuAt.x}
           y={menuAt.y}
           onClose={() => setMenuAt(null)}

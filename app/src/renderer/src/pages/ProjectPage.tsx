@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Icon } from '@iconify/react'
 import { useNavigate, useParams } from 'react-router'
 import type { Profile, ProjectVersion, ProviderId, SortOption } from '@shared/models'
@@ -24,6 +24,7 @@ import { Select } from '@/components/ui/Select'
 import { ProjectIcon } from '@/components/ui/ProjectIcon'
 import { ChoiceFilter } from '@/components/discover/filters/FilterFields'
 import { loaderChoices, loaderLabel } from '@/components/discover/filters/model'
+import { useInstallTarget } from '@/components/discover/useInstallTarget'
 import { useProviderFilters } from '@/components/discover/useProviderFilters'
 
 const NO_SORTS: SortOption[] = []
@@ -55,7 +56,8 @@ export function ProjectPage() {
   const loadProfiles = useCallback(() => api.profiles.list(), [])
   const { data: profiles } = useAsync(loadProfiles)
 
-  const [targetId, setTargetId] = useState('')
+  // The install target is the one chosen in Discover (or `?profile=`); it is kept for the session.
+  const [targetId, setTargetId] = useInstallTarget()
   const [picking, setPicking] = useState<ProjectVersion | null>(null)
   const [withDependencies, setWithDependencies] = useState(true)
   const [packVersion, setPackVersion] = useState<ProjectVersion | null>(null)
@@ -70,12 +72,25 @@ export function ProjectPage() {
   const filterGameVersion = versionFilters?.supports.gameVersion && gameVersion ? gameVersion : undefined
   const filterLoader = versionFilters?.supports.loader && loaderFilter ? loaderFilter : undefined
 
+  const applyProfileFilters = useCallback(
+    (chosen: Profile | undefined): void => {
+      setGameVersion(chosen?.minecraftVersion ?? '')
+      setLoaderFilter(chosen && project?.kind === 'mod' && chosen.loader !== 'vanilla' ? chosen.loader : '')
+    },
+    [project?.kind]
+  )
   const chooseProfile = (profileId: string): void => {
-    const chosen = profiles?.find((profile) => profile.id === profileId)
     setTargetId(profileId)
-    setGameVersion(chosen?.minecraftVersion ?? '')
-    setLoaderFilter(chosen && project?.kind === 'mod' && chosen.loader !== 'vanilla' ? chosen.loader : '')
+    applyProfileFilters(profiles?.find((profile) => profile.id === profileId))
   }
+
+  // A target that was chosen before the page opened fills the version filters once its data is there.
+  const filled = useRef('')
+  useEffect(() => {
+    if (!target || !project || filled.current === `${target.id}|${project.id}`) return
+    filled.current = `${target.id}|${project.id}`
+    applyProfileFilters(target)
+  }, [target, project, applyProfileFilters])
 
   const loadVersions = useCallback(
     () => api.providers.versions(providerId, id, { gameVersion: filterGameVersion, loader: filterLoader }),

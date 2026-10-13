@@ -32,7 +32,7 @@ const RESULT_TONES: Record<SyncPackAutoResult['status'], Tone> = {
 }
 
 /** Status of the automatic creation, the manual check, and the profile for one chosen version. */
-export function SyncPackAutoStatusCard() {
+export function PackAutoStatusCard() {
   const { t, language } = useI18n()
   const { settings } = useSettings()
   const toast = useToast()
@@ -115,7 +115,7 @@ export function SyncPackAutoStatusCard() {
             {t('syncpacks.check')}
           </Button>
         </div>
-        {running && job && <ProgressBar value={job.progress > 0 ? job.progress : null} label={job.title} />}
+        {running && job && <ProgressBar value={job.progress > 0 ? job.progress : null} label={job.title} showPercent caption={job.message || undefined} />}
 
         <div className="flex flex-wrap items-end gap-3">
           <div className="min-w-0 flex-1 basis-56">

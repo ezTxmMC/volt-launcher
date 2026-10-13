@@ -39,10 +39,12 @@ export function useGameBusy(profileId: string): { busy: boolean; reload: () => v
 }
 
 /**
- * Text of a failed launch for a toast. A 409 (the game is already running) gets `runningText`;
- * every other error shows the backend's message, including 400, 404 and 422.
+ * Text of a failed launch for a toast: the backend's message, including 409 (it names the running
+ * profile when several at once are switched off), 400, 404 and 422. `runningText` is the fallback
+ * for a 409 that came without a message.
  */
 export function launchFailureText(error: unknown, runningText: string): string {
+  const message = errorMessage(error).trim()
   const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : undefined
-  return status === 409 ? runningText : errorMessage(error)
+  return status === 409 && message === '' ? runningText : message
 }

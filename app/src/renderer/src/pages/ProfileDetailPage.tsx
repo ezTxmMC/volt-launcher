@@ -12,14 +12,15 @@ import { Page } from '@/components/ui/Page'
 import { type TabItem, Tabs } from '@/components/ui/Tabs'
 import { ModsTab } from './profile/ModsTab'
 import { DataPacksTab, ResourcePacksTab, ShaderPacksTab } from './profile/ContentTypeTabs'
+import { DiscoverTab } from './profile/DiscoverTab'
 import { ModpackTab } from './profile/ModpackTab'
 import { OverviewTab } from './profile/OverviewTab'
 import { PlayControls } from './profile/PlayControls'
 import { SettingsTab } from './profile/SettingsTab'
 
-type TabId = 'overview' | 'mods' | 'resourcepacks' | 'shaderpacks' | 'datapacks' | 'modpack' | 'settings'
+type TabId = 'overview' | 'discover' | 'mods' | 'resourcepacks' | 'shaderpacks' | 'datapacks' | 'modpack' | 'settings'
 
-const TAB_IDS: readonly TabId[] = ['overview', 'mods', 'resourcepacks', 'shaderpacks', 'datapacks', 'modpack', 'settings']
+const TAB_IDS: readonly TabId[] = ['overview', 'discover', 'mods', 'resourcepacks', 'shaderpacks', 'datapacks', 'modpack', 'settings']
 
 export function ProfileDetailPage() {
   const { t } = useI18n()
@@ -33,6 +34,7 @@ export function ProfileDetailPage() {
 
   const tabs: readonly TabItem<TabId>[] = [
     { id: 'overview', label: t('profile.tab.overview'), icon: 'lucide:sliders-horizontal' },
+    { id: 'discover', label: t('profile.tab.discover'), icon: 'lucide:compass' },
     { id: 'mods', label: t('profile.tab.mods'), icon: 'lucide:puzzle' },
     { id: 'resourcepacks', label: t('profile.tab.resourcepacks'), icon: 'lucide:image' },
     { id: 'shaderpacks', label: t('profile.tab.shaderpacks'), icon: 'lucide:sparkles' },
@@ -92,6 +94,7 @@ export function ProfileDetailPage() {
       </div>
 
       {tab === 'overview' && <OverviewTab profile={profile} onChanged={reload} />}
+      {tab === 'discover' && <DiscoverTab key={profile.id} profile={profile} />}
       {tab === 'mods' && <ModsTab profile={profile} />}
       {tab === 'resourcepacks' && <ResourcePacksTab profile={profile} />}
       {tab === 'shaderpacks' && <ShaderPacksTab profile={profile} />}

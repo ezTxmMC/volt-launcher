@@ -12,12 +12,14 @@ interface QuickPlayStripProps {
   loading: boolean
   error: string | null
   disabled: boolean
+  /** Tooltip of the entries while they are disabled for a reason the user can act on. */
+  disabledReason?: string
   /** Starts the selected profile and joins the given server. */
   onLaunch: (server: ServerInfo) => void
 }
 
 /** Full-width strip under the launch panel: the label, then the profile's servers as quick entries. */
-export function QuickPlayStrip({ servers, loading, error, disabled, onLaunch }: QuickPlayStripProps) {
+export function QuickPlayStrip({ servers, loading, error, disabled, disabledReason, onLaunch }: QuickPlayStripProps) {
   const { t } = useI18n()
   const { settings } = useSettings()
   const shown = servers.slice(0, QUICK_PLAY_LIMIT)
@@ -34,7 +36,7 @@ export function QuickPlayStrip({ servers, loading, error, disabled, onLaunch }: 
           <li key={server.index} className="min-w-0 max-w-full">
             <button
               type="button"
-              title={t('quickPlay.joinTitle', { address: server.address })}
+              title={disabled && disabledReason ? disabledReason : t('quickPlay.joinTitle', { address: server.address })}
               disabled={disabled}
               onClick={() => onLaunch(server)}
               className="flex max-w-[240px] items-center gap-2 rounded-lg border border-line bg-surface-3 px-2.5 py-1.5 text-[13.5px] font-semibold text-muted transition-colors hover:bg-line hover:text-fg disabled:cursor-not-allowed disabled:opacity-50"

@@ -64,7 +64,7 @@ export function JobRow({
           </button>
         )}
       </div>
-      {running && <ProgressBar value={job.progress > 0 ? job.progress : null} label={job.title} />}
+      {running && <ProgressBar value={job.progress > 0 ? job.progress : null} label={job.title} showPercent />}
     </div>
   )
 }

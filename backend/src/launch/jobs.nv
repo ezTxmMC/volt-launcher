@@ -177,6 +177,7 @@ define class LaunchJob based JobBody {
     private map<string, object> quickPlay: get, set
 
     method execute(string jobId): object {
+        core.jobSetProfile(jobId, profileId)
         var outcome = core.runTrapped(LaunchPipelineTask{profileId = profileId, jobId = jobId, start = start, quickPlay = quickPlay})
         launchReleaseProfile(profileId)
         if (outcome.failed()) {

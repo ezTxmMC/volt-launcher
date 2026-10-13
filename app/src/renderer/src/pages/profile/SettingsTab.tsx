@@ -108,6 +108,7 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
   // The list being saved (or just saved); it applies only while profile.synced is still the one it was made from.
   const [draft, setDraft] = useState<{ base: readonly SyncedFolder[] | undefined; list: SyncedFolder[] } | null>(null)
   const [saving, setSaving] = useState<SyncedFolder | null>(null)
+  const [healing, setHealing] = useState(false)
   const current: readonly SyncedFolder[] = draft && draft.base === profile.synced ? draft.list : (profile.synced ?? [])
   const running = game?.running === true
 
@@ -132,6 +133,29 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
       reloadGame()
     } finally {
       setSaving(null)
+    }
+  }
+
+  // The game can replace a link with a real file (servers.dat); the backend relinks it, and this does it now.
+  const heal = async (): Promise<void> => {
+    if (healing || saving !== null || running) return
+    setHealing(true)
+    try {
+      const { report } = await api.profiles.healSynced(profile.id)
+      const healed = report.filter((entry) => entry.status === 'healed')
+      const failed = report.filter((entry) => entry.status === 'failed')
+      const nameOf = (key: SyncedFolder): string =>
+        t(SYNCED_ITEMS.find((item) => item.key === key)?.label.profile ?? 'profile.synced.title')
+      if (report.length === 0) toast.success(t('profile.synced.heal.none'))
+      else if (failed.length === 0) toast.success(t('profile.synced.heal.healed', { count: healed.length }))
+      else {
+        const lines = failed.map((entry) => `${nameOf(entry.key)}: ${entry.message ?? t('profile.synced.heal.noMessage')}`)
+        toast.notify('error', `${t('profile.synced.heal.summary', { healed: healed.length, failed: failed.length })}\n${lines.join('\n')}`, t('profile.synced.heal.title'))
+      }
+    } catch (error) {
+      toast.error(error)
+    } finally {
+      setHealing(false)
     }
   }
 
@@ -171,6 +195,17 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
           )
         })}
       </ul>
+      <div className="flex flex-wrap items-center gap-3">
+        <Button
+          icon="lucide:link-2"
+          loading={healing}
+          disabled={running || saving !== null || (profile.synced ?? []).length === 0}
+          onClick={() => void heal()}
+        >
+          {t('profile.synced.heal')}
+        </Button>
+        <span className="min-w-0 flex-1 basis-64 text-[12px] leading-[1.5] text-subtle">{t('profile.synced.heal.hint')}</span>
+      </div>
     </Section>
   )
 }

@@ -1,8 +1,11 @@
 import { Icon } from '@iconify/react'
 import { NavLink, Outlet } from 'react-router'
 import { useI18n } from '@/i18n'
+import { useJobs } from '@/state/jobs'
 import type { MessageKey } from '@/i18n'
+import { ProgressBar } from './ui/Feedback'
 import { AuroraBackground } from './AuroraBackground'
+import { GamesButton } from './games/GamesButton'
 import { JobsButton } from './JobsPanel'
 import { Wordmark } from './Wordmark'
 import { WindowControls } from './WindowControls'
@@ -18,8 +21,9 @@ interface RailItem {
 /** Left rail. The main items sit at the top; News and Settings sit at the bottom. Chat and Clips are not offered yet (no backend). */
 const RAIL_TOP: readonly RailItem[] = [
   { to: '/', label: 'rail.play', icon: 'lucide:gamepad-2' },
-  { to: '/profiles', label: 'rail.instances', icon: 'lucide:layers' },
+  { to: '/profiles', label: 'rail.profiles', icon: 'lucide:layers' },
   { to: '/discover', label: 'rail.discover', icon: 'lucide:search' },
+  { to: '/packs', label: 'rail.packs', icon: 'lucide:package-plus' },
   { to: '/skins', label: 'rail.character', icon: 'lucide:user-round' }
 ]
 
@@ -69,11 +73,26 @@ function TopBar() {
     <header className="app-drag relative z-[60] flex h-[52px] shrink-0 items-center gap-3 pr-2 pl-4">
       <Wordmark />
       <div className="app-no-drag ml-auto flex min-w-0 shrink-0 items-center gap-2">
+        <GamesButton />
         <JobsButton />
         <AccountMenu />
         <WindowControls />
       </div>
     </header>
+  )
+}
+
+/** Slim line under the top bar: average progress of the running jobs; indeterminate while none reports one. */
+function GlobalProgress() {
+  const { jobs } = useJobs()
+  const { t } = useI18n()
+  const running = jobs.filter((job) => job.state === 'running')
+  const known = running.filter((job) => job.progress > 0)
+  const value = known.length === 0 ? null : running.reduce((sum, job) => sum + job.progress, 0) / running.length
+  return (
+    <div className="relative z-[55] h-1 shrink-0 px-2">
+      {running.length > 0 && <ProgressBar value={value} label={t('jobs.title')} size="sm" />}
+    </div>
   )
 }
 
@@ -83,6 +102,7 @@ export function Shell() {
     <div className="relative flex h-full flex-col overflow-hidden bg-bg text-fg antialiased">
       <AuroraBackground />
       <TopBar />
+      <GlobalProgress />
       <div className="relative z-10 flex min-h-0 flex-1 gap-2 px-2 pb-2">
         <Rail />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-2xl border border-line bg-surface shadow-pop">

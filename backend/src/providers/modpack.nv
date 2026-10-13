@@ -275,6 +275,8 @@ method applyPackUpdate(string jobId, string profileId, string provider, string p
     var previous = readPackRecord(gameDir)
     var staging = stagingDir(jobId)
     var state = newPackState(profileId, true, "")
+    state.jobId(jobId)
+    core.jobSetProfile(jobId, profileId)
     var outcome = core.runTrapped(PvPackTask{
         jobId = jobId, provider = provider, projectId = projectId, versionId = versionId,
         staging = staging, state = state
@@ -380,6 +382,7 @@ define class PvImportJob based JobBody {
 
     method execute(string jobId): object {
         var state = newPackState("", false, name)
+        state.jobId(jobId)
         var outcome = core.runTrapped(PvImportTask{jobId = jobId, file = file, name = name, state = state})
         var profileId = state.profileId()
         releaseBusy(profileId)

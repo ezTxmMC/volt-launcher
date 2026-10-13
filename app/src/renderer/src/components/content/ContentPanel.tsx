@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react'
 import { Icon } from '@iconify/react'
 import { useNavigate } from 'react-router'
-import type { ContentType, DependencyWarning, Job, ModFile, Profile } from '@shared/models'
+import type { ContentType, DependencyWarning, Job, ModFile, Profile, SyncPackEntry } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
 import { formatBytes } from '@/lib/format'
@@ -17,6 +17,7 @@ import { Button, IconButton } from '@/components/ui/Button'
 import { EmptyState, ErrorNotice, LoadingBlock } from '@/components/ui/Feedback'
 import { TextInput } from '@/components/ui/Field'
 import { Switch } from '@/components/ui/Switch'
+import { AddToPackDialog, packKindOf } from '@/components/packs/AddToPackDialog'
 import { VersionDialog } from './VersionDialog'
 
 /** Name shown for a file: the mod's own name, else the project name, else the file name. */
@@ -65,6 +66,8 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
   const [jobIds, setJobIds] = useState<readonly string[]>([])
   const [removing, setRemoving] = useState<ModFile | null>(null)
   const [versionsOf, setVersionsOf] = useState<ModFile | null>(null)
+  const [packEntry, setPackEntry] = useState<SyncPackEntry | null>(null)
+  const packKind = packKindOf(type)
 
   // Any finished job may have changed the folder, so refresh the lists.
   useJobFinished((job) => {
@@ -246,7 +249,7 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
           action={
             <div className="flex flex-wrap justify-center gap-2">
               {/* Same Button as the folder action, so both have the same size. */}
-              <Button variant="primary" icon="lucide:compass" onClick={() => navigate(`/discover?kind=${DISCOVER_KIND[type]}`)}>
+              <Button variant="primary" icon="lucide:compass" onClick={() => navigate(`/discover?kind=${DISCOVER_KIND[type]}&profile=${encodeURIComponent(profile.id)}`)}>
                 {t('content.empty.discover')}
               </Button>
               {window.volt && (
@@ -271,12 +274,14 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
                   key={file.fileName}
                   file={file}
                   isMods={isMods}
+                  packKind={packKind}
                   busy={rowBusy.has(file.fileName)}
                   locked={jobRunning}
                   sizeLabel={formatBytes(file.size, language)}
                   onToggle={() => void toggle(file)}
                   onUpdate={() => void updateOne(file)}
                   onVersions={() => setVersionsOf(file)}
+                  onAddToPack={(entry) => setPackEntry(entry)}
                   onRemove={() => setRemoving(file)}
                 />
               ))}
@@ -299,6 +304,8 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
         />
       )}
 
+      {packEntry && <AddToPackDialog entry={packEntry} onClose={() => setPackEntry(null)} />}
+
       {versionsOf && (
         <VersionDialog
           profile={profile}
@@ -316,19 +323,30 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
   )
 }
 
+/** The pack entry a file stands for, or null when its source is unknown or not one packs can use. */
+function packEntryOf(file: ModFile, kind: SyncPackEntry['kind']): SyncPackEntry | null {
+  const source = file.source
+  if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge')) return null
+  return { provider: source.provider, projectId: source.projectId, kind, name: displayName(file), iconUrl: null }
+}
+
 function ContentRow({
   file,
   isMods,
+  packKind,
   busy,
   locked,
   sizeLabel,
   onToggle,
   onUpdate,
   onVersions,
+  onAddToPack,
   onRemove
 }: {
   file: ModFile
   isMods: boolean
+  /** The pack kind of this content type; null for data packs, which packs do not hold. */
+  packKind: SyncPackEntry['kind'] | null
   busy: boolean
   /** True while a job runs for this profile; blocks starting another update. */
   locked: boolean
@@ -336,10 +354,12 @@ function ContentRow({
   onToggle: () => void
   onUpdate: () => void
   onVersions: () => void
+  onAddToPack: (entry: SyncPackEntry) => void
   onRemove: () => void
 }) {
   const { t } = useI18n()
   const name = displayName(file)
+  const packEntry = packKind ? packEntryOf(file, packKind) : null
   return (
     <li className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-2 px-4 py-3 xl:grid-cols-[auto_1fr_auto_auto]">
       <Switch
@@ -361,6 +381,14 @@ function ContentRow({
         </div>
       </div>
       <div className="col-start-3 row-start-1 flex items-center gap-1 xl:col-start-4">
+        {packKind && (
+          <IconButton
+            icon="lucide:package-plus"
+            label={packEntry ? t('content.addToPack') : t('content.addToPack.unknown')}
+            onClick={() => packEntry && onAddToPack(packEntry)}
+            disabled={!packEntry}
+          />
+        )}
         <IconButton icon="lucide:history" label={t('content.changeVersion')} onClick={onVersions} disabled={busy || locked} />
         <IconButton
           icon="lucide:trash-2"

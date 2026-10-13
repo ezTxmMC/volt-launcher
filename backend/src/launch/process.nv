@@ -537,3 +537,40 @@ method launchEscalate(string profileId, integer pid) {
         launchSignal(pid, true)
     }
 }
+
+// --- running games overview -------------------------------------------------------------------
+
+// Every running game: [{profileId, pid, startedAt, uptimeSeconds, stopping}], oldest first.
+method launchRunningGames(): array {
+    var out = []
+    sync (launchGameLock) {
+        for (id in launchGames) {
+            var game = launchGames[id]
+            var seconds = time.clock() - game["clock"]
+            out.append({
+                "profileId": id, "pid": game["pid"], "startedAt": game["startedAt"],
+                "uptimeSeconds": seconds, "stopping": game["stopping"]
+            })
+        }
+    }
+    return out
+}
+
+// The id of a running game other than `except`, or "".
+method launchOtherRunning(string except): string {
+    var other = ""
+    sync (launchGameLock) {
+        for (id in launchGames) {
+            if (id != except && other == "") {
+                other = id
+            }
+        }
+        // A start that is still preparing (downloads, installs) counts as well.
+        for (id in launchBusyProfiles) {
+            if (id != except && other == "" && launchBusyProfiles[id] == "launch") {
+                other = id
+            }
+        }
+    }
+    return other
+}

@@ -64,6 +64,7 @@ method startJob(string kind, string title, JobBody body): map<string, object> {
         "message": "",
         "error": none(),
         "result": none(),
+        "profileId": none(),
         "createdAt": nowIso(),
         "finishedAt": none()
     }
@@ -159,6 +160,18 @@ method jobProgress(string id, float progress, string message) {
         if (jobsById.has(id) && jobsById[id]["state"] == "running") {
             jobsById[id]["progress"] = value
             jobsById[id]["message"] = message
+        }
+    }
+}
+
+// Tells which profile the job works on (shown on that profile's card while it runs). "" changes nothing.
+method jobSetProfile(string id, string profileId) {
+    if (id == "" || profileId == "") {
+        return
+    }
+    sync (jobLock) {
+        if (jobsById.has(id)) {
+            jobsById[id]["profileId"] = profileId
         }
     }
 }

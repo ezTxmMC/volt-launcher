@@ -66,6 +66,12 @@ export function GeneralSection() {
           checked={settings.openLogsOnLaunch}
           onChange={(openLogsOnLaunch) => void apply({ openLogsOnLaunch })}
         />
+        <ToggleRow
+          label={t('settings.multiProfile')}
+          hint={t('settings.multiProfile.hint')}
+          checked={settings.multiProfile !== false}
+          onChange={(multiProfile) => void apply({ multiProfile })}
+        />
         <div className="grid gap-2">
           <span className="font-medium">{t('settings.profileSort')}</span>
           <Segmented<ProfileSort>

@@ -317,6 +317,7 @@ define class PvPackState {
     private map<string, object> packSource: get, set    // the pack itself: {provider, projectId, versionId, name, kind}
     private map<string, object> fileSources: get, set   // game-relative path (lower case) -> the provider file it is
     private array content: get, set     // game-relative content paths the pack wrote (downloads and overrides)
+    private string jobId: get, set      // the job that runs it ("" = none): told which profile it creates
 
     method addFile(string rel) {
         if (isContentRel(rel) && files.contains(rel) == false) {
@@ -354,7 +355,7 @@ method packSourceMap(string provider, string projectId, string versionId, string
 
 // A fresh pack state: the profile it creates or (update) changes, no files yet.
 method newPackState(string profileId, bool update, string title): PvPackState {
-    return PvPackState{profileId = profileId, update = update, files = [], title = title, chosenName = "", packSource = {}, fileSources = {}, content = []}
+    return PvPackState{profileId = profileId, update = update, files = [], title = title, chosenName = "", packSource = {}, fileSources = {}, content = [], jobId = ""}
 }
 
 // --- sources of pack files --------------------------------------------------------------
@@ -545,6 +546,7 @@ method createPackProfile(PvPackState state, string name, map<string, object> loa
     }
     var created = core.createProfile(fields)
     state.profileId(created["id"])
+    core.jobSetProfile(state.jobId(), created["id"])
     claimBusy(created["id"], "pack-install")
     return core.profileDir(created["id"])
 }
@@ -590,6 +592,7 @@ define class PvPackInstallJob based JobBody {
 
     method execute(string jobId): object {
         var state = newPackState("", false, "")
+        state.jobId(jobId)
         state.chosenName(name)
         var staging = stagingDir(jobId)
         var outcome = core.runTrapped(PvPackTask{

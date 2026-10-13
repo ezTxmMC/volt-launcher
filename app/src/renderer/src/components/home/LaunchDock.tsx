@@ -14,6 +14,8 @@ interface LaunchDockProps {
   busy: boolean
   /** The play side is disabled (busy, or the game of this profile is running). */
   disabled: boolean
+  /** Tooltip of the play side, e.g. why it is disabled. */
+  playTitle?: string
   onLaunch: () => void
   onSelect: (id: string) => void
   /** Shown below the button, e.g. the job row of the launch. */
@@ -24,7 +26,7 @@ interface LaunchDockProps {
  * Tag with the profile's version and loader above a split button: the play side starts the
  * profile, the square side opens a popover to pick another profile.
  */
-export function LaunchDock({ profiles, profile, title, busy, disabled, onLaunch, onSelect, footer }: LaunchDockProps) {
+export function LaunchDock({ profiles, profile, title, busy, disabled, playTitle, onLaunch, onSelect, footer }: LaunchDockProps) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -60,6 +62,7 @@ export function LaunchDock({ profiles, profile, title, busy, disabled, onLaunch,
           type="button"
           onClick={onLaunch}
           disabled={disabled}
+          title={playTitle}
           className="flex min-w-0 flex-1 items-center gap-4 rounded-l-xl px-5 text-left transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-80 disabled:hover:bg-accent"
         >
           {busy ? (

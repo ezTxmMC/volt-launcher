@@ -51,7 +51,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         return [...current.slice(-3), { id, kind, title, message }]
       })
       // Also armed for a skipped toast: dismissing an id that is not shown is a no-op.
-      setTimeout(() => dismiss(id), kind === 'error' ? 8000 : 4500)
+      setTimeout(() => dismiss(id), kind === 'error' || message.length > 90 ? 8000 : 4500)
     },
     [dismiss]
   )
@@ -83,7 +83,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <Icon icon={ICONS[item.kind]} className={`mt-0.5 size-5 shrink-0 ${TONES[item.kind]}`} />
             <div className="min-w-0 flex-1">
               {item.title && <p className="text-[12px] font-bold tracking-[0.08em] uppercase">{item.title}</p>}
-              <p className="text-sm break-words">{item.message}</p>
+              <p className="text-sm break-words whitespace-pre-line">{item.message}</p>
             </div>
             <button
               type="button"

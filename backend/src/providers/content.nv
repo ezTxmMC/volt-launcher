@@ -141,6 +141,7 @@ define class PvContentInstallJob based JobBody {
     private string world: get, set
 
     method execute(string jobId): object {
+        core.jobSetProfile(jobId, profileId)
         claimBusy(profileId, "content-install")
         var outcome = core.runTrapped(PvContentTask{
             jobId = jobId, profileId = profileId, provider = provider,

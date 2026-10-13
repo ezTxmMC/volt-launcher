@@ -1,18 +1,21 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
-import type { Profile, ProfileListItem } from '@shared/models'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Job, Profile, ProfileListItem } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
 import { useAsync } from '@/lib/hooks'
 import { LOADER_NAMES } from '@/lib/labels'
+import { RunningStrip } from '@/components/games/RunningStrip'
 import { CreateProfileModal } from '@/components/CreateProfileModal'
 import { ImportProfilesDialog } from '@/components/imports/ImportProfilesDialog'
 import { Stagger } from '@/components/motion/Stagger'
 import { ProfileCard } from '@/components/ProfileCard'
+import { ProfilePlaceholderCard } from '@/components/ProfilePlaceholderCard'
 import { Button } from '@/components/ui/Button'
 import { Field, Select, TextInput } from '@/components/ui/Field'
 import { EmptyState, ErrorNotice, LoadingBlock } from '@/components/ui/Feedback'
 import { Page } from '@/components/ui/Page'
-import { useJobFinished } from '@/state/jobs'
+import { useGames } from '@/state/games'
+import { useJobFinished, useJobs } from '@/state/jobs'
 import { useToast } from '@/state/toast'
 
 type SortKey = 'lastPlayed' | 'name' | 'created' | 'playtime'
@@ -52,6 +55,8 @@ export function ProfilesPage() {
   const toast = useToast()
   const load = useCallback(() => api.profiles.list(), [])
   const { data: profiles, error, loading, reload } = useAsync(load)
+  const { jobs, cancel } = useJobs()
+  const { entries: gameEntries } = useGames()
   const [creating, setCreating] = useState(false)
   const [importing, setImporting] = useState(false)
   const [search, setSearch] = useState('')
@@ -70,6 +75,45 @@ export function ProfilesPage() {
     if (count === undefined) toast.success(t('imports.done.generic'))
     else toast.success(count === 1 ? t('imports.done.one') : t('imports.done.many', { count }))
   })
+
+  // Running jobs by profile (cards show their progress) and pack installs whose profile is not created yet.
+  const jobByProfile = useMemo(() => {
+    const map = new Map<string, Job>()
+    for (const job of jobs) if (job.state === 'running' && job.profileId && !map.has(job.profileId)) map.set(job.profileId, job)
+    return map
+  }, [jobs])
+  const placeholders = useMemo(
+    () => jobs.filter((job) => job.state === 'running' && !job.profileId && (job.kind === 'pack-install' || job.kind === 'pack-import')),
+    [jobs]
+  )
+  // The profile list reloads when a pack job learns its profile or leaves the running state.
+  const packJobKey = jobs
+    .filter((job) => job.kind === 'pack-install' || job.kind === 'pack-import')
+    .map((job) => `${job.id}:${job.state}:${job.profileId ?? ''}`)
+    .join('|')
+  const firstPackJobKey = useRef(packJobKey)
+  useEffect(() => {
+    if (firstPackJobKey.current === packJobKey) return
+    firstPackJobKey.current = packJobKey
+    reload()
+  }, [packJobKey, reload])
+  const cancelJob = (job: Job): void => {
+    cancel(job.id).catch((failure: unknown) => toast.error(failure))
+  }
+  const placeholderCards = placeholders.map((job) => <ProfilePlaceholderCard key={job.id} job={job} onCancel={cancelJob} />)
+
+  // Cards show the running state from the live games list; the profile list reloads when a game starts or ends.
+  const runningIds = useMemo(
+    () => new Set(gameEntries.filter((entry) => entry.state !== 'launching').map((entry) => entry.profileId)),
+    [gameEntries]
+  )
+  const runningKey = [...runningIds].sort().join('|')
+  const firstRunningKey = useRef(runningKey)
+  useEffect(() => {
+    if (firstRunningKey.current === runningKey) return
+    firstRunningKey.current = runningKey
+    reload()
+  }, [runningKey, reload])
 
   const needle = search.trim().toLowerCase()
   const visible = useMemo(
@@ -148,10 +192,11 @@ export function ProfilesPage() {
           </Button>
         </div>
       </div>
+      <RunningStrip />
       {error && <ErrorNotice message={error} onRetry={reload} />}
       {!profiles && loading && <LoadingBlock />}
       {profiles &&
-        sections.map((section) => (
+        sections.map((section, index) => (
           <section key={section.key} className="grid gap-2.5">
             <h3 className="flex items-center gap-2 text-[12px] font-bold tracking-[0.14em] text-subtle uppercase">
               {section.label}
@@ -160,11 +205,13 @@ export function ProfilesPage() {
               </span>
             </h3>
             <Stagger className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">
+              {index === 0 && placeholderCards}
               {section.items.map((profile) => (
                 <ProfileCard
                   key={profile.id}
                   profile={profile}
-                  running={profile.running}
+                  job={jobByProfile.get(profile.id)}
+                  running={runningIds.has(profile.id)}
                   onToggleFavourite={(target) => void toggleFavourite(target)}
                   onChanged={reload}
                 />
@@ -172,10 +219,13 @@ export function ProfilesPage() {
             </Stagger>
           </section>
         ))}
-      {profiles && profiles.length > 0 && visible.length === 0 && (
+      {profiles && sections.length === 0 && placeholders.length > 0 && (
+        <Stagger className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3">{placeholderCards}</Stagger>
+      )}
+      {profiles && profiles.length > 0 && visible.length === 0 && placeholders.length === 0 && (
         <p className="text-center text-muted">{t('profiles.noMatches')}</p>
       )}
-      {profiles && profiles.length === 0 && (
+      {profiles && profiles.length === 0 && placeholders.length === 0 && (
         <EmptyState icon="lucide:layers" title={t('profiles.empty.title')} description={t('profiles.empty.description')} />
       )}
       {creating && <CreateProfileModal onClose={() => setCreating(false)} />}

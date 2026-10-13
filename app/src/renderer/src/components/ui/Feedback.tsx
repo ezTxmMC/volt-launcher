@@ -17,24 +17,64 @@ export function LoadingBlock({ label }: { label?: string }) {
   )
 }
 
-/** Determinate progress bar; pass `value` in 0..1, or null for an indeterminate bar. */
-export function ProgressBar({ value, label }: { value: number | null; label: string }) {
-  return (
+const BAR_HEIGHT = { sm: 'h-1', md: 'h-1.5', lg: 'h-2.5' } as const
+
+/**
+ * Progress bar; `value` in 0..1, or null for an indeterminate bar. The fill has an accent gradient and,
+ * while running, a moving sheen (stopped by the motion tokens in styles.css). `showPercent` adds the
+ * percentage on the right, `caption` a message line below.
+ */
+export function ProgressBar({
+  value,
+  label,
+  size = 'md',
+  showPercent = false,
+  caption,
+  className = ''
+}: {
+  value: number | null
+  label: string
+  size?: 'sm' | 'md' | 'lg'
+  showPercent?: boolean
+  caption?: string
+  className?: string
+}) {
+  const percent = value === null ? null : Math.round(Math.max(0, Math.min(1, value)) * 100)
+  const bar = (
     <div
       role="progressbar"
       aria-label={label}
       aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={value === null ? undefined : Math.round(value * 100)}
-      className="h-1 w-full overflow-hidden rounded-full bg-line"
+      aria-valuenow={percent ?? undefined}
+      aria-valuetext={caption}
+      className={`volt-progress ${BAR_HEIGHT[size]} w-full min-w-0 overflow-hidden rounded-full bg-line`}
     >
       {value === null ? (
-        <div className="volt-indeterminate h-full w-1/3 rounded-full bg-accent" />
+        <div className="volt-progress-fill volt-indeterminate h-full w-1/3 rounded-full" />
       ) : (
         <div
-          className="h-full rounded-full bg-accent transition-[width] duration-300"
+          className="volt-progress-fill h-full rounded-full transition-[width] duration-500 ease-out"
           style={{ width: `${Math.max(2, Math.min(100, value * 100))}%` }}
         />
+      )}
+    </div>
+  )
+  if (!showPercent && !caption) return <div className={className}>{bar}</div>
+  return (
+    <div className={`flex min-w-0 flex-col gap-1 ${className}`}>
+      <div className="flex items-center gap-2">
+        {bar}
+        {showPercent && percent !== null && (
+          <span className="w-9 shrink-0 text-right text-[11px] font-semibold text-subtle tabular-nums" aria-hidden="true">
+            {percent}%
+          </span>
+        )}
+      </div>
+      {caption && (
+        <p className="truncate text-[11px] text-subtle" title={caption}>
+          {caption}
+        </p>
       )}
     </div>
   )

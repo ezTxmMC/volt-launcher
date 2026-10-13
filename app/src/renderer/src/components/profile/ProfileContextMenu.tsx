@@ -3,6 +3,7 @@ import type { Profile } from '@shared/models'
 import { useLaunchProfile } from '@/components/home/hooks/useLaunchProfile'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
+import { useLaunchBlock } from '@/state/games'
 import { useJobs } from '@/state/jobs'
 import { useToast } from '@/state/toast'
 import { ContextMenu, type ContextMenuEntry } from '@/components/ui/ContextMenu'
@@ -32,6 +33,7 @@ export function ProfileContextMenu({ profile, running, x, y, onClose, onChanged,
   const navigate = useNavigate()
   const launch = useLaunchProfile()
   const favourite = profile.favourite === true
+  const launchBlock = useLaunchBlock(profile.id)
 
   const failed = (error: unknown): void => toast.error(error)
 
@@ -40,7 +42,8 @@ export function ProfileContextMenu({ profile, running, x, y, onClose, onChanged,
       id: 'start',
       label: t('profiles.menu.start'),
       icon: 'lucide:play',
-      disabled: running,
+      disabled: running || launchBlock.blocked,
+      title: launchBlock.reason,
       onSelect: () => void launch(profile.id).catch(failed)
     },
     {

@@ -292,7 +292,10 @@ method autoReleaseName(string name) {
 method autoProfileName(string minecraftVersion): string {
     var names = []
     for (id in autoPackIds()) {
-        names.append("" + packFind(id)["name"])
+        var pack = packFind(id)
+        if (core.isNull(pack) == false) {
+            names.append("" + pack["name"])
+        }
     }
     var name = minecraftVersion
     if (names.length() > 0) {
@@ -311,6 +314,24 @@ method autoNameTaken(string name): bool {
         }
     }
     return false
+}
+
+// The ids of the profiles the checker created (all stored results, newest first).
+method autoCreatedProfileIds(): array {
+    var text = ""
+    sync (autoLock) {
+        text = json.stringify(autoResults)
+    }
+    var out = []
+    for (row in json.parse(text)) {
+        if (core.isMap(row) && core.getOr(row, "status", "") == "created") {
+            var profileId = core.getOr(row, "profileId", core.none())
+            if (core.isString(profileId) && out.contains("" + profileId) == false) {
+                out.append("" + profileId)
+            }
+        }
+    }
+    return out
 }
 
 // --- reading ------------------------------------------------------------------------------

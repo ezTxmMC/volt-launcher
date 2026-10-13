@@ -101,6 +101,15 @@ method fileInfoFor(string file, integer size, integer modified, bool withMetadat
     return info
 }
 
+// Whether the in-memory cache already holds the info of this file state (flag "m" with metadata, "h" without).
+method fileInfoKnown(string file, integer size, integer modified, string flag): bool {
+    var known = false
+    sync (modsLock) {
+        known = fileInfoCache.has(file + "|" + size + "|" + modified + "|" + flag)
+    }
+    return known
+}
+
 // --- locations ---------------------------------------------------------------------
 
 // The location of one kind of content of a profile. `world` only matters for
@@ -208,4 +217,69 @@ method busyKind(string profileId): string {
         }
     }
     return kind
+}
+
+// --- persistent scan cache ----------------------------------------------------------------------
+//
+// <gameDir>/.volt/scan-<kind>.json: {"files": {"<file name>": {"size", "modified", "sha1", "metadata"}}}.
+// It lets a scan after a restart skip reading the jars: a file whose size and modification time are
+// unchanged is not opened. The entries are put into the in-memory cache before a scan.
+
+method scanCachePath(ContentLoc loc): string {
+    return path.join(path.dirname(loc.store()), "scan-" + loc.kind() + ".json")
+}
+
+// Loads the persistent cache of a location into the in-memory one. Never raises.
+method scanCacheLoad(ContentLoc loc) {
+    var stored = core.readJsonFile(scanCachePath(loc), {})
+    if (core.isMap(stored) == false || stored.has("files") == false || core.isMap(stored["files"]) == false) {
+        return
+    }
+    var withMetadata = loc.kind() == "mods"
+    var flag = "h"
+    if (withMetadata) {
+        flag = "m"
+    }
+    var files = stored["files"]
+    var prepared = {}
+    for (name in files) {
+        var entry = files[name]
+        if (core.isMap(entry) == false || core.isString(core.getOr(entry, "sha1", core.none())) == false) {
+            continue
+        }
+        if (core.isWholeNumber(core.getOr(entry, "size", core.none())) == false || core.isWholeNumber(core.getOr(entry, "modified", core.none())) == false) {
+            continue
+        }
+        var metadata = core.getOr(entry, "metadata", core.none())
+        if (withMetadata && core.isMap(metadata) == false) {
+            continue
+        }
+        var key = path.join(loc.dir(), name) + "|" + entry["size"] + "|" + entry["modified"] + "|" + flag
+        prepared[key] = {"sha1": entry["sha1"], "metadata": metadata}
+    }
+    sync (modsLock) {
+        if (fileInfoCache.length() + prepared.length() >= FILE_CACHE_LIMIT) {
+            fileInfoCache = {}
+        }
+        for (key in prepared) {
+            if (fileInfoCache.has(key) == false) {
+                fileInfoCache[key] = prepared[key]
+            }
+        }
+    }
+}
+
+// Writes the persistent cache from the files just scanned: [{"name", "size", "modified", "sha1", "metadata"}].
+// A failure is only logged (the cache is an optimisation).
+method scanCacheSave(ContentLoc loc, array rows) {
+    var files = {}
+    for (row in rows) {
+        files["" + row["name"]] = {
+            "size": row["size"], "modified": row["modified"], "sha1": row["sha1"], "metadata": row["metadata"]
+        }
+    }
+    var problem = core.writeFileAtomic(scanCachePath(loc), json.stringify({"files": files}) + "\n")
+    if (problem != "") {
+        core.logWarn("mods: cannot save the scan cache: " + problem)
+    }
 }

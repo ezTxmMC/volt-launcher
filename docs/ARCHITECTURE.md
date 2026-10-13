@@ -652,6 +652,20 @@ Notes:
 - No lock is held during network or file access; temporary files carry a random ID.
 - Tests: `backend/tests/logo/run.sh` (classification, priority with fixtures, cache, 404; the jar and the pack fixtures are created with Python in the temporary data folder).
 
+## Running games
+
+`multiProfile` (setting, default `true`) allows several profiles to run at the same time. When it is `false`, `POST /api/profiles/:id/launch`
+answers 409 with the name of the running profile while another game runs or is being prepared. `GET /api/games` lists the running games
+`{profileId, name, pid, startedAt, uptimeSeconds, stopping}` and `POST /api/games/stop-all` sends the stop signal to all of them
+(`{stopped: [profileId]}`). Each job also carries `profileId` once it knows the profile it works on.
+
+## Mod detection speed
+
+`mods.scanContent` reads a jar only when it has changed. `<gameDir>/.volt/scan-<kind>.json` keeps size, modification time, SHA-1 and
+metadata per file; a scan after a restart only stats the files. Files the cache does not know are read on up to 6 threads
+(`SCAN_THREADS`), and the metadata is taken from the central directory without building an entry for every file of the jar
+(`zipEntriesNamed`). A profile with 521 jars (970 MB) scans in 0.7 s cold and 0.01 s from the cache (before: 6.6 s every start).
+
 ## Synced packs (`syncpacks/`)
 
 A synced pack is a named list of content projects (mods, resource packs, shaders) from Modrinth or CurseForge.
@@ -677,7 +691,7 @@ Pack: `{id, name, entries, profiles, createdAt}`, entry `{provider, projectId, k
 | GET / PATCH / DELETE | `/api/syncpacks/:id` | Pack; PATCH `{name?, entries?}` (entries replace the list); DELETE unlinks the pack everywhere, keeps the files as ordinary content and removes it from the new-version selection. |
 | POST | `/api/syncpacks/:id/sync` | Job (202, kind `syncpack`): every linked profile is brought up to date (entries that left the pack are removed, new ones installed). Busy profiles are skipped and listed. |
 | POST | `/api/syncpacks/from-profile` | Body `{profileId, name}` → 201 Pack from the profile's content with a known provider source. |
-| GET | `/api/profiles/:id/syncpacks` | `{packs: [{packId, name, files, overridden, declined, missing}]}` |
+| GET | `/api/profiles/:id/syncpacks` | `{packs: [{packId, name, files, overridden, declined, failed, missing}]}`; `failed` is `[{projectId, name, kind, reason}]` (what the last apply could not install; vanilla profiles refuse mods) and is not part of `missing` |
 | POST | `/api/profiles/:id/syncpacks` | Body `{packId, retry?}` → Job (202): link and install. `retry` clears `declined`. 409 while the game runs or the profile is busy. |
 | POST | `/api/profiles/:id/syncpacks/reconcile` | `{changes, packs}`: settles overrides now. |
 | DELETE | `/api/profiles/:id/syncpacks/:packId?removeFiles=true\|false` | `{removed, kept}`. Only the pack's own files are removed; the profile's files never are. |
@@ -709,7 +723,7 @@ recorded as the pack's files (nothing is installed or changed). `syncpacks.json`
 
 ### Tests and fixtures
 
-`backend/tests/syncpacks/run.sh` (103 checks, about 50 s, no network): validation, apply with override, later
+`backend/tests/syncpacks/run.sh` (111 checks, about 55 s, no network): validation, apply with override, later
 override, declined files, sync, from-profile, unlink with and without files, new-version profiles with packs, the
 timer and the migration. With `--enable-test-routes`, `VOLT_SYNCPACKS_FIXTURES` (installs.json) replaces the
 provider installs and `VOLT_AUTOPROFILES_FIXTURES` (manifest.json, loaders.json) the manifest and loader lookups.
@@ -753,6 +767,10 @@ When a profile is created, you choose which folders and files are shared between
 - Creating: the shared folder is `<dataDir>/synced/<key>/` (created if needed). In the new profile's game folder, the entry `<folder>` is created as a link to it: `ln -s` on Linux and macOS, a directory junction via `cmd /c mklink /J` on Windows (without admin rights). If the entry already exists (folder, file, or link), nothing is replaced: 409 `conflict` with "the folder <name> already exists in the new profile". If a link fails, creation responds with 500 `internal`; the profile is rolled back (links and profile folder are removed).
 - Files (`options` → `options.txt`, `servers` → `servers.dat`): the shared entry is `<dataDir>/synced/options.txt` or `servers.dat` (with the game's name). Link: `ln -s` on Linux and macOS; on Windows a hard link via `cmd /c mklink /H <profile file> <shared file>` (without admin rights, only on the same drive). A hard link is removed with `del`, which deletes only that name; the file remains. Enabling: if the shared file is missing, the profile's file is moved there; if it is already there, the profile's file is moved to `<gameDir>/.volt-sync-conflicts/<name>` (not overwritten, with the suffix "(2)" if the name is taken). If the profile has no file and the shared one is missing, an empty one is created (`"createdEmpty": true`). `syncReport`: `{"key": "options", "action": "enable", "status": "ok", "moved": 1, "conflicts": 0, "createdEmpty": false}`. Disabling: the link is removed and the shared file is copied into the game folder (the profile keeps a copy, the shared one remains); `{"key": "options", "action": "disable", "status": "ok", "copied": 1}`. If the copy fails, it is undone as with folders (status `failed`). Creating: if the entry exists in the game folder, 409 with "the file options.txt already exists in the new profile". The 409 when the game is running, the journal, and the deletion rules apply unchanged.
 - Deleting: only the profile's links are removed, in the managed folder and in the game folder (if changed via `PATCH`). On Linux, `removeAll` removes a link itself without following it. On Windows, a junction is removed with `cmd /c rmdir` before the profile folder is deleted, so that `removeAll` does not descend into the target. If a link remains, the profile folder is kept (warning in the log). The launcher never deletes shared content.
+- Healing: Minecraft saves `servers.dat` (and sometimes `options.txt`) by writing a new file and renaming it over the old one, which
+  turns the link into a real file. `core.healSynced` relinks such entries after a game exits and before any game starts (a file
+  takes the game's content unless it is empty, a folder is merged like an enable); links that point elsewhere and running
+  profiles are left alone. `POST /api/profiles/:id/synced/heal` does it on demand and answers `{report: [{key, status: healed | failed, message?}]}`.
 - Tests: `backend/tests/synced/run.sh` (link and target, shared files, deletion with content preserved, 400/409/500, PATCH enable with merging and conflicts, PATCH disable with copy, failed copy, undo after a failed link, restart, profile without the field; files: enable with move, second profile via the same link, disable with copy, conflict in `.volt-sync-conflicts`, empty file, failed copy, undo, creation with 409 and with both files; in the temporary data folder). `backend/tests/syncpacks/run.sh` verifies that new-version profiles have `["options", "servers"]` with links. Not tested: the 409 when the game is running (no runtime hook wired up), the junction and the hard link on Windows and macOS at runtime.
 
 ## Forge up to 1.12.2 (`launch/legacyforge.nv`)

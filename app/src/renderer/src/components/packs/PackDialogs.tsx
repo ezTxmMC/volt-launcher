@@ -10,11 +10,82 @@ import { Field, Select, TextInput } from '@/components/ui/Field'
 import { Modal } from '@/components/ui/Modal'
 
 /** Shared name check: empty and taken names block the save; the backend answers the same rules with 400/409. */
-function nameProblemOf(name: string, existingNames: readonly string[], current?: string): 'empty' | 'taken' | null {
+export function nameProblemOf(name: string, existingNames: readonly string[], current?: string): 'empty' | 'taken' | null {
   const trimmed = name.trim()
   if (trimmed === '') return 'empty'
   if (existingNames.some((existing) => existing.toLowerCase() === trimmed.toLowerCase() && existing !== current)) return 'taken'
   return null
+}
+
+/** Creates an empty pack with a name; its entries are added afterwards on the pack page. */
+export function NewPackDialog({
+  existingNames,
+  onClose,
+  onSaved
+}: {
+  existingNames: readonly string[]
+  onClose: () => void
+  onSaved: (pack: SyncPack) => void
+}) {
+  const { t } = useI18n()
+  const toast = useToast()
+  const [name, setName] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const problem = nameProblemOf(name, existingNames)
+  const message = problem === 'taken' ? t('syncpacks.name.taken') : t('syncpacks.editor.nameHint')
+  const canSave = !saving && problem === null
+
+  const save = async (): Promise<void> => {
+    if (!canSave) return
+    setSaving(true)
+    setError(null)
+    try {
+      const created = await api.syncpacks.create(name.trim())
+      toast.success(t('settings.saved'))
+      onSaved(created)
+    } catch (failure) {
+      setError(errorMessage(failure))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Modal
+      title={t('syncpacks.editor.new')}
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button variant="primary" icon="lucide:plus" loading={saving} disabled={!canSave} onClick={() => void save()}>
+            {t('syncpacks.new.create')}
+          </Button>
+        </>
+      }
+    >
+      <form
+        className="grid gap-4"
+        onSubmit={(event) => {
+          event.preventDefault()
+          void save()
+        }}
+      >
+        <Field label={t('syncpacks.editor.name')} hint={message}>
+          <TextInput
+            value={name}
+            maxLength={60}
+            placeholder={t('syncpacks.editor.namePlaceholder')}
+            aria-invalid={problem === 'taken' || undefined}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </Field>
+        {error && <ErrorNotice message={error} />}
+      </form>
+    </Modal>
+  )
 }
 
 /** Renames a pack (PATCH with the name). */
@@ -27,7 +98,7 @@ export function RenameDialog({
   pack: SyncPack
   existingNames: readonly string[]
   onClose: () => void
-  onSaved: () => void
+  onSaved: (pack: SyncPack) => void
 }) {
   const { t } = useI18n()
   const toast = useToast()
@@ -43,9 +114,9 @@ export function RenameDialog({
     setSaving(true)
     setError(null)
     try {
-      await api.syncpacks.update(pack.id, { name: name.trim() })
+      const saved = await api.syncpacks.update(pack.id, { name: name.trim() })
       toast.success(t('settings.saved'))
-      onSaved()
+      onSaved(saved)
     } catch (failure) {
       setError(errorMessage(failure))
     } finally {
@@ -92,7 +163,7 @@ export function FromProfileDialog({
 }: {
   existingNames: readonly string[]
   onClose: () => void
-  onSaved: () => void
+  onSaved: (pack: SyncPack) => void
 }) {
   const { t } = useI18n()
   const toast = useToast()
@@ -117,9 +188,9 @@ export function FromProfileDialog({
     setSaving(true)
     setError(null)
     try {
-      await api.syncpacks.fromProfile(profileId, shownName.trim())
+      const created = await api.syncpacks.fromProfile(profileId, shownName.trim())
       toast.success(t('settings.saved'))
-      onSaved()
+      onSaved(created)
     } catch (failure) {
       setError(errorMessage(failure))
     } finally {

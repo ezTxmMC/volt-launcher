@@ -6,6 +6,8 @@ import type { ApiResult, BackendStatus, HttpMethod, VoltBridge } from '@shared/b
 import type {
   ContentKind,
   GameStatus,
+  RunningGamesView,
+  GamePhase,
   Job,
   Loader,
   ModFile,
@@ -33,9 +35,11 @@ import type {
   SyncPackEntry,
   SyncPackKind,
   ProfileSyncPack,
+  ProfileSyncPackFailure,
   ProfileSyncPackFile,
   ProfileSyncPackRef,
   ProfileSyncPackRemoval,
+  SyncHealEntry,
   BackupInfo,
   CurrentSkin,
   LogChunk,
@@ -76,6 +80,7 @@ const DEFAULT_SETTINGS: Settings = {
   javaRuntimes: [],
   closeOnLaunch: false,
   openLogsOnLaunch: false,
+  multiProfile: true,
   downloadThreads: 6,
   backupsToKeep: 5,
   backupBeforePackUpdate: true,
@@ -247,7 +252,8 @@ function startJob(
   kind: string,
   title: string,
   durationMs: number,
-  onDone: () => Record<string, unknown> | void = () => undefined
+  onDone: () => Record<string, unknown> | void = () => undefined,
+  profileId: string | null = null
 ): Job {
   const job: Job = {
     id: hex(12),
@@ -258,11 +264,28 @@ function startJob(
     message: '',
     error: null,
     result: null,
+    profileId,
     createdAt: nowIso(),
     finishedAt: null
   }
   jobs.set(job.id, { job, startedAt: Date.now(), durationMs, onDone, cancelled: false })
   return { ...job }
+}
+
+/** Another profile whose game runs or is being started (multiProfile off refuses a second start). */
+function otherActiveProfile(profileId: string): Profile | undefined {
+  const active = (id: string): boolean => runningGames.get(id)?.running === true || jobPhase(id) === 'launch'
+  return profiles.find((profile) => profile.id !== profileId && active(profile.id))
+}
+
+/** The game phase a running job of the profile stands for. */
+function jobPhase(profileId: string): GamePhase {
+  for (const { job } of jobs.values()) {
+    if (job.state !== 'running' || job.profileId !== profileId) continue
+    if (job.kind === 'install-game' || job.kind === 'launch') return job.kind
+    if (job.kind === 'profile-verify') return 'verify'
+  }
+  return 'idle'
 }
 
 function evaluate(entry: MockJob): Job {
@@ -280,6 +303,7 @@ function evaluate(entry: MockJob): Job {
       job.finishedAt = nowIso()
       const outcome = entry.onDone()
       job.result = typeof outcome === 'object' && outcome !== null ? outcome : null
+      if (typeof job.result?.['profileId'] === 'string') job.profileId = job.result['profileId']
     }
   }
   return { ...job }
@@ -496,6 +520,7 @@ interface MockLink {
   files: ProfileSyncPackFile[]
   overridden: ProfileSyncPackRef[]
   declined: ProfileSyncPackRef[]
+  failed: ProfileSyncPackFailure[]
 }
 
 const syncEntry = (provider: SyncPackEntry['provider'], projectId: string, kind: SyncPackKind, name: string): SyncPackEntry => ({
@@ -541,7 +566,8 @@ const syncPackLinks = new Map<string, MockLink[]>([
           { projectId: '5ZwdcRci', name: 'ImmediatelyFast', kind: 'mod', fileName: 'immediatelyfast-1.3.0.jar', dependency: false }
         ],
         overridden: [{ projectId: 'gvQqBUqZ', name: 'Lithium', kind: 'mod' }],
-        declined: [{ projectId: 'nmDcB62a', name: 'ModernFix', kind: 'mod' }]
+        declined: [{ projectId: 'nmDcB62a', name: 'ModernFix', kind: 'mod' }],
+        failed: []
       }
     ]
   ]
@@ -575,20 +601,71 @@ function syncFileOf(entry: SyncPackEntry, dependency: boolean): ProfileSyncPackF
   return { projectId: entry.projectId, name: entry.name, kind: entry.kind, fileName: syncFileName(entry), dependency }
 }
 
-/** Brings a link up to date with its pack: removed entries leave the profile, new ones are installed unless decided otherwise. */
-function reconcileLink(link: MockLink): void {
+/** What one apply reports, as the backend's job result does: names per outcome plus the reasons of what was skipped. */
+interface MockApplyResult {
+  profileId: string
+  packId: string
+  installed: string[]
+  overridden: string[]
+  removed: string[]
+  skipped: string[]
+}
+
+/** Why the mock cannot install an entry into a profile (mirrors the failure texts of the backend). */
+function installFailure(profile: Profile, entry: SyncPackEntry): string | null {
+  if (entry.kind === 'mod' && profile.loader === 'vanilla') return 'this profile has no mod loader'
+  if (entry.name === 'ModernFix' && profile.loader === 'forge') {
+    return `no version of ${entry.name} fits Minecraft ${profile.minecraftVersion} / ${profile.loader}`
+  }
+  if (entry.kind === 'shader' && profile.minecraftVersion === '1.20.6') {
+    return `no version of ${entry.name} fits Minecraft ${profile.minecraftVersion}`
+  }
+  return null
+}
+
+/**
+ * Brings a link up to date with its pack, like the backend's apply: entries that left the pack are removed, new ones
+ * are installed unless the profile decided otherwise or no version fits. `retry` clears the declined entries.
+ */
+function applyLink(profile: Profile, link: MockLink, retry: boolean): MockApplyResult {
   const row = syncPackRowOf(link.packId)
   const inPack = (projectId: string): boolean => row.entries.some((entry) => entry.projectId === projectId)
+  const result: MockApplyResult = { profileId: profile.id, packId: row.id, installed: [], overridden: [], removed: [], skipped: [] }
+  if (retry) link.declined = []
+  link.failed = []
+  for (const file of link.files) if (!inPack(file.projectId) && !file.dependency) result.removed.push(file.name)
   link.files = link.files.filter((file) => inPack(file.projectId))
   link.overridden = link.overridden.filter((ref) => inPack(ref.projectId))
   link.declined = link.declined.filter((ref) => inPack(ref.projectId))
   for (const entry of row.entries) {
-    const decided =
+    const present =
       link.files.some((file) => file.projectId === entry.projectId) ||
-      link.overridden.some((ref) => ref.projectId === entry.projectId) ||
-      link.declined.some((ref) => ref.projectId === entry.projectId)
-    if (!decided) link.files.push(syncFileOf(entry, false))
+      link.declined.some((ref) => ref.projectId === entry.projectId) ||
+      link.overridden.some((ref) => ref.projectId === entry.projectId)
+    if (present) {
+      if (link.overridden.some((ref) => ref.projectId === entry.projectId) && !result.overridden.includes(entry.name)) {
+        result.overridden.push(entry.name)
+      }
+      continue
+    }
+    const own = (mods.get(profile.id) ?? []).some((file) => file.source?.projectId === entry.projectId)
+    if (own) {
+      if (!link.overridden.some((ref) => ref.projectId === entry.projectId)) {
+        link.overridden.push({ projectId: entry.projectId, name: entry.name, kind: entry.kind })
+      }
+      result.overridden.push(entry.name)
+      continue
+    }
+    const problem = installFailure(profile, entry)
+    if (problem) {
+      link.failed.push({ projectId: entry.projectId, name: entry.name, kind: entry.kind, reason: problem })
+      result.skipped.push(`${entry.name} not installed: ${problem}`)
+      continue
+    }
+    link.files.push(syncFileOf(entry, false))
+    result.installed.push(entry.name)
   }
+  return result
 }
 
 function profileSyncPackView(link: MockLink): ProfileSyncPack {
@@ -597,9 +674,18 @@ function profileSyncPackView(link: MockLink): ProfileSyncPack {
     (entry) =>
       !link.files.some((file) => file.projectId === entry.projectId) &&
       !link.overridden.some((ref) => ref.projectId === entry.projectId) &&
-      !link.declined.some((ref) => ref.projectId === entry.projectId)
+      !link.declined.some((ref) => ref.projectId === entry.projectId) &&
+      !link.failed.some((ref) => ref.projectId === entry.projectId)
   )
-  return { packId: row.id, name: row.name, files: link.files.map((file) => ({ ...file })), overridden: link.overridden, declined: link.declined, missing }
+  return {
+    packId: row.id,
+    name: row.name,
+    files: link.files.map((file) => ({ ...file })),
+    overridden: link.overridden,
+    declined: link.declined,
+    failed: link.failed,
+    missing
+  }
 }
 
 function linksOf(profileId: string | undefined): MockLink[] {
@@ -680,8 +766,12 @@ function setSyncedFolders(profile: Profile, requested: unknown[]): Profile & { s
 
 function modsOf(id: string | undefined): ModFile[] {
   profileById(id)
-  const list = mods.get(id ?? '')
-  if (!list) throw new MockError('Mods nicht gefunden')
+  // Profiles the seed does not list start without mods.
+  let list = mods.get(id ?? '')
+  if (!list) {
+    list = []
+    mods.set(id ?? '', list)
+  }
   return list
 }
 
@@ -1724,12 +1814,19 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/syncpacks\/(\w+)\/sync$/,
     (m) => {
       const row = syncPackRowOf(m[1])
-      const linked = profilesLinkedTo(row.id).length
       return startJob('syncpack', `Synchronisiere „${row.name}“`, 2000, () => {
-        for (const links of syncPackLinks.values()) {
-          for (const link of links) if (link.packId === row.id) reconcileLink(link)
+        const results: MockApplyResult[] = []
+        const skipped: string[] = []
+        for (const profileId of profilesLinkedTo(row.id)) {
+          if (runningGames.get(profileId)?.running) {
+            skipped.push(profileId)
+            continue
+          }
+          for (const link of syncPackLinks.get(profileId) ?? []) {
+            if (link.packId === row.id) results.push(applyLink(profileById(profileId), link, false))
+          }
         }
-        return { packId: row.id, profiles: linked }
+        return { packId: row.id, profiles: results, skipped }
       })
     }
   ],
@@ -1741,13 +1838,15 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
       const profile = profileById(m[1])
       const row = syncPackRowOf(String(body['packId'] ?? ''))
       if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: Das Profil ist beschäftigt')
-      if (linksOf(profile.id).some((link) => link.packId === row.id)) throw new MockError('HTTP 409: Das Pack ist schon verknüpft')
+      const retry = body['retry'] === true
+      const existing = linksOf(profile.id).find((link) => link.packId === row.id)
+      if (existing && !retry) throw new MockError('HTTP 409: Das Pack ist schon verknüpft')
       return startJob('syncpack', `Installiere Pack „${row.name}“`, 2500, () => {
-        const link: MockLink = { packId: row.id, files: [], overridden: [], declined: [] }
-        reconcileLink(link)
+        if (existing) return { ...applyLink(profile, existing, true) }
+        const link: MockLink = { packId: row.id, files: [], overridden: [], declined: [], failed: [] }
         const links = syncPackLinks.get(profile.id) ?? []
         syncPackLinks.set(profile.id, [...links, link])
-        return { packId: row.id, installed: link.files.length }
+        return { ...applyLink(profile, link, false) }
       })
     }
   ],
@@ -1987,7 +2086,17 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       return evaluate(entry)
     }
   ],
-  ['GET', /^\/api\/profiles$/, () => profiles],
+  [
+    'GET',
+    /^\/api\/profiles$/,
+    // The list carries each profile's launch state, as GET /api/profiles does.
+    () =>
+      profiles.map((profile) => ({
+        ...profile,
+        running: runningGames.get(profile.id)?.running === true,
+        phase: runningGames.get(profile.id)?.phase ?? jobPhase(profile.id)
+      }))
+  ],
   [
     'POST',
     /^\/api\/profiles$/,
@@ -2053,7 +2162,7 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
           ok: true
         })
         return undefined
-      })
+      }, profile.id)
     }
   ],
   ['GET', /^\/api\/profiles\/(\w+)\/verify$/, (m) => ({ report: verifyReports.get(m[1] ?? '') ?? null })],
@@ -2247,7 +2356,23 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
         }
         profiles.push(profile)
         mods.set(profile.id, [])
+        return { profileId: profile.id }
       })
+    }
+  ],
+  [
+    'POST',
+    /^\/api\/profiles\/(\w+)\/synced\/heal$/,
+    (m) => {
+      const profile = profileById(m[1])
+      if (runningGames.get(profile.id)?.running) return { report: [] }
+      // Like the backend: only entries that were detached show up; the mock detaches servers.dat and config.
+      const report: SyncHealEntry[] = []
+      for (const key of profile.synced ?? []) {
+        if (key === 'servers' || key === 'options') report.push({ key, status: 'healed' })
+        else if (key === 'config') report.push({ key, status: 'failed', message: 'the entry is neither a file nor a link' })
+      }
+      return { report }
     }
   ],
   [
@@ -2256,13 +2381,26 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     (m, body) => {
       const profile = profileById(m[1])
       const project = findProject(body['provider'] as ProviderId, String(body['projectId']))
+      const world = typeof body['world'] === 'string' ? body['world'] : null
+      if (project.kind === 'datapack' && !world) throw new MockError('HTTP 400: world is required for data packs')
       return startJob('content-install', `Installiere ${project.name} in ${profile.name}`, 3000, () => {
         if (project.kind === 'mod') {
           modsOf(profile.id).push(
             mod(`${project.slug}-1.0.0.jar`, profile.loader, project.slug, project.name, '1.0.0', modrinthSource(project.id, '1.0.0', project.name), 900_000)
           )
+          return
         }
-      })
+        const type = project.kind === 'shader' ? 'shaderpacks' : project.kind === 'resourcepack' ? 'resourcepacks' : 'datapacks'
+        packFilesOf(profile.id, type, world).push({
+          fileName: `${project.slug}-1.0.0.zip`,
+          enabled: true,
+          size: 412_000,
+          sha1: hex(40),
+          metadata: null,
+          source: modrinthSource(project.id, '1.0.0', project.name),
+          update: null
+        })
+      }, profile.id)
     }
   ],
   [
@@ -2278,7 +2416,7 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/install-game$/,
     (m) => {
       const profile = profileById(m[1])
-      return startJob('game-install', `Installiere Minecraft ${profile.minecraftVersion}`, 5000)
+      return startJob('install-game', `Installiere Minecraft ${profile.minecraftVersion}`, 5000, undefined, profile.id)
     }
   ],
   [
@@ -2286,10 +2424,41 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/launch$/,
     (m) => {
       const profile = profileById(m[1])
+      if (!settings.multiProfile) {
+        const other = otherActiveProfile(profile.id)
+        if (other) throw new MockError(`HTTP 409: '${other.name}' läuft; mehrere Profile gleichzeitig zu starten ist in den Einstellungen ausgeschaltet`)
+      }
       return startJob('launch', `Starte ${profile.name}`, 2500, () => {
         profile.lastPlayed = nowIso()
-        runningGames.set(profile.id, { running: true, pid: 4242, startedAt: nowIso(), stopping: false, phase: 'running', lastExit: null })
-      })
+        runningGames.set(profile.id, { running: true, pid: 4242 + Math.floor(Math.random() * 1000), startedAt: nowIso(), stopping: false, phase: 'running', lastExit: null })
+      }, profile.id)
+    }
+  ],
+  [
+    'GET',
+    /^\/api\/games$/,
+    (): RunningGamesView => ({
+      games: [...runningGames.entries()]
+        .filter(([, game]) => game.running && game.startedAt)
+        .map(([profileId, game]) => ({
+          profileId,
+          name: profiles.find((profile) => profile.id === profileId)?.name ?? profileId,
+          pid: game.pid,
+          startedAt: game.startedAt ?? nowIso(),
+          uptimeSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(game.startedAt ?? nowIso())) / 1000)),
+          stopping: game.stopping
+        }))
+        .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt)),
+      multiProfile: settings.multiProfile
+    })
+  ],
+  [
+    'POST',
+    /^\/api\/games\/stop-all$/,
+    () => {
+      const stopped = [...runningGames.keys()]
+      runningGames.clear()
+      return { stopped }
     }
   ],
   [
@@ -2301,6 +2470,22 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     }
   ]
 ]
+
+// Demo: two games that have been running for a while (the profiles page strip, the top bar panel).
+profiles.slice(0, 2).forEach((profile, index) => {
+  runningGames.set(profile.id, {
+    running: true,
+    pid: 4242 + index,
+    startedAt: agoIso(index === 0 ? 47 : 6),
+    stopping: false,
+    phase: 'running',
+    lastExit: null
+  })
+})
+
+// Demo of the running states: a game install on a profile and a pack install whose profile does not exist yet.
+if (profiles[0]) startJob('install-game', `Installiere Minecraft ${profiles[0].minecraftVersion}`, 90_000, undefined, profiles[0].id)
+startJob('pack-install', 'Installiere Fabulously Optimized', 120_000)
 
 async function handle<T>(method: HttpMethod, rawPath: string, body: unknown): Promise<ApiResult<T>> {
   await sleep(LATENCY_MS)

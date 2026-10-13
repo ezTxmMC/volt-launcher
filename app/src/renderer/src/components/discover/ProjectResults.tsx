@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Icon } from '@iconify/react'
 import { Link } from 'react-router'
 import type { ProjectSummary } from '@shared/models'
@@ -14,8 +14,12 @@ import type { DiscoverView } from './useDiscoverPrefs'
 const LIST_TAGS = 6
 const GRID_TAGS = 3
 
-function detailPath(project: ProjectSummary): string {
-  return `/discover/${project.provider}/${encodeURIComponent(project.id)}`
+/** What a result shows as its install action; the default is the "+" that asks for a profile. */
+export type RenderAction = (project: ProjectSummary) => ReactNode
+
+function detailPath(project: ProjectSummary, profileId?: string): string {
+  const base = `/discover/${project.provider}/${encodeURIComponent(project.id)}`
+  return profileId ? `${base}?profile=${encodeURIComponent(profileId)}` : base
 }
 
 /**
@@ -63,7 +67,7 @@ function ProjectTags({ project, limit }: { project: ProjectSummary; limit: numbe
 }
 
 /** The "+" button of a card: installs the project into a chosen profile. Not for modpacks, which create their own profile. */
-function QuickAddButton({ project, className }: { project: ProjectSummary; className: string }) {
+export function QuickAddButton({ project, className = '' }: { project: ProjectSummary; className?: string }) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   if (project.kind === 'modpack') return null
@@ -93,11 +97,19 @@ function Stat({ icon, title, children }: { icon: string; title: string; children
 }
 
 /** One result in the list view: icon, name and author, a clamped summary, tags, and the counts on the right. */
-export function ProjectListRow({ project }: { project: ProjectSummary }) {
+export function ProjectListRow({
+  project,
+  action,
+  profileId
+}: {
+  project: ProjectSummary
+  action?: ReactNode
+  profileId?: string
+}) {
   const { language, t } = useI18n()
   return (
     <li className="group relative flex gap-4 rounded-xl border border-line bg-surface p-3.5 transition-colors duration-[var(--motion-base)] hover:border-[var(--accent-border)] hover:bg-surface-strong focus-within:border-[var(--accent-border)]">
-      <Link to={detailPath(project)} aria-label={project.name} className="absolute inset-0 rounded-xl" />
+      <Link to={detailPath(project, profileId)} aria-label={project.name} className="absolute inset-0 rounded-xl" />
       <ProjectIcon url={project.iconUrl} size="lg" />
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <div className="min-w-0">
@@ -127,21 +139,29 @@ export function ProjectListRow({ project }: { project: ProjectSummary }) {
             </Stat>
           )}
         </div>
-        <QuickAddButton project={project} className="relative" />
+        {action === undefined ? <QuickAddButton project={project} className="relative" /> : action}
       </div>
     </li>
   )
 }
 
 /** One result in the grid view: icon, name, author, a clamped summary, tags and the counts. */
-export function ProjectGridCard({ project }: { project: ProjectSummary }) {
+export function ProjectGridCard({
+  project,
+  action,
+  profileId
+}: {
+  project: ProjectSummary
+  action?: ReactNode
+  profileId?: string
+}) {
   const { language, t } = useI18n()
   return (
     <article className="group relative flex flex-col gap-3 rounded-xl border border-line bg-[var(--card-solid)] p-4 backface-hidden transition-[transform,border-color] duration-[var(--motion-base)] ease-[var(--motion-ease)] hover:translate-y-[var(--motion-lift)] hover:border-[var(--accent-border)] hover:shadow-[inset_0_0_0_9999px_rgba(0,178,255,0.05)] focus-within:border-[var(--accent-border)]">
-      <Link to={detailPath(project)} aria-label={project.name} className="absolute inset-0 rounded-xl" />
+      <Link to={detailPath(project, profileId)} aria-label={project.name} className="absolute inset-0 rounded-xl" />
       <div className="flex items-start gap-3">
         <ProjectIcon url={project.iconUrl} />
-        <div className="min-w-0 flex-1 pr-8">
+        <div className="min-w-0 flex-1">
           <h3 className="truncate text-[15px] leading-tight font-bold" title={project.name}>
             {project.name}
           </h3>
@@ -150,29 +170,49 @@ export function ProjectGridCard({ project }: { project: ProjectSummary }) {
       </div>
       {project.summary && <p className="line-clamp-2 text-[13.5px] leading-[1.5] text-muted">{project.summary}</p>}
       <ProjectTags project={project} limit={GRID_TAGS} />
-      <div className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-subtle">
-        <Stat icon="lucide:download" title={t('discover.stats.downloads')}>
-          {formatNumber(project.downloads, language)}
-        </Stat>
-        {project.follows !== undefined && (
-          <Stat icon="lucide:heart" title={t('discover.stats.follows')}>
-            {formatNumber(project.follows, language)}
+      <div className="mt-auto flex flex-wrap items-center justify-between gap-x-3 gap-y-2 text-[12.5px] text-subtle">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <Stat icon="lucide:download" title={t('discover.stats.downloads')}>
+            {formatNumber(project.downloads, language)}
           </Stat>
-        )}
+          {project.follows !== undefined && (
+            <Stat icon="lucide:heart" title={t('discover.stats.follows')}>
+              {formatNumber(project.follows, language)}
+            </Stat>
+          )}
+        </div>
+        {action === undefined ? <QuickAddButton project={project} className="relative" /> : action}
       </div>
-      <QuickAddButton project={project} className="absolute top-3 right-3" />
     </article>
   )
 }
 
 /** The results of one page, as list rows or grid cards. `stale` dims them while the next page loads. */
-export function ProjectResults({ items, view, stale }: { items: ProjectSummary[]; view: DiscoverView; stale: boolean }) {
+export function ProjectResults({
+  items,
+  view,
+  stale,
+  renderAction,
+  profileId
+}: {
+  items: ProjectSummary[]
+  view: DiscoverView
+  stale: boolean
+  renderAction?: RenderAction
+  /** Carried to the project page, so it opens with the same install target. */
+  profileId?: string
+}) {
   const dim = stale ? 'opacity-50 transition-opacity duration-200' : 'transition-opacity duration-200'
   if (view === 'grid') {
     return (
       <Stagger aria-busy={stale} className={`grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3 ${dim}`}>
         {items.map((project) => (
-          <ProjectGridCard key={`${project.provider}:${project.id}`} project={project} />
+          <ProjectGridCard
+            key={`${project.provider}:${project.id}`}
+            project={project}
+            action={renderAction?.(project)}
+            profileId={profileId}
+          />
         ))}
       </Stagger>
     )
@@ -180,7 +220,12 @@ export function ProjectResults({ items, view, stale }: { items: ProjectSummary[]
   return (
     <Stagger as="ul" aria-busy={stale} className={`grid gap-2 ${dim}`}>
       {items.map((project) => (
-        <ProjectListRow key={`${project.provider}:${project.id}`} project={project} />
+        <ProjectListRow
+          key={`${project.provider}:${project.id}`}
+          project={project}
+          action={renderAction?.(project)}
+          profileId={profileId}
+        />
       ))}
     </Stagger>
   )

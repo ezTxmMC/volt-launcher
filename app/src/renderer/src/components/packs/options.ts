@@ -45,10 +45,5 @@ export function countByKind(entries: readonly SyncPackEntry[]): Array<{ kind: Sy
   return SYNC_PACK_KINDS.map((kind) => ({ kind, count: entries.filter((entry) => entry.kind === kind).length }))
 }
 
-/** Two entry lists are the same when they hold the same projects in the same order. */
-export function sameEntries(a: readonly SyncPackEntry[], b: readonly SyncPackEntry[]): boolean {
-  return a.length === b.length && a.every((entry, index) => entryKey(entry) === entryKey(b[index]))
-}
-
 /** Identifies an entry: the same project of the same provider is one entry. */
 export const entryKey = (entry: SyncPackEntry | undefined): string => `${entry?.provider ?? ''}:${entry?.projectId ?? ''}`

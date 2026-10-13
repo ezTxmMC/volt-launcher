@@ -51,16 +51,9 @@ method migrateIsDefaultPreset(array stored): bool {
 // The profile ids the old checker created (and that still exist).
 method migrateAutoProfiles(): array {
     var out = []
-    for (row in autoOverview()["results"]) {
-        if (core.isMap(row) == false || core.getOr(row, "status", "") != "created") {
-            continue
-        }
-        var profileId = core.getOr(row, "profileId", core.none())
-        if (core.isString(profileId) == false || out.contains("" + profileId)) {
-            continue
-        }
-        if (core.isNull(core.findProfile("" + profileId)) == false) {
-            out.append("" + profileId)
+    for (profileId in autoCreatedProfileIds()) {
+        if (core.isNull(core.findProfile(profileId)) == false) {
+            out.append(profileId)
         }
     }
     return out
@@ -126,8 +119,8 @@ method migrateRun() {
     if (entries.length() > 0) {
         var made = core.runTrapped(MigratePackTask{entries = entries})
         if (made.failed()) {
-            core.logWarn("syncpacks: migration could not create the pack: " + made.error())
-            return
+            // Raised, so the migration is not marked done and the next start tries again.
+            core.raise(made.error())
         }
         pack = made.result()
         packIds.append("" + pack["id"])

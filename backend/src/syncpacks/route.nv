@@ -124,6 +124,10 @@ method packRemove(string id): map<string, object> {
     packRequire(id)
     var unlinked = 0
     for (profileId in spLinkedProfiles(id)) {
+        if (providers.busyWith(profileId) != "") {
+            // A job runs on it: the record stays and is ignored once the pack is gone.
+            continue
+        }
         spUnlink(profileId, id, false)
         unlinked = unlinked + 1
     }
@@ -222,6 +226,9 @@ method profileRoute(string verb, array<string> segments, map<string, string> que
     if (segments.length() == 4 && segments[3] == "reconcile") {
         if (verb != "POST") {
             return core.methodNotAllowed(verb, segments)
+        }
+        if (providers.busyWith(profileId) != "") {
+            core.conflict("this profile is busy (" + providers.busyWith(profileId) + ")")
         }
         var changes = spReconcile(profileId)
         return core.ok({"changes": changes, "packs": spProfileView(profileId)["packs"]})

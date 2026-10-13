@@ -11,6 +11,7 @@ import {
 import type { Job } from '@shared/models'
 import { useI18n } from '@/i18n'
 import { api } from '@/lib/api'
+import { summarizeSyncJob } from '@/lib/syncResult'
 import { useToast } from './toast'
 
 type FinishedListener = (job: Job) => void
@@ -125,7 +126,21 @@ export function JobsProvider({ children }: { children: ReactNode }) {
         if (job.state === 'done') {
           // An import reports its own count on the profile page; a second toast would repeat it.
           if (job.kind === 'import') return
-          if (job.kind === 'pack-install') {
+          const syncSummary = job.kind === 'syncpack' ? summarizeSyncJob(job) : null
+          if (syncSummary) {
+            // A pack job tells what arrived and why the rest did not (the reasons come from the backend).
+            const counts = t('syncpacks.toast.counts', {
+              installed: syncSummary.installed,
+              overridden: syncSummary.overridden,
+              removed: syncSummary.removed
+            })
+            const reasons = syncSummary.skipped
+            const first = reasons[0]
+            const more = reasons.length > 1 ? ` ${t('syncpacks.toast.more', { count: reasons.length - 1 })}` : ''
+            const tail = first ? `\n${first}${more}` : ''
+            const busy = syncSummary.busyProfiles.length > 0 ? `\n${t('syncpacks.toast.busy', { count: syncSummary.busyProfiles.length })}` : ''
+            toast.notify(first || busy ? 'info' : 'success', `${counts}${tail}${busy}`, job.title)
+          } else if (job.kind === 'pack-install') {
             const name = job.title.replace(/^Installiere /, '')
             toast.notify('success', t('notify.packInstalled', { name }), t('job.state.done'))
           } else {

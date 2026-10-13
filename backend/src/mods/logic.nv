@@ -2,6 +2,7 @@ package mods
 
 import os
 import path
+import thread
 import time
 import core
 
@@ -124,12 +125,83 @@ method modFile(ContentLoc loc, string name, map<string, object> mods): map<strin
     }
 }
 
-// ModFile[] of the location (the folder is not created here).
+// Cold reads (jars the cache does not know) run on this many threads: the work is reading and
+// hashing, so a few threads use the disk and the processor without holding many jars in memory.
+private final SCAN_THREADS = 6
+
+// Reads one file into the in-memory cache; a failing file is left to the sequential pass.
+method scanWorker(array files, bool withMetadata, integer next) {
+    while (true) {
+        var index = thread.add(next, 1) - 1
+        if (index >= files.length()) {
+            return
+        }
+        var file = "" + files[index]
+        var outcome = core.runTrapped(ScanOneTask{file = file, withMetadata = withMetadata})
+        if (outcome.failed()) {
+            core.logWarn("mods: cannot read " + file + ": " + outcome.error())
+        }
+    }
+}
+
+define class ScanOneTask {
+    private string file: get, set
+    private bool withMetadata: get, set
+
+    method run(): object {
+        fileInfoFor(file, os.fileSize(file), os.modifiedMillis(file), withMetadata)
+        return true
+    }
+}
+
+// ModFile[] of the location (the folder is not created here). The cache of earlier scans is loaded
+// first, so only new or changed files are read; those are read in parallel and the cache is saved.
 method scanContent(ContentLoc loc): array {
     var mods = loadStore(loc)
+    var names = contentFileNames(loc)
+    scanCacheLoad(loc)
+    var withMetadata = loc.kind() == "mods"
+    var flag = "h"
+    if (withMetadata) {
+        flag = "m"
+    }
+    // The files the in-memory cache (filled from disk above) does not know yet.
+    var cold = []
+    for (name in names) {
+        var file = path.join(loc.dir(), name)
+        if (fileInfoKnown(file, os.fileSize(file), os.modifiedMillis(file), flag) == false) {
+            cold.append(file)
+        }
+    }
+    if (cold.length() > 1) {
+        var workers = SCAN_THREADS
+        if (workers > cold.length()) {
+            workers = cold.length()
+        }
+        var next = thread.counter(0)
+        var handles = []
+        var i = 0
+        while (i < workers) {
+            handles.append(thread scanWorker(cold, withMetadata, next))
+            i = i + 1
+        }
+        thread.joinAll(handles)
+    }
     var out = []
-    for (name in contentFileNames(loc)) {
-        out.append(modFile(loc, name, mods))
+    var rows = []
+    for (name in names) {
+        var entry = modFile(loc, name, mods)
+        out.append(entry)
+        var path1 = path.join(loc.dir(), name)
+        rows.append({
+            "name": name, "size": os.fileSize(path1), "modified": os.modifiedMillis(path1),
+            "sha1": entry["sha1"], "metadata": entry["metadata"]
+        })
+    }
+    if (cold.length() > 0 || os.isFile(scanCachePath(loc)) == false) {
+        if (os.isDir(path.dirname(loc.store())) || names.length() > 0) {
+            scanCacheSave(loc, rows)
+        }
     }
     return out
 }

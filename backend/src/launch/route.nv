@@ -27,6 +27,9 @@ method route(string verb, array<string> segments, map<string, string> query, obj
         }
         return core.ok(launchDetectJava())
     }
+    if (segments[0] == "games") {
+        return gamesRoute(verb, segments)
+    }
     if (segments[0] != "profiles" || segments.length() < 3) {
         core.notFound("no such endpoint")
     }
@@ -51,6 +54,18 @@ method route(string verb, array<string> segments, map<string, string> query, obj
         }
         if (launchIsRunning(id)) {
             core.conflict("the game of this profile is running")
+        }
+        if (start && core.setting("multiProfile") == false) {
+            // One game at a time: another profile's game (or its start) blocks this launch.
+            var other = launchOtherRunning(id)
+            if (other != "") {
+                var otherProfile = core.findProfile(other)
+                var otherName = other
+                if (core.isNull(otherProfile) == false) {
+                    otherName = "" + otherProfile["name"]
+                }
+                core.conflict("'" + otherName + "' is running; starting several profiles at once is switched off in the settings")
+            }
         }
         if (launchClaimProfile(id, section) == false) {
             core.conflict("an install or launch of this profile is already running")
@@ -184,5 +199,50 @@ method launchQuickCheckRequest(string profileId, map<string, object> profile, ma
     var folder = launchQuickWorld(quick)
     if (os.isDir(path.join(core.profileDir(profileId), "saves", folder)) == false) {
         core.notFound("world '" + folder + "' not found")
+    }
+}
+
+// GET /api/games: {games: [{profileId, name, pid, startedAt, uptimeSeconds, stopping}], multiProfile}
+// POST /api/games/stop-all: every running game gets the stop signal -> {stopped: [profileId]}
+method gamesRoute(string verb, array<string> segments): map<string, object> {
+    if (segments.length() == 1) {
+        if (verb != "GET") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var games = []
+        for (game in launchRunningGames()) {
+            var profile = core.findProfile("" + game["profileId"])
+            if (core.isNull(profile)) {
+                game["name"] = "" + game["profileId"]
+            } else {
+                game["name"] = "" + profile["name"]
+            }
+            games.append(game)
+        }
+        return core.ok({"games": games, "multiProfile": core.setting("multiProfile") != false})
+    }
+    if (segments.length() == 2 && segments[1] == "stop-all") {
+        if (verb != "POST") {
+            return core.methodNotAllowed(verb, segments)
+        }
+        var stopped = []
+        for (game in launchRunningGames()) {
+            var id = "" + game["profileId"]
+            var outcome = core.runTrapped(StopGameTask{profileId = id})
+            if (outcome.failed() == false) {
+                stopped.append(id)
+            }
+        }
+        return core.ok({"stopped": stopped})
+    }
+    core.notFound("no such endpoint")
+    return {}
+}
+
+define class StopGameTask {
+    private string profileId: get, set
+
+    method run(): object {
+        return launchStopGame(profileId)
     }
 }

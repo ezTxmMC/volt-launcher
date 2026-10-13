@@ -6,7 +6,7 @@ import path
 
 // Process wide configuration, fixed once at startup by main.
 
-final VERSION = "0.1.2"
+final VERSION = "0.2.0"
 
 var appVersion = ""
 var dataDirectory = ""

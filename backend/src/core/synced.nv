@@ -327,6 +327,21 @@ method markGameRunning(string id, bool running) {
             runningGames.remove(id)
         }
     }
+    if (running == false) {
+        // The game may have replaced a linked file while it ran: settle that now (see healSynced).
+        var healing = runTrapped(HealTask{id = id})
+        if (healing.failed()) {
+            logWarn("synced: could not check the links of profile " + id + ": " + healing.error())
+        }
+    }
+}
+
+define class HealTask {
+    private string id: get, set
+
+    method run(): object {
+        return healSynced(id)
+    }
 }
 
 method isGameRunning(string id): bool {
@@ -809,4 +824,127 @@ method patchSynced(string id, array<string> wanted, map<string, object> fields):
     }
     saved["syncReport"] = report
     return saved
+}
+
+// --- healing -----------------------------------------------------------------------------------
+//
+// Minecraft saves servers.dat (and, in some versions, options.txt) by writing a new file and renaming
+// it over the old one. That replaces the link with a real file: the profile is detached from the shared
+// entry and the shared file stays stale. After a game exits and before any game starts, a link that
+// became a real file is merged back: a file takes the game's content (the newest save) unless it is
+// empty, a folder is merged like an enable (names the shared folder lacks move there, clashes go to
+// the conflicts folder), then the link is made again. A link that points somewhere else is left alone
+// (the user's choice) and a running game's profile is not touched.
+
+// A file key: the game's file becomes the shared one (unless it is empty and the shared file is not),
+// then the link is made. "" when nothing is wrong or it was healed, otherwise the reason.
+method healFileKey(string shared, string link): string {
+    if (linkedTo(link, shared, true) || os.isSymlink(link)) {
+        return ""
+    }
+    if (os.isFile(link)) {
+        if (os.isFile(shared) == false || os.fileSize(link) > 0) {
+            if (os.platform() == "windows") {
+                // The other profiles hold hard links to the shared file: it must keep its identity,
+                // so it is overwritten in place instead of replaced.
+                if (os.copy(link, shared) == false || os.fileSize(shared) != os.fileSize(link)) {
+                    return "cannot copy the game's file into the shared one"
+                }
+            } else {
+                var temp = shared + ".volt-new"
+                if (os.copy(link, temp) == false || os.fileSize(temp) != os.fileSize(link)) {
+                    if (os.isFile(temp)) {
+                        os.remove(temp)
+                    }
+                    return "cannot copy the game's file into the shared one"
+                }
+                if (os.rename(temp, shared) == false) {
+                    os.remove(temp)
+                    return "cannot replace the shared file"
+                }
+            }
+        }
+        os.remove(link)
+    } else if (os.exists(link)) {
+        return "the entry is neither a file nor a link"
+    }
+    if (os.isFile(shared) == false) {
+        var created = writeFileAtomic(shared, "")
+        if (created != "") {
+            return created
+        }
+    }
+    return makeLink(shared, link, true)
+}
+
+define class HealFolderTask {
+    private string gameDir: get, set
+    private string key: get, set
+    private string shared: get, set
+    private string link: get, set
+
+    method run(): object {
+        var journal = []
+        enableKey(gameDir, key, shared, link, journal)
+        return true
+    }
+}
+
+// The entries of one profile that were detached are linked again. Returns what was done:
+// [{"key", "status": "healed" | "failed", "message"?}]. Never raises.
+method healSynced(string id): array {
+    var report = []
+    var profile = findProfile(id)
+    if (isNull(profile) || isGameRunning(id)) {
+        return report
+    }
+    var keys = storedSynced(getOr(profile, "synced", []))
+    var gameDir = effectiveGameDir(profile)
+    for (key in keys) {
+        var shared = syncedSharedPath(key)
+        var link = syncedLinkPath(gameDir, key)
+        var asFile = syncedIsFile(key)
+        if (asFile == false && (linkPointsTo(link, shared) || os.isSymlink(link))) {
+            continue
+        }
+        var problem = ""
+        var needed = false
+        if (asFile && os.platform() == "windows" && windowsFileId(shared) == "") {
+            // The file identity cannot be read here: a link cannot be told from a copy, so leave it.
+            continue
+        }
+        if (asFile) {
+            needed = linkedTo(link, shared, true) == false && os.isSymlink(link) == false
+            if (needed) {
+                problem = healFileKey(shared, link)
+            }
+        } else {
+            needed = true
+            var outcome = runTrapped(HealFolderTask{gameDir = gameDir, key = key, shared = shared, link = link})
+            if (outcome.failed()) {
+                problem = decodeFailure(outcome.error())["message"]
+            }
+        }
+        if (needed == false) {
+            continue
+        }
+        if (problem == "") {
+            report.append({"key": key, "status": "healed"})
+            logInfo("synced: relinked '" + key + "' of profile " + id)
+        } else {
+            report.append({"key": key, "status": "failed", "message": problem})
+            logWarn("synced: cannot relink '" + key + "' of profile " + id + ": " + problem)
+        }
+    }
+    return report
+}
+
+// Heals every profile (called before a game starts, so the shared entries are current).
+method healAllSynced() {
+    for (p in profiles()) {
+        var outcome = runTrapped(HealTask{id = "" + p["id"]})
+        if (outcome.failed()) {
+            logWarn("synced: healing " + p["id"] + " failed: " + outcome.error())
+        }
+    }
 }

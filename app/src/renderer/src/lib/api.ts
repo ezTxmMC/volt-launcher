@@ -7,6 +7,7 @@ import type {
   ExportFormat,
   ExportResult,
   GameStatus,
+  RunningGamesView,
   Job,
   ModFile,
   ModpackStatus,
@@ -48,6 +49,7 @@ import type {
   SyncPackEntry,
   SyncPacksView,
   ProfileSyncPackRemoval,
+  SyncHealEntry,
   ProfileSyncPacksView
 } from '@shared/models'
 import type {
@@ -117,6 +119,8 @@ export interface ContentInstallRequest {
   kind: ContentKind
   /** Defaults to true on the backend; false installs only the requested file. */
   withDependencies?: boolean
+  /** Required for data packs: the world folder they go into. */
+  world?: string
 }
 
 export interface SearchParams {
@@ -207,6 +211,8 @@ export const api = {
     /** Sends the full list of shared folders. 409 while the game of the profile runs, 400 for unknown keys. */
     setSynced: (id: string, synced: SyncedFolder[]) =>
       request<ProfileSyncResult>('PATCH', profilePath(id), { synced }),
+    /** Links shared entries that the game replaced with real files again; never throws for single keys. */
+    healSynced: (id: string) => request<{ report: SyncHealEntry[] }>('POST', `${profilePath(id)}/synced/heal`),
     remove: (id: string) => request<unknown>('DELETE', profilePath(id)),
     duplicate: (id: string, name?: string) =>
       request<Job>('POST', `${profilePath(id)}/duplicate`, name ? { name } : {}),
@@ -217,8 +223,9 @@ export const api = {
     logo: (id: string) => request<ProfileLogo>('GET', `${profilePath(id)}/logo`),
     syncPacks: {
       list: (id: string) => request<ProfileSyncPacksView>('GET', `${profilePath(id)}/syncpacks`),
-      /** Job: links the pack and installs it. 409 while the profile is busy. */
-      link: (id: string, packId: string) => request<Job>('POST', `${profilePath(id)}/syncpacks`, { packId }),
+      /** Job: links the pack and installs it. `retry` clears the declined entries. 409 while the profile is busy. */
+      link: (id: string, packId: string, retry?: boolean) =>
+        request<Job>('POST', `${profilePath(id)}/syncpacks`, retry ? { packId, retry: true } : { packId }),
       /** Keeps or removes the pack's files in the profile. */
       unlink: (id: string, packId: string, removeFiles: boolean) =>
         request<ProfileSyncPackRemoval>(
@@ -323,6 +330,12 @@ export const api = {
     launch: (id: string, quickPlay?: QuickPlay) =>
       request<Job>('POST', `${profilePath(id)}/launch`, quickPlay ? { quickPlay } : undefined),
     stop: (id: string) => request<unknown>('POST', `${profilePath(id)}/game/stop`)
+  },
+  games: {
+    /** Running games of all profiles, oldest first, plus the multiProfile setting. */
+    list: () => request<RunningGamesView>('GET', '/api/games'),
+    /** Sends the stop signal to every running game; answers the profile ids that got it. */
+    stopAll: () => request<{ stopped: string[] }>('POST', '/api/games/stop-all')
   },
   accounts: {
     list: () => request<AccountsView>('GET', '/api/accounts'),

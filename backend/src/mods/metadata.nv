@@ -15,6 +15,10 @@ import core
 // missing strings are null, a jar without any of these files is "unknown".
 
 private final METADATA_LIMIT = 4194304    // 4 MiB per metadata file
+private final METADATA_ENTRIES = [
+    "fabric.mod.json", "quilt.mod.json", "META-INF/neoforge.mods.toml", "META-INF/mods.toml",
+    "mcmod.info", "META-INF/MANIFEST.MF"
+]
 
 method emptyMetadata(string loader): map<string, object> {
     return {
@@ -28,7 +32,7 @@ method emptyMetadata(string loader): map<string, object> {
 
 // The metadata of a jar held in `data`. Raises on a broken archive.
 method readMetadata(string data): map<string, object> {
-    var entries = zipEntries(data)
+    var entries = zipEntriesNamed(data, METADATA_ENTRIES)
     var text = zipReadNamed(data, entries, "fabric.mod.json", METADATA_LIMIT)
     if (text != "") {
         return fabricMetadata(text)

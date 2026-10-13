@@ -364,6 +364,42 @@ result "adding a deleted pack: 404" 404
 req DELETE "/api/syncpacks/$FROM"
 result "delete the other pack" 200
 
+# A pack on a profile without a mod loader: mods are refused with a reason, the rest installs.
+req POST /api/profiles '{"name": "Plain", "minecraftVersion": "9.0.0", "loader": "vanilla"}'
+PLAIN=$(jval "d['id']")
+req POST /api/syncpacks '{"name": "Mixed", "entries": [{"provider": "modrinth", "projectId": "sodiumid", "kind": "mod", "name": "Sodium"}, {"provider": "modrinth", "projectId": "shid", "kind": "shader", "name": "Complementary"}]}'
+MIXED=$(jval "d['id']")
+req POST "/api/profiles/$PLAIN/syncpacks" "{\"packId\": \"$MIXED\"}"
+JOB=$(jval "d['id']")
+wait_job "$JOB"
+jpy "vanilla: the shader installs, the mod is refused with a reason" \
+    "ok = d['result']['installed'] == ['Complementary'] and any('no mod loader' in x for x in d['result']['skipped'])"
+req GET "/api/profiles/$PLAIN/syncpacks"
+jpy "vanilla: the profile view lists the failure and does not call it missing" \
+    "ok = [f['projectId'] for f in d['packs'][0]['failed']] == ['sodiumid'] and d['packs'][0]['missing'] == [] and 'no mod loader' in d['packs'][0]['failed'][0]['reason']"
+req DELETE "/api/syncpacks/$MIXED"
+result "delete the mixed pack" 200
+
+# Linked files that the game replaced by real files are linked again (heal).
+req POST /api/profiles '{"name": "Healer", "minecraftVersion": "9.0.0", "loader": "fabric", "synced": ["servers", "options"]}'
+HEAL=$(jval "d['id']")
+rm "$DATA/profiles/$HEAL/servers.dat" "$DATA/profiles/$HEAL/options.txt"
+printf 'NEW-SERVERS' > "$DATA/profiles/$HEAL/servers.dat"
+: > "$DATA/profiles/$HEAL/options.txt"
+req POST "/api/profiles/$HEAL/synced/heal"
+result "heal answers 200" 200
+jpy "heal: both entries were relinked" "ok = sorted((r['key'], r['status']) for r in d['report']) == [('options', 'healed'), ('servers', 'healed')]"
+CHECKS=$((CHECKS + 1))
+if [ -L "$DATA/profiles/$HEAL/servers.dat" ] && [ "$(cat "$DATA/synced/servers.dat")" = "NEW-SERVERS" ]; then
+    echo "ok    heal: servers.dat is a link again and the shared file has the game's content"
+else
+    FAILURES=$((FAILURES + 1)); echo "FAIL  heal: servers.dat link or shared content"
+fi
+req POST "/api/profiles/$HEAL/synced/heal"
+jpy "heal: nothing to do the second time" "ok = d['report'] == []"
+req POST /api/profiles/000000000000/synced/heal
+result "heal of an unknown profile: 404" 404
+
 # --- new-version profiles ------------------------------------------------------------------------
 req POST /api/syncpacks/auto/check
 result "POST check answers 202" 202

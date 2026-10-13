@@ -3,6 +3,7 @@ import { HashRouter, Navigate, Outlet, Route, Routes } from 'react-router'
 import { I18nProvider } from '@/i18n'
 import { AuthProvider, useAuth } from '@/state/auth'
 import { BackendProvider, useBackendStatus } from '@/state/backend'
+import { GamesProvider } from '@/state/games'
 import { JobsProvider } from '@/state/jobs'
 import { SettingsProvider } from '@/state/settings'
 import { ToastProvider } from '@/state/toast'
@@ -17,6 +18,7 @@ import { ProfileDetailPage } from '@/pages/ProfileDetailPage'
 import { ProfilesPage } from '@/pages/ProfilesPage'
 import { ProjectPage } from '@/pages/ProjectPage'
 import { SettingsPage } from '@/pages/SettingsPage'
+import { PacksPage } from '@/pages/packs/PacksPage'
 import { AccountsPage } from '@/pages/accounts/AccountsPage'
 import { SkinsPage } from '@/pages/accounts/SkinsPage'
 import { SavesPage } from '@/pages/saves/SavesPage'
@@ -43,6 +45,7 @@ export function App() {
           <SettingsProvider fallback={<StartingScreen />}>
             <ToastProvider>
               <JobsProvider>
+                <GamesProvider>
                 <HashRouter>
                   <AuthProvider>
                     <Routes>
@@ -55,6 +58,7 @@ export function App() {
                           <Route path="profiles/:id/saves" element={<SavesPage />} />
                           <Route path="discover" element={<DiscoverPage />} />
                           <Route path="discover/:provider/:id" element={<ProjectPage />} />
+                          <Route path="packs" element={<PacksPage />} />
                           <Route path="news" element={<NewsPage />} />
                           <Route path="settings" element={<SettingsPage />} />
                           <Route path="accounts" element={<AccountsPage />} />
@@ -65,6 +69,7 @@ export function App() {
                     </Routes>
                   </AuthProvider>
                 </HashRouter>
+                </GamesProvider>
               </JobsProvider>
             </ToastProvider>
           </SettingsProvider>
