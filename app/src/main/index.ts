@@ -76,7 +76,7 @@ function registerIpc(): void {
   })
 
   ipcMain.handle(IPC.updateKind, () => updateKind())
-  ipcMain.handle(IPC.updateApply, (_event, filePath: unknown) => applyUpdate(filePath))
+  ipcMain.handle(IPC.updateApply, (_event, filePath: unknown) => applyUpdate(filePath, { stop: () => backend.stop(), start: () => backend.start() }))
 
   backend.onChange((status) => {
     mainWindow?.webContents.send(IPC.backendStatusEvent, status)

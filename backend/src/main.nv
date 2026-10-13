@@ -9,10 +9,11 @@ import migration
 import server
 import system
 import syncpacks
+import thread
 
 // volt-backend - the local HTTP service of VoltLauncher (docs/ARCHITECTURE.md).
 //
-//   volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--enable-test-routes]
+//   volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--parent-pid <pid>] [--enable-test-routes]
 //   volt-backend --migration-dry-run --data-dir <scratch> --legacy-dir <old folder>
 //
 // Started by the Electron main process; listens on 127.0.0.1 only, prints
@@ -21,8 +22,36 @@ import syncpacks
 // dir); a migration from there runs once at start (migration/).
 
 method usage() {
-    eprintln "usage: volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--enable-test-routes]"
+    eprintln "usage: volt-backend --port <int> --token <hex> [--data-dir <path>] [--legacy-dir <path>] [--app-version <x.y.z>] [--parent-pid <pid>] [--enable-test-routes]"
     eprintln "       volt-backend --migration-dry-run --data-dir <scratch dir> --legacy-dir <old folder>"
+}
+
+// Whether the process with this id still exists (kill -0, or tasklist on Windows).
+method processExists(integer pid): bool {
+    if (os.platform() == "windows") {
+        return os.exec("tasklist /FI \"PID eq " + pid + "\" /NH 2>NUL | find \" " + pid + " \" >NUL") == 0
+    }
+    return os.exec("kill -0 " + pid + " 2>/dev/null") == 0
+}
+
+// The launcher app starts this backend and passes its own id (--parent-pid). When that process is gone
+// (a crash, a kill, an update that replaced the app) nobody can reach this backend any more, so it ends
+// instead of running on as an orphan.
+method watchParent(integer pid) {
+    var misses = 0
+    while (true) {
+        thread.sleep(3000)
+        if (processExists(pid)) {
+            misses = 0
+        } else {
+            misses = misses + 1
+        }
+        // Two checks in a row, so one failed probe never ends the backend.
+        if (misses >= 2) {
+            core.logInfo("the launcher (pid " + pid + ") is gone, the backend ends")
+            os.exit(0)
+        }
+    }
 }
 
 method main(array<string> arguments) {
@@ -68,6 +97,10 @@ method main(array<string> arguments) {
     var appVersion = cli.option(parsed, "app-version", "")
     if (appVersion != "" && appVersion != "true") {
         core.setAppVersion(appVersion)
+    }
+    var parentText = cli.option(parsed, "parent-pid", "")
+    if (parentText != "" && strings.isNumeric(parentText) && parentText.contains(".") == false && parentText.contains("-") == false) {
+        thread watchParent(parseInt(parentText))
     }
     core.init(dataDir, cli.flag(parsed, "enable-test-routes"))
     migration.startup(dataDir, legacyDir)

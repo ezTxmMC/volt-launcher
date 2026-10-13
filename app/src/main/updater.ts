@@ -116,7 +116,8 @@ function spawnDetached(command: string, args: string[]): Promise<void> {
 
 async function installNsis(file: string): Promise<UpdateApplyResult> {
   await spawnDetached(file, ['/S', '--updated', '--force-run'])
-  app.quit()
+  // exit, not quit: nothing may keep the old files open while the installer replaces them.
+  app.exit(0)
   return { ok: true }
 }
 
@@ -152,7 +153,7 @@ async function replaceMacApp(zip: string): Promise<UpdateApplyResult> {
   const script = join(work, 'replace.sh')
   writeFileSync(script, MAC_REPLACE_SCRIPT, { mode: 0o700 })
   await spawnDetached('/bin/sh', [script, String(process.pid), join(extracted, newBundle), bundle, work])
-  app.quit()
+  app.exit(0)
   return { ok: true }
 }
 
@@ -174,7 +175,10 @@ async function installPackage(command: 'dpkg' | 'rpm', args: string[]): Promise<
  * Installs a file from `<dataDir>/updates` and restarts the launcher. The install kind is detected
  * here, never taken from the renderer; only the file path comes from the renderer, and it is checked.
  */
-export async function applyUpdate(requested: unknown): Promise<UpdateApplyResult> {
+export async function applyUpdate(
+  requested: unknown,
+  backend: { stop: () => Promise<void>; start: () => Promise<void> }
+): Promise<UpdateApplyResult> {
   if (typeof requested !== 'string' || requested.length === 0) return { ok: false, message: 'Invalid path.' }
   let file: string
   try {
@@ -182,23 +186,40 @@ export async function applyUpdate(requested: unknown): Promise<UpdateApplyResult
   } catch (error) {
     return { ok: false, message: messageOf(error) }
   }
+  let stopped = false
   try {
-    switch (await detectInstallKind()) {
-      case 'nsis':
-        return await installNsis(file)
-      case 'appimage':
-        return replaceAppImage(file)
-      case 'mac-app':
-        return await replaceMacApp(file)
-      case 'deb':
-        return await installPackage('dpkg', ['-i', file])
-      case 'rpm':
-        return await installPackage('rpm', ['-U', '--replacepkgs', file])
-      default:
-        shell.showItemInFolder(file)
-        return { ok: false, manual: true }
+    const kind = await detectInstallKind()
+    // The backend must be gone before any file is replaced: it would lock its binary (Windows), be replaced
+    // under a running process, and outlive the launcher as an orphan. app.exit() skips before-quit, so the
+    // cleanup cannot be left to it.
+    if (kind !== 'manual' && kind !== 'flatpak') {
+      await backend.stop()
+      stopped = true
     }
+    const result = await applyKind(kind, file)
+    // The install did not happen (cancelled, failed): the launcher stays open, so its backend must run again.
+    if (!result.ok && stopped) void backend.start()
+    return result
   } catch (error) {
+    if (stopped) void backend.start()
     return { ok: false, message: messageOf(error) }
+  }
+}
+
+async function applyKind(kind: InstallKind, file: string): Promise<UpdateApplyResult> {
+  switch (kind) {
+    case 'nsis':
+      return installNsis(file)
+    case 'appimage':
+      return replaceAppImage(file)
+    case 'mac-app':
+      return replaceMacApp(file)
+    case 'deb':
+      return installPackage('dpkg', ['-i', file])
+    case 'rpm':
+      return installPackage('rpm', ['-U', '--replacepkgs', file])
+    default:
+      shell.showItemInFolder(file)
+      return { ok: false, manual: true }
   }
 }

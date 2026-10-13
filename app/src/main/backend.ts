@@ -6,6 +6,7 @@ import { createServer } from 'node:net'
 import { join } from 'node:path'
 import { app } from 'electron'
 import type { ApiResult, BackendStatus, HttpMethod } from '@shared/bridge'
+import { killStaleBackends } from './staleBackend'
 
 const STARTUP_TIMEOUT_MS = 15_000
 const REQUEST_TIMEOUT_MS = 120_000
@@ -117,10 +118,14 @@ export class BackendManager {
       this.token = randomBytes(32).toString('hex')
       const dataDir = launcherDataDir()
       mkdirSync(dataDir, { recursive: true })
+      // A backend left over from an earlier run (crash, update) would write the same data directory.
+      const ended = await killStaleBackends(dataDir, [this.child?.pid])
+      if (ended > 0) this.appendLog(Buffer.from(`[launcher] ended ${ended} stale backend process(es)\n`))
+      if (generation !== this.generation) return
 
       const child = spawn(
         binary,
-        ['--port', String(this.port), '--token', this.token, '--data-dir', dataDir, '--app-version', app.getVersion()],
+        ['--port', String(this.port), '--token', this.token, '--data-dir', dataDir, '--app-version', app.getVersion(), '--parent-pid', String(process.pid)],
         {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true
@@ -178,6 +183,35 @@ export class BackendManager {
     // Last resort so a hung backend never outlives the launcher.
     process.once('exit', () => {
       if (child.exitCode === null) child.kill('SIGKILL')
+    })
+  }
+
+  /**
+   * Stops the child and waits until it is gone: SIGTERM, then SIGKILL after `graceMs`. Used before an update
+   * replaces the files (a running backend would lock them, or outlive the launcher as an orphan). Resolves at
+   * once when there is no child. A restart or `start()` afterwards works as usual.
+   */
+  stop(graceMs = 4000): Promise<void> {
+    this.stopping = true
+    // A pending start() or health wait gives up (its generation is no longer current).
+    this.generation++
+    const child = this.child
+    if (child === null || child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      let finished = false
+      const done = (): void => {
+        if (finished) return
+        finished = true
+        clearTimeout(timer)
+        resolve()
+      }
+      child.once('exit', done)
+      child.kill('SIGTERM')
+      const timer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        // The kill cannot be refused for our own child; do not wait forever for the exit event anyway.
+        setTimeout(done, 1500)
+      }, graceMs)
     })
   }
 
