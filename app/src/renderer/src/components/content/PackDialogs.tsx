@@ -102,7 +102,9 @@ export function ImportDialog({ onStarted, onClose }: { onStarted: (job: Job) => 
   const [busy, setBusy] = useState(false)
 
   const run = async (): Promise<void> => {
-    if (path.trim() === '') return
+    if (path.trim() === '') {
+      return
+    }
     setBusy(true)
     try {
       const job = await api.modpack.importFile(path.trim(), name.trim())
@@ -163,10 +165,16 @@ type NameProblem = 'empty' | 'tooLong' | 'taken'
 
 /** Checks the trimmed name. `taken` is only a warning: the backend accepts duplicate profile names. */
 function nameProblemOf(trimmed: string, taken: readonly string[]): NameProblem | null {
-  if (trimmed === '') return 'empty'
-  if (trimmed.length > PACK_NAME_MAX) return 'tooLong'
+  if (trimmed === '') {
+    return 'empty'
+  }
+  if (trimmed.length > PACK_NAME_MAX) {
+    return 'tooLong'
+  }
   const wanted = trimmed.toLowerCase()
-  if (taken.some((other) => other.trim().toLowerCase() === wanted)) return 'taken'
+  if (taken.some((other) => other.trim().toLowerCase() === wanted)) {
+    return 'taken'
+  }
   return null
 }
 
@@ -205,15 +213,20 @@ export function InstallPackDialog({
   const blocked = problem === 'empty' || problem === 'tooLong'
 
   const submit = async (): Promise<void> => {
-    if (blocked || busy) return
+    if (blocked || busy) {
+      return
+    }
     setBusy(true)
     setConflict('')
     try {
       await onInstall(trimmed)
       onClose()
     } catch (failure) {
-      if (isConflict(failure)) setConflict(errorMessage(failure))
-      else toast.error(failure)
+      if (isConflict(failure)) {
+        setConflict(errorMessage(failure))
+      } else {
+        toast.error(failure)
+      }
       setBusy(false)
     }
   }

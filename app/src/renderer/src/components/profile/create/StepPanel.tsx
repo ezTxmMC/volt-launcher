@@ -13,8 +13,12 @@ export function StepPanel({ direction, children }: { direction: 1 | -1; children
 
   useLayoutEffect(() => {
     const element = ref.current
-    if (!element || !animate || typeof element.animate !== 'function') return
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    if (!element || !animate || typeof element.animate !== 'function') {
+      return
+    }
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      return
+    }
     const offset = 18 * direction
     element.animate(
       [

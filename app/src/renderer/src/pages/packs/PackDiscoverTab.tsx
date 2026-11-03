@@ -50,7 +50,9 @@ export function PackDiscoverTab({ pack, onChanged }: { pack: SyncPack; onChanged
   }
 
   const renderAction = (project: ProjectSummary) => {
-    if (project.kind !== 'mod' && project.kind !== 'resourcepack' && project.kind !== 'shader') return null
+    if (project.kind !== 'mod' && project.kind !== 'resourcepack' && project.kind !== 'shader') {
+      return null
+    }
     const key = entryKey(entryOf(project))
     if (entries.some((existing) => entryKey(existing) === key && existing.kind === project.kind)) {
       return (

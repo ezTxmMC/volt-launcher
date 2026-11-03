@@ -21,12 +21,16 @@ const STATE_LABEL: Record<GameEntryState, MessageKey> = {
 export function useUptime(startedAt: string | null): number | null {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    if (startedAt === null) return
+    if (startedAt === null) {
+      return
+    }
     setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [startedAt])
-  if (startedAt === null) return null
+  if (startedAt === null) {
+    return null
+  }
   const start = Date.parse(startedAt)
   return Number.isNaN(start) ? null : Math.max(0, Math.floor((now - start) / 1000))
 }

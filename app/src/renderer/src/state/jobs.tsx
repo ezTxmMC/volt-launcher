@@ -50,7 +50,11 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       const previous = knownStates.current.get(job.id)
       knownStates.current.set(job.id, job.state)
       const justFinished = job.state !== 'running' && (previous === 'running' || (previous === undefined && announceUnseenFinished))
-      if (justFinished) for (const listener of listeners.current) listener(job)
+      if (justFinished) {
+        for (const listener of listeners.current) {
+          listener(job)
+        }
+      }
     }
   }, [])
 
@@ -85,7 +89,9 @@ export function JobsProvider({ children }: { children: ReactNode }) {
 
   // Poll only while something is running.
   useEffect(() => {
-    if (!polling) return
+    if (!polling) {
+      return
+    }
     let stopped = false
     let timer: ReturnType<typeof setTimeout> | undefined
     const tick = async (): Promise<void> => {
@@ -94,7 +100,9 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       } catch {
         // transient error: try again on the next tick
       }
-      if (!stopped) timer = setTimeout(() => void tick(), POLL_INTERVAL_MS)
+      if (!stopped) {
+        timer = setTimeout(() => void tick(), POLL_INTERVAL_MS)
+      }
     }
     timer = setTimeout(() => void tick(), POLL_INTERVAL_MS)
     return () => {
@@ -125,7 +133,9 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       onJobFinished((job) => {
         if (job.state === 'done') {
           // An import reports its own count on the profile page; a second toast would repeat it.
-          if (job.kind === 'import') return
+          if (job.kind === 'import') {
+            return
+          }
           const syncSummary = job.kind === 'syncpack' ? summarizeSyncJob(job) : null
           if (syncSummary) {
             // A pack job tells what arrived and why the rest did not (the reasons come from the backend).
@@ -175,7 +185,9 @@ export function JobsProvider({ children }: { children: ReactNode }) {
 
 export function useJobs(): JobsValue {
   const value = useContext(JobsContext)
-  if (!value) throw new Error('useJobs must be used inside JobsProvider')
+  if (!value) {
+    throw new Error('useJobs must be used inside JobsProvider')
+  }
   return value
 }
 

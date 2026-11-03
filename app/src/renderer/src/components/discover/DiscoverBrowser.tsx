@@ -129,7 +129,9 @@ export function DiscoverBrowser({ kinds, lock, renderAction, profileId, renderSc
 
   // A page past the last one (for example after a shorter result) moves to the last page.
   useEffect(() => {
-    if (pages === null || search.loading || search.total === null || search.total === 0 || page <= pages) return
+    if (pages === null || search.loading || search.total === null || search.total === 0 || page <= pages) {
+      return
+    }
     setParams(
       (current) => {
         const next = new URLSearchParams(current)
@@ -142,9 +144,13 @@ export function DiscoverBrowser({ kinds, lock, renderAction, profileId, renderSc
 
   // Escape closes the filter drawer (narrow screens).
   useEffect(() => {
-    if (!drawerOpen) return
+    if (!drawerOpen) {
+      return
+    }
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setDrawerOpen(false)
+      if (event.key === 'Escape') {
+        setDrawerOpen(false)
+      }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
@@ -156,11 +162,16 @@ export function DiscoverBrowser({ kinds, lock, renderAction, profileId, renderSc
         (current) => {
           const next = new URLSearchParams(current)
           for (const [key, value] of Object.entries(changes)) {
-            if (value) next.set(key, value)
-            else next.delete(key)
+            if (value) {
+              next.set(key, value)
+            } else {
+              next.delete(key)
+            }
           }
           // Any change of the search, a filter or the page size starts again at the first page.
-          if (resetPage) next.delete('page')
+          if (resetPage) {
+            next.delete('page')
+          }
           return next
         },
         { replace: true }

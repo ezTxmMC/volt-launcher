@@ -80,7 +80,9 @@ const ANIMATION_RULES = `
 
 /** Injected once, so the animation switch needs no change to the stylesheet file. */
 function ensureStyleElement(): void {
-  if (document.getElementById(STYLE_ID)) return
+  if (document.getElementById(STYLE_ID)) {
+    return
+  }
   const style = document.createElement('style')
   style.id = STYLE_ID
   style.textContent = ANIMATION_RULES
@@ -95,8 +97,11 @@ export function applyAppearance(settings: Pick<Settings, 'accentColor' | 'uiScal
   const tokens = accent === DEFAULT_ACCENT ? {} : accentTokens(accent)
   for (const name of Object.keys(accentTokens(DEFAULT_ACCENT))) {
     const value = tokens[name]
-    if (value) root.style.setProperty(name, value)
-    else root.style.removeProperty(name)
+    if (value) {
+      root.style.setProperty(name, value)
+    } else {
+      root.style.removeProperty(name)
+    }
   }
 
   const scale = UI_SCALE_FACTORS[settings.uiScale] ?? 1

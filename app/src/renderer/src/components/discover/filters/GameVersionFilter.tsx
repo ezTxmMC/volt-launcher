@@ -40,7 +40,9 @@ export function GameVersionFilter({ versions, value, onChange }: GameVersionFilt
   const matching = needle ? versions.filter((version) => version.toLowerCase().includes(needle)) : versions
   let visible = needle || showAll ? matching : matching.slice(0, PREVIEW_COUNT)
   // The chosen version stays in the list even when it is outside the preview.
-  if (value && !needle && !visible.includes(value)) visible = [value, ...visible]
+  if (value && !needle && !visible.includes(value)) {
+    visible = [value, ...visible]
+  }
 
   return (
     <>

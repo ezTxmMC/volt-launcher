@@ -15,12 +15,18 @@ export function JobsButton() {
   const container = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      return
+    }
     const onPointer = (event: PointerEvent): void => {
-      if (container.current && !container.current.contains(event.target as Node)) setOpen(false)
+      if (container.current && !container.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
     }
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
     }
     document.addEventListener('pointerdown', onPointer)
     document.addEventListener('keydown', onKey)

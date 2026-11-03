@@ -37,7 +37,9 @@ export function AdvancedSection() {
 /** Parses a whole number in [min, max], or undefined. */
 function parseRange(text: string, min: number, max: number): number | undefined {
   const trimmed = text.trim()
-  if (!/^\d+$/.test(trimmed)) return undefined
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined
+  }
   const value = Number(trimmed)
   return value >= min && value <= max ? value : undefined
 }
@@ -139,7 +141,9 @@ function DirectoriesCard() {
         return
       }
       const problem = await window.volt.openPath(path)
-      if (problem) toast.error(problem)
+      if (problem) {
+        toast.error(problem)
+      }
     } catch (error) {
       toast.error(error)
     }
@@ -183,7 +187,9 @@ function DiagnosticsCard() {
         return
       }
       const problem = await window.volt.openPath(path)
-      if (problem) toast.error(problem)
+      if (problem) {
+        toast.error(problem)
+      }
     } catch (error) {
       toast.error(error)
     }

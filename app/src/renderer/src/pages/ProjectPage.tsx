@@ -87,7 +87,9 @@ export function ProjectPage() {
   // A target that was chosen before the page opened fills the version filters once its data is there.
   const filled = useRef('')
   useEffect(() => {
-    if (!target || !project || filled.current === `${target.id}|${project.id}`) return
+    if (!target || !project || filled.current === `${target.id}|${project.id}`) {
+      return
+    }
     filled.current = `${target.id}|${project.id}`
     applyProfileFilters(target)
   }, [target, project, applyProfileFilters])
@@ -106,7 +108,9 @@ export function ProjectPage() {
   }
 
   const installContent = async (version: ProjectVersion, profile: Profile): Promise<void> => {
-    if (!project) return
+    if (!project) {
+      return
+    }
     try {
       const job = await api.providers.installContent(profile.id, {
         provider: providerId,
@@ -125,9 +129,13 @@ export function ProjectPage() {
   }
 
   const onInstall = (version: ProjectVersion): void => {
-    if (isPack) setPackVersion(version)
-    else if (target) void installContent(version, target).catch(() => undefined)
-    else setPicking(version)
+    if (isPack) {
+      setPackVersion(version)
+    } else if (target) {
+      void installContent(version, target).catch(() => undefined)
+    } else {
+      setPicking(version)
+    }
   }
 
   if (!project) {
@@ -318,8 +326,11 @@ function BackLink() {
   const navigate = useNavigate()
   // Going back keeps the search state of the Discover page; fall back to it on a fresh start.
   const goBack = (): void => {
-    if (window.history.length > 1) void navigate(-1)
-    else void navigate('/discover')
+    if (window.history.length > 1) {
+      void navigate(-1)
+    } else {
+      void navigate('/discover')
+    }
   }
   return (
     <button type="button" onClick={goBack} className="inline-flex w-fit items-center gap-1 text-muted hover:text-fg">

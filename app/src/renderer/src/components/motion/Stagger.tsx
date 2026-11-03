@@ -29,7 +29,9 @@ export function Stagger({ as = 'div', children, className, ...rest }: StaggerPro
   useEffect(() => {
     // Only the first commit with children starts the timer; the timer removes the hook (not the animation
     // already running on the children). No cleanup: StrictMode runs effects twice and must not cancel it.
-    if (!hasChildren || scheduled.current) return
+    if (!hasChildren || scheduled.current) {
+      return
+    }
     scheduled.current = true
     window.setTimeout(() => ref.current?.removeAttribute('data-stagger'), PLAY_WINDOW_MS)
   }, [hasChildren])

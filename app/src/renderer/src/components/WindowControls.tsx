@@ -12,13 +12,19 @@ export function WindowControls() {
 
   useEffect(() => {
     const bridge = window.volt
-    if (!bridge) return
+    if (!bridge) {
+      return
+    }
     let active = true
     void bridge.isMaximized().then((value) => {
-      if (active) setMaximized(value)
+      if (active) {
+        setMaximized(value)
+      }
     })
     const unsubscribe = bridge.onMaximizedChange((value) => {
-      if (active) setMaximized(value)
+      if (active) {
+        setMaximized(value)
+      }
     })
     return () => {
       active = false

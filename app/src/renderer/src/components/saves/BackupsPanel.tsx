@@ -31,10 +31,15 @@ export function BackupsPanel({ profile }: { profile: Profile }) {
 
   // Backups are written and restored as jobs: refresh the list when one of ours ends.
   useJobFinished((job: Job) => {
-    if (!jobIds.includes(job.id)) return
+    if (!jobIds.includes(job.id)) {
+      return
+    }
     reload()
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
-    else if (job.state === 'done') toast.success(t('job.finished', { title: job.title }))
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    } else if (job.state === 'done') {
+      toast.success(t('job.finished', { title: job.title }))
+    }
   })
 
   const ownJobs = jobs.filter((job) => jobIds.includes(job.id) && job.state === 'running')
@@ -49,7 +54,9 @@ export function BackupsPanel({ profile }: { profile: Profile }) {
     try {
       const folder = await api.saves.openBackupsFolder(profile.id)
       const problem = await window.volt?.openPath(folder.path)
-      if (problem) toast.error(problem)
+      if (problem) {
+        toast.error(problem)
+      }
     } catch (failure) {
       toast.error(failure)
     }

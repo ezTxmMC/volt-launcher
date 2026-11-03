@@ -47,7 +47,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     (kind: ToastKind, message: string, title?: string) => {
       const id = nextId.current++
       setItems((current) => {
-        if (current.some((item) => item.kind === kind && item.message === message)) return current
+        if (current.some((item) => item.kind === kind && item.message === message)) {
+          return current
+        }
         return [...current.slice(-3), { id, kind, title, message }]
       })
       // Also armed for a skipped toast: dismissing an id that is not shown is a no-op.
@@ -102,6 +104,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
 export function useToast(): ToastApi {
   const value = useContext(ToastContext)
-  if (!value) throw new Error('useToast must be used inside ToastProvider')
+  if (!value) {
+    throw new Error('useToast must be used inside ToastProvider')
+  }
   return value
 }

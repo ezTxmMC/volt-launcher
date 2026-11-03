@@ -21,7 +21,9 @@ const RESOLVED_ID = `\0${VIRTUAL_ID}`
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
     const full = join(dir, entry)
-    if (statSync(full).isDirectory()) return sourceFiles(full)
+    if (statSync(full).isDirectory()) {
+      return sourceFiles(full)
+    }
     return /\.(ts|tsx)$/.test(entry) ? [full] : []
   })
 }
@@ -39,11 +41,15 @@ export function lucideSubset(): Plugin {
     name: 'volt-lucide-subset',
     resolveId: (id) => (id === VIRTUAL_ID ? RESOLVED_ID : null),
     load(id) {
-      if (id !== RESOLVED_ID) return null
+      if (id !== RESOLVED_ID) {
+        return null
+      }
       const used = new Set<string>()
       for (const file of sourceFiles(sourceDir)) {
         for (const match of readFileSync(file, 'utf8').matchAll(/lucide:([a-z0-9-]+)/g)) {
-          if (match[1]) used.add(match[1])
+          if (match[1]) {
+            used.add(match[1])
+          }
         }
       }
       const full = JSON.parse(readFileSync(collectionFile, 'utf8')) as IconifyCollection
@@ -55,8 +61,11 @@ export function lucideSubset(): Plugin {
       }
       for (const name of used) {
         const icon = full.icons[name] ?? full.icons[full.aliases?.[name]?.parent ?? '']
-        if (icon) subset.icons[name] = icon
-        else this.warn(`Unknown Lucide icon: ${name}`)
+        if (icon) {
+          subset.icons[name] = icon
+        } else {
+          this.warn(`Unknown Lucide icon: ${name}`)
+        }
       }
       return `export default ${JSON.stringify(subset)}`
     }

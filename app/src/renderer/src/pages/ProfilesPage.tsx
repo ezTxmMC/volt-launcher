@@ -33,9 +33,15 @@ function sortProfiles(list: readonly ProfileListItem[], sort: SortKey, language:
       case 'playtime':
         return b.totalPlaytimeMs - a.totalPlaytimeMs
       case 'lastPlayed':
-        if (!a.lastPlayed && !b.lastPlayed) return a.name.localeCompare(b.name, language, { sensitivity: 'base' })
-        if (!a.lastPlayed) return 1
-        if (!b.lastPlayed) return -1
+        if (!a.lastPlayed && !b.lastPlayed) {
+          return a.name.localeCompare(b.name, language, { sensitivity: 'base' })
+        }
+        if (!a.lastPlayed) {
+          return 1
+        }
+        if (!b.lastPlayed) {
+          return -1
+        }
         return b.lastPlayed.localeCompare(a.lastPlayed)
     }
   })
@@ -43,7 +49,9 @@ function sortProfiles(list: readonly ProfileListItem[], sort: SortKey, language:
 }
 
 function matches(profile: Profile, needle: string): boolean {
-  if (needle === '') return true
+  if (needle === '') {
+    return true
+  }
   const haystack = [profile.name, profile.group ?? '', profile.minecraftVersion, profile.loader, LOADER_NAMES[profile.loader]]
     .join(' ')
     .toLowerCase()
@@ -67,19 +75,30 @@ export function ProfilesPage() {
 
   // An import finished: show the new profiles and report how many were copied.
   useJobFinished((job) => {
-    if (job.kind !== 'import') return
+    if (job.kind !== 'import') {
+      return
+    }
     const count = pendingImports.current.get(job.id)
     pendingImports.current.delete(job.id)
     reload()
-    if (job.state !== 'done') return
-    if (count === undefined) toast.success(t('imports.done.generic'))
-    else toast.success(count === 1 ? t('imports.done.one') : t('imports.done.many', { count }))
+    if (job.state !== 'done') {
+      return
+    }
+    if (count === undefined) {
+      toast.success(t('imports.done.generic'))
+    } else {
+      toast.success(count === 1 ? t('imports.done.one') : t('imports.done.many', { count }))
+    }
   })
 
   // Running jobs by profile (cards show their progress) and pack installs whose profile is not created yet.
   const jobByProfile = useMemo(() => {
     const map = new Map<string, Job>()
-    for (const job of jobs) if (job.state === 'running' && job.profileId && !map.has(job.profileId)) map.set(job.profileId, job)
+    for (const job of jobs) {
+      if (job.state === 'running' && job.profileId && !map.has(job.profileId)) {
+        map.set(job.profileId, job)
+      }
+    }
     return map
   }, [jobs])
   const placeholders = useMemo(
@@ -93,7 +112,9 @@ export function ProfilesPage() {
     .join('|')
   const firstPackJobKey = useRef(packJobKey)
   useEffect(() => {
-    if (firstPackJobKey.current === packJobKey) return
+    if (firstPackJobKey.current === packJobKey) {
+      return
+    }
     firstPackJobKey.current = packJobKey
     reload()
   }, [packJobKey, reload])
@@ -110,7 +131,9 @@ export function ProfilesPage() {
   const runningKey = [...runningIds].sort().join('|')
   const firstRunningKey = useRef(runningKey)
   useEffect(() => {
-    if (firstRunningKey.current === runningKey) return
+    if (firstRunningKey.current === runningKey) {
+      return
+    }
     firstRunningKey.current = runningKey
     reload()
   }, [runningKey, reload])
@@ -126,7 +149,9 @@ export function ProfilesPage() {
   const groups = useMemo(() => {
     const byName = new Map<string, ProfileListItem[]>()
     for (const profile of visible) {
-      if (profile.favourite || !profile.group) continue
+      if (profile.favourite || !profile.group) {
+        continue
+      }
       const list = byName.get(profile.group) ?? []
       list.push(profile)
       byName.set(profile.group, list)
@@ -149,9 +174,15 @@ export function ProfilesPage() {
   if (favouritesOnly) {
     sections.push({ key: 'all', label: t('profiles.favourites'), items: visible })
   } else {
-    if (favourites.length > 0) sections.push({ key: 'favourites', label: t('profiles.favourites'), items: favourites })
-    for (const [name, items] of groups) sections.push({ key: `group:${name}`, label: name, items })
-    if (ungrouped.length > 0) sections.push({ key: 'ungrouped', label: t('profiles.ungrouped'), items: ungrouped })
+    if (favourites.length > 0) {
+      sections.push({ key: 'favourites', label: t('profiles.favourites'), items: favourites })
+    }
+    for (const [name, items] of groups) {
+      sections.push({ key: `group:${name}`, label: name, items })
+    }
+    if (ungrouped.length > 0) {
+      sections.push({ key: 'ungrouped', label: t('profiles.ungrouped'), items: ungrouped })
+    }
   }
 
   return (

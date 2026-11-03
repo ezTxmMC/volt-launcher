@@ -24,7 +24,9 @@ export function ScreenshotsPanel({ profile }: { profile: Profile }) {
     try {
       const folder = await api.saves.openScreenshotFolder(profile.id)
       const problem = await window.volt?.openPath(folder.path)
-      if (problem) toast.error(problem)
+      if (problem) {
+        toast.error(problem)
+      }
     } catch (failure) {
       toast.error(failure)
     }
@@ -118,14 +120,20 @@ function useShotSource(profileId: string, shot: ScreenshotInfo, enabled: boolean
   const key = `${profileId}/${shot.fileName}`
 
   useEffect(() => {
-    if (!enabled) return
+    if (!enabled) {
+      return
+    }
     let cancelled = false
     api.saves.screenshotImage(profileId, shot.fileName).then(
       (result) => {
-        if (!cancelled) setState({ key, src: result.dataUrl, failed: false })
+        if (!cancelled) {
+          setState({ key, src: result.dataUrl, failed: false })
+        }
       },
       () => {
-        if (!cancelled) setState({ key, src: null, failed: true })
+        if (!cancelled) {
+          setState({ key, src: null, failed: true })
+        }
       }
     )
     return () => {
@@ -143,7 +151,9 @@ function ShotThumb({ profileId, shot, onOpen }: { profileId: string; shot: Scree
 
   useEffect(() => {
     const element = ref.current
-    if (!element) return
+    if (!element) {
+      return
+    }
     if (typeof IntersectionObserver === 'undefined') {
       setVisible(true)
       return
@@ -186,7 +196,11 @@ function ShotThumb({ profileId, shot, onOpen }: { profileId: string; shot: Scree
 
 function ShotImage({ profileId, shot, className }: { profileId: string; shot: ScreenshotInfo; className: string }) {
   const { src, failed } = useShotSource(profileId, shot, true)
-  if (src) return <img src={src} alt={shot.fileName} className={className} />
-  if (failed) return <ErrorNotice message={shot.fileName} />
+  if (src) {
+    return <img src={src} alt={shot.fileName} className={className} />
+  }
+  if (failed) {
+    return <ErrorNotice message={shot.fileName} />
+  }
   return <LoadingBlock />
 }

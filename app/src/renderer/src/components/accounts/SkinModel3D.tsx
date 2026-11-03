@@ -15,7 +15,9 @@ export function SkinModel3D({ src, slim, back, className = '' }: { src: string; 
   useEffect(() => {
     const canvas = canvasRef.current
     const frame = frameRef.current
-    if (!canvas || !frame) return
+    if (!canvas || !frame) {
+      return
+    }
     let viewer: SkinViewer
     try {
       viewer = new SkinViewer({ canvas, width: frame.clientWidth || 240, height: frame.clientHeight || 300 })
@@ -28,7 +30,9 @@ export function SkinModel3D({ src, slim, back, className = '' }: { src: string; 
     viewer.controls.enablePan = false
     viewerRef.current = viewer
     const observer = new ResizeObserver(() => {
-      if (frame.clientWidth > 0 && frame.clientHeight > 0) viewer.setSize(frame.clientWidth, frame.clientHeight)
+      if (frame.clientWidth > 0 && frame.clientHeight > 0) {
+        viewer.setSize(frame.clientWidth, frame.clientHeight)
+      }
     })
     observer.observe(frame)
     return () => {
@@ -41,14 +45,18 @@ export function SkinModel3D({ src, slim, back, className = '' }: { src: string; 
   // The skin and the view follow the props; the model keeps its place while the skin changes.
   useEffect(() => {
     const viewer = viewerRef.current
-    if (!viewer) return
+    if (!viewer) {
+      return
+    }
     setFailed(false)
     viewer.loadSkin(src, { model: slim ? 'slim' : 'default' }).catch(() => setFailed(true))
   }, [src, slim])
 
   useEffect(() => {
     const viewer = viewerRef.current
-    if (viewer) viewer.playerObject.rotation.y = back ? Math.PI : 0
+    if (viewer) {
+      viewer.playerObject.rotation.y = back ? Math.PI : 0
+    }
   }, [back])
 
   return (

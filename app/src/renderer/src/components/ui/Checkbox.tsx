@@ -31,7 +31,9 @@ export function Checkbox({
   const inputRef = useRef<HTMLInputElement>(null)
   // The indeterminate state exists only as a DOM property.
   useEffect(() => {
-    if (inputRef.current) inputRef.current.indeterminate = indeterminate
+    if (inputRef.current) {
+      inputRef.current.indeterminate = indeterminate
+    }
   }, [indeterminate])
 
   const filled = checked || indeterminate

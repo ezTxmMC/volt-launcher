@@ -75,12 +75,20 @@ export function GamesProvider({ children }: { children: ReactNode }) {
     const nextIds = new Set(view.games.map((game) => game.profileId))
     if (known) {
       for (const [id, name] of known) {
-        if (nextIds.has(id)) continue
+        if (nextIds.has(id)) {
+          continue
+        }
         // A stop the user asked for here is no news; a game that ended by itself (quit, crash, stopped elsewhere) is.
-        if (!stoppedHere.current.has(id)) toast.info(t('games.exited', { name }))
+        if (!stoppedHere.current.has(id)) {
+          toast.info(t('games.exited', { name }))
+        }
       }
     }
-    for (const id of [...stoppedHere.current]) if (!nextIds.has(id)) stoppedHere.current.delete(id)
+    for (const id of [...stoppedHere.current]) {
+      if (!nextIds.has(id)) {
+        stoppedHere.current.delete(id)
+      }
+    }
     previous.current = new Map(view.games.map((game) => [game.profileId, game.name]))
     setGames(view.games)
     setStopping((current) => {
@@ -108,17 +116,23 @@ export function GamesProvider({ children }: { children: ReactNode }) {
 
   // A launch job that ended turned into a running game (or failed): look at once instead of waiting for the next tick.
   useJobFinished((job) => {
-    if (job.kind === 'launch') reload()
+    if (job.kind === 'launch') {
+      reload()
+    }
   })
 
   // Names, versions and logos of the rows come from the profile list; load it again when the set of rows changes.
   const rowKey = [...games.map((game) => game.profileId), ...launching.map((job) => job.profileId)].join('|')
   useEffect(() => {
-    if (rowKey === '') return
+    if (rowKey === '') {
+      return
+    }
     let cancelled = false
     api.profiles.list().then(
       (list) => {
-        if (!cancelled) setProfiles(list)
+        if (!cancelled) {
+          setProfiles(list)
+        }
       },
       () => undefined
     )
@@ -139,7 +153,9 @@ export function GamesProvider({ children }: { children: ReactNode }) {
     const seen = new Set(list.map((entry) => entry.profileId))
     for (const job of launching) {
       const id = job.profileId
-      if (id === null || seen.has(id)) continue
+      if (id === null || seen.has(id)) {
+        continue
+      }
       seen.add(id)
       const profile = byId.get(id)
       list.push({
@@ -157,7 +173,9 @@ export function GamesProvider({ children }: { children: ReactNode }) {
 
   const blockedBy = useCallback(
     (profileId: string): string | null => {
-      if (multiProfile) return null
+      if (multiProfile) {
+        return null
+      }
       return entries.find((entry) => entry.profileId !== profileId)?.name ?? null
     },
     [entries, multiProfile]
@@ -181,13 +199,19 @@ export function GamesProvider({ children }: { children: ReactNode }) {
 
   const stopAll = useCallback(async () => {
     const ids = games.map((game) => game.profileId)
-    for (const id of ids) stoppedHere.current.add(id)
+    for (const id of ids) {
+      stoppedHere.current.add(id)
+    }
     setStopping((current) => new Set([...current, ...ids]))
     try {
       const result = await api.games.stopAll()
-      for (const id of result.stopped) stoppedHere.current.add(id)
+      for (const id of result.stopped) {
+        stoppedHere.current.add(id)
+      }
     } catch (error) {
-      for (const id of ids) stoppedHere.current.delete(id)
+      for (const id of ids) {
+        stoppedHere.current.delete(id)
+      }
       setStopping(new Set())
       throw error
     }
@@ -214,7 +238,9 @@ export function GamesProvider({ children }: { children: ReactNode }) {
 
 export function useGames(): GamesValue {
   const value = useContext(GamesContext)
-  if (!value) throw new Error('useGames must be used inside GamesProvider')
+  if (!value) {
+    throw new Error('useGames must be used inside GamesProvider')
+  }
   return value
 }
 

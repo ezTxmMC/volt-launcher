@@ -13,7 +13,9 @@ type Status = 'loading' | 'ready' | 'failed'
 /** Draws the face and the hat overlay of the skin into the canvas, nearest-neighbour scaled. */
 function drawHead(canvas: HTMLCanvasElement, skin: HTMLImageElement): void {
   const context = canvas.getContext('2d')
-  if (!context) throw new Error('2D canvas is not available')
+  if (!context) {
+    throw new Error('2D canvas is not available')
+  }
   context.imageSmoothingEnabled = false
   context.clearRect(0, 0, canvas.width, canvas.height)
   context.drawImage(skin, FACE.x, FACE.y, HEAD, HEAD, 0, 0, canvas.width, canvas.height)
@@ -45,7 +47,9 @@ export function AccountAvatar({
     const image = new Image()
     image.onload = () => {
       const canvas = canvasRef.current
-      if (cancelled) return
+      if (cancelled) {
+        return
+      }
       if (!canvas || image.naturalWidth < 64 || image.naturalHeight < 32) {
         setStatus('failed')
         return
@@ -58,7 +62,9 @@ export function AccountAvatar({
       }
     }
     image.onerror = () => {
-      if (!cancelled) setStatus('failed')
+      if (!cancelled) {
+        setStatus('failed')
+      }
     }
     setStatus('loading')
     image.src = source

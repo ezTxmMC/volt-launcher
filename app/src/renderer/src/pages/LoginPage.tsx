@@ -19,7 +19,9 @@ export function LoginPage() {
   const { signedIn } = useAuth()
   const signIn = useMicrosoftSignIn()
 
-  if (signedIn) return <Navigate to="/" replace />
+  if (signedIn) {
+    return <Navigate to="/" replace />
+  }
 
   return (
     <div className="relative flex h-full flex-col overflow-hidden bg-bg text-fg antialiased">

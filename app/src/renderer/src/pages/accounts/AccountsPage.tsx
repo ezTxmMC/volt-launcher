@@ -28,7 +28,9 @@ export function AccountsPage() {
     setBusy(true)
     try {
       await action()
-      if (success) toast.success(success)
+      if (success) {
+        toast.success(success)
+      }
       notifyChanged('accounts')
     } catch (failure) {
       toast.error(failure)

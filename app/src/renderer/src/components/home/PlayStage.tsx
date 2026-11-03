@@ -35,7 +35,9 @@ function RunningInfo({ profile, startedAt, running }: { profile: Profile; starte
   const uptime = useUptime(running ? startedAt : null)
   const others = entries.filter((entry) => entry.profileId !== profile.id)
   const first = others[0]
-  if (!running && !first) return null
+  if (!running && !first) {
+    return null
+  }
   return (
     <div className="grid gap-2">
       {running && (

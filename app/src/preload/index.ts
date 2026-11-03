@@ -37,7 +37,9 @@ const bridge: VoltBridge = {
   pickDirectory: () => ipcRenderer.invoke(IPC.pickDirectory) as Promise<string | null>,
   async signIn(): Promise<Job | null> {
     const envelope = (await ipcRenderer.invoke(IPC.signIn)) as SignInEnvelope
-    if (!envelope.ok) throw new Error(envelope.message)
+    if (!envelope.ok) {
+      throw new Error(envelope.message)
+    }
     return envelope.job
   },
   hideWindow: () => ipcRenderer.invoke(IPC.hideWindow) as Promise<void>,

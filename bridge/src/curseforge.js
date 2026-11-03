@@ -15,7 +15,9 @@ function cacheKey(method, path, body) {
 
 function readCache(key) {
   const entry = cache.get(key);
-  if (!entry) return null;
+  if (!entry) {
+    return null;
+  }
   if (Date.now() > entry.expiresAt) {
     cache.delete(key);
     return null;
@@ -88,7 +90,9 @@ export async function callCurseForge(path, options = {}) {
 
   if (cacheable) {
     const hit = readCache(key);
-    if (hit) return hit;
+    if (hit) {
+      return hit;
+    }
   }
 
   const controller = new AbortController();
@@ -115,10 +119,14 @@ export async function callCurseForge(path, options = {}) {
     }
 
     const payload = await response.json();
-    if (cacheable) writeCache(key, payload);
+    if (cacheable) {
+      writeCache(key, payload);
+    }
     return payload;
   } catch (error) {
-    if (error instanceof CurseForgeError) throw error;
+    if (error instanceof CurseForgeError) {
+      throw error;
+    }
     if (error.name === 'AbortError') {
       throw new CurseForgeError('CurseForge did not respond in time', 504);
     }
@@ -130,7 +138,9 @@ export async function callCurseForge(path, options = {}) {
 
 /** Verifies the configured key by making the cheapest authenticated call available. */
 export async function checkApiKey() {
-  if (!hasApiKey()) return { ok: false, reason: 'no-api-key' };
+  if (!hasApiKey()) {
+    return { ok: false, reason: 'no-api-key' };
+  }
   try {
     await callCurseForge('/v1/games/432');
     return { ok: true };

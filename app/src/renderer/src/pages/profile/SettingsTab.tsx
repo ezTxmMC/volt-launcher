@@ -90,8 +90,12 @@ function ToggleRow({ label, hint, checked, onChange }: { label: string; hint?: s
 /** The toast line for one folder of a sync report; `enabled` is whether the folder is shared now. */
 function reportLine(entry: SyncReportEntry, enabled: boolean, t: Translate): string {
   const name = t(SYNCED_ITEMS.find((item) => item.key === entry.key)?.label.profile ?? 'profile.synced.title')
-  if (!enabled) return t('profile.synced.report.disabled', { name })
-  if (entry.moved === 0 && entry.conflicts === 0) return t('profile.synced.report.empty', { name })
+  if (!enabled) {
+    return t('profile.synced.report.disabled', { name })
+  }
+  if (entry.moved === 0 && entry.conflicts === 0) {
+    return t('profile.synced.report.empty', { name })
+  }
   const moved = t('profile.synced.report.enabled', { name, moved: entry.moved })
   return entry.conflicts > 0 ? moved + t('profile.synced.report.conflicts', { conflicts: entry.conflicts }) : moved
 }
@@ -118,7 +122,9 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
   }, [reloadGame])
 
   const change = async (key: SyncedFolder, on: boolean): Promise<void> => {
-    if (saving !== null || running) return
+    if (saving !== null || running) {
+      return
+    }
     const next = SYNCED_ITEMS.map((item) => item.key).filter((item) => (item === key ? on : current.includes(item)))
     setDraft({ base: profile.synced, list: next })
     setSaving(key)
@@ -138,7 +144,9 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
 
   // The game can replace a link with a real file (servers.dat); the backend relinks it, and this does it now.
   const heal = async (): Promise<void> => {
-    if (healing || saving !== null || running) return
+    if (healing || saving !== null || running) {
+      return
+    }
     setHealing(true)
     try {
       const { report } = await api.profiles.healSynced(profile.id)
@@ -146,9 +154,11 @@ function SharedFolders({ profile, onChanged }: { profile: Profile; onChanged: ()
       const failed = report.filter((entry) => entry.status === 'failed')
       const nameOf = (key: SyncedFolder): string =>
         t(SYNCED_ITEMS.find((item) => item.key === key)?.label.profile ?? 'profile.synced.title')
-      if (report.length === 0) toast.success(t('profile.synced.heal.none'))
-      else if (failed.length === 0) toast.success(t('profile.synced.heal.healed', { count: healed.length }))
-      else {
+      if (report.length === 0) {
+        toast.success(t('profile.synced.heal.none'))
+      } else if (failed.length === 0) {
+        toast.success(t('profile.synced.heal.healed', { count: healed.length }))
+      } else {
         const lines = failed.map((entry) => `${nameOf(entry.key)}: ${entry.message ?? t('profile.synced.heal.noMessage')}`)
         toast.notify('error', `${t('profile.synced.heal.summary', { healed: healed.length, failed: failed.length })}\n${lines.join('\n')}`, t('profile.synced.heal.title'))
       }
@@ -251,10 +261,14 @@ export function SettingsTab({ profile, onChanged }: { profile: Profile; onChange
   const canSave = dirty && problem === null && !saving
 
   const save = async (): Promise<void> => {
-    if (!canSave) return
+    if (!canSave) {
+      return
+    }
     const envVars: Record<string, string> = {}
     for (const row of draft.envRows) {
-      if (row.key.trim() !== '') envVars[row.key.trim()] = row.value
+      if (row.key.trim() !== '') {
+        envVars[row.key.trim()] = row.value
+      }
     }
     const patch: UpdateProfileRequest = {
       name: draft.name.trim(),
@@ -285,7 +299,9 @@ export function SettingsTab({ profile, onChanged }: { profile: Profile; onChange
   }
 
   const pickIcon = async (file: File | undefined): Promise<void> => {
-    if (!file) return
+    if (!file) {
+      return
+    }
     if (!file.type.startsWith('image/')) {
       toast.error(t('profile.settings.iconInvalid'))
       return
@@ -309,7 +325,9 @@ export function SettingsTab({ profile, onChanged }: { profile: Profile; onChange
       toast.error(error)
     } finally {
       setIconBusy(false)
-      if (fileInput.current) fileInput.current.value = ''
+      if (fileInput.current) {
+        fileInput.current.value = ''
+      }
     }
   }
 
@@ -327,7 +345,9 @@ export function SettingsTab({ profile, onChanged }: { profile: Profile; onChange
 
   const chooseDirectory = async (): Promise<void> => {
     const picked = await window.volt?.pickDirectory()
-    if (picked) update('gameDirectory', picked)
+    if (picked) {
+      update('gameDirectory', picked)
+    }
   }
 
   const hideGlobal = settings.closeOnLaunch ? t('profile.settings.hideLauncherGlobal.on') : t('profile.settings.hideLauncherGlobal.off')

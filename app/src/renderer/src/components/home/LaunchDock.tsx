@@ -35,12 +35,18 @@ export function LaunchDock({ profiles, profile, title, busy, disabled, playTitle
 
   // Close on a click outside the dock or on Escape, as the account menu does.
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      return
+    }
     const onPointer = (event: MouseEvent): void => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false)
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
     }
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
     }
     document.addEventListener('mousedown', onPointer)
     document.addEventListener('keydown', onKey)
@@ -107,7 +113,9 @@ export function LaunchDock({ profiles, profile, title, busy, disabled, playTitle
                   aria-selected={selected}
                   onClick={() => {
                     setOpen(false)
-                    if (!selected) onSelect(entry.id)
+                    if (!selected) {
+                      onSelect(entry.id)
+                    }
                   }}
                   className={`flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors ${
                     selected ? 'bg-accent-soft-strong text-accent' : 'hover:bg-surface-3'

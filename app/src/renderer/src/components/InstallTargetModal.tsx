@@ -25,7 +25,9 @@ export function InstallTargetModal({
   const profile = profiles.find((candidate) => candidate.id === profileId)
 
   const confirm = async (): Promise<void> => {
-    if (!profile) return
+    if (!profile) {
+      return
+    }
     setBusy(true)
     try {
       await onConfirm(profile)

@@ -50,11 +50,15 @@ export function ConnectModpackDialog({
   }
 
   const close = (): void => {
-    if (!connecting) onClose()
+    if (!connecting) {
+      onClose()
+    }
   }
 
   const connect = async (): Promise<void> => {
-    if (!chosen || !selectedId) return
+    if (!chosen || !selectedId) {
+      return
+    }
     setConnecting(true)
     setProblem(null)
     try {

@@ -33,7 +33,9 @@ function forwardQuery(query, allowed) {
   const params = new URLSearchParams();
   for (const name of allowed) {
     const value = query[name];
-    if (value !== undefined && value !== '') params.append(name, String(value));
+    if (value !== undefined && value !== '') {
+      params.append(name, String(value));
+    }
   }
   const encoded = params.toString();
   return encoded ? `?${encoded}` : '';
@@ -107,7 +109,9 @@ export function createRouter() {
       callCurseForge('/v1/mods/files', { method: 'POST', body: { fileIds: [fileId] }, cacheable: true }).then(
         (payload) => {
           const file = payload?.data?.[0];
-          if (!file) throw new CurseForgeError(`No CurseForge file with id ${fileId}`, 404);
+          if (!file) {
+            throw new CurseForgeError(`No CurseForge file with id ${fileId}`, 404);
+          }
           return { data: file };
         },
       ),

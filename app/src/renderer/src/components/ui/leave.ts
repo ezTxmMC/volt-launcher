@@ -15,7 +15,9 @@ export function leaveThen(element: HTMLElement | null, done: () => void): void {
     done()
     return
   }
-  if (element.dataset.leaving) return
+  if (element.dataset.leaving) {
+    return
+  }
   element.dataset.leaving = 'true'
   window.setTimeout(done, LEAVE_MS)
 }

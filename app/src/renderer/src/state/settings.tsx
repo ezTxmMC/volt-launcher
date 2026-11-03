@@ -22,11 +22,15 @@ export function SettingsProvider({ children, fallback }: { children: ReactNode; 
   const { setLanguage } = useI18n()
 
   useEffect(() => {
-    if (!settings) return
+    if (!settings) {
+      return
+    }
     setLanguage(settings.language)
     applyTheme(settings.theme)
     applyAppearance(settings)
-    if (settings.theme !== 'system') return
+    if (settings.theme !== 'system') {
+      return
+    }
     const query = window.matchMedia('(prefers-color-scheme: light)')
     const onChange = (): void => {
       document.documentElement.dataset['theme'] = resolveTheme('system')
@@ -67,6 +71,8 @@ function SettingsFailure({ message, onRetry }: { message: string; onRetry: () =>
 
 export function useSettings(): SettingsValue {
   const value = useContext(SettingsContext)
-  if (!value) throw new Error('useSettings must be used inside SettingsProvider')
+  if (!value) {
+    throw new Error('useSettings must be used inside SettingsProvider')
+  }
   return value
 }

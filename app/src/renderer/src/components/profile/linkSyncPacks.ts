@@ -15,7 +15,9 @@ export async function waitForJob(id: string): Promise<Job | undefined> {
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, POLL_MS))
     const job = (await api.jobs.list()).find((entry) => entry.id === id)
-    if (!job || job.state !== 'running') return job
+    if (!job || job.state !== 'running') {
+      return job
+    }
   }
   return undefined
 }

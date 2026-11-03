@@ -17,7 +17,9 @@ const DEFAULTS = {
 
 function intFromEnv(name, fallback) {
   const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
@@ -39,7 +41,9 @@ export const config = {
  * which is indistinguishable from an invalid key at the call site.
  */
 function normaliseKey(raw) {
-  if (!raw) return '';
+  if (!raw) {
+    return '';
+  }
   return raw.trim().replace(/^['"]|['"]$/g, '').trim();
 }
 
@@ -47,7 +51,9 @@ export const hasApiKey = () => config.apiKey.length > 0;
 
 /** A safe fragment for logs, so a misread key is visible without exposing it. */
 export const apiKeyFingerprint = () => {
-  if (!hasApiKey()) return 'none';
+  if (!hasApiKey()) {
+    return 'none';
+  }
   const key = config.apiKey;
   return `${key.slice(0, 4)}…${key.slice(-4)} (${key.length} chars)`;
 };

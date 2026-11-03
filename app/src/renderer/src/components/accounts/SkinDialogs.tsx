@@ -44,7 +44,9 @@ export function UploadSkinModal({ onClose }: { onClose: () => void }) {
     const file = event.target.files?.[0]
     setPicked(null)
     setProblem(null)
-    if (!file) return
+    if (!file) {
+      return
+    }
     if (file.type !== 'image/png' && !file.name.toLowerCase().endsWith('.png')) {
       setProblem(t('skins.invalidFile'))
       return
@@ -61,14 +63,18 @@ export function UploadSkinModal({ onClose }: { onClose: () => void }) {
         return
       }
       setPicked(read)
-      if (name.trim() === '') setName(file.name.replace(/\.png$/i, '').slice(0, 64))
+      if (name.trim() === '') {
+        setName(file.name.replace(/\.png$/i, '').slice(0, 64))
+      }
     } catch {
       setProblem(t('skins.invalidFile'))
     }
   }
 
   const submit = async (): Promise<void> => {
-    if (!picked || name.trim() === '' || busy) return
+    if (!picked || name.trim() === '' || busy) {
+      return
+    }
     setBusy(true)
     try {
       const response = await api.skins.add(name.trim(), slim, picked.dataUrl)
@@ -139,7 +145,9 @@ export function RenameSkinModal({ skin, onClose }: { skin: Skin; onClose: () => 
   const valid = name.trim() !== ''
 
   const submit = async (): Promise<void> => {
-    if (!valid || busy) return
+    if (!valid || busy) {
+      return
+    }
     setBusy(true)
     try {
       const response = await api.skins.rename(skin.id, name.trim())

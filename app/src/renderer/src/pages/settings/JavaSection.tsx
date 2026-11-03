@@ -18,7 +18,9 @@ const MEMORY_MAX_MB = 1048576
 /** Parses a whole number of megabytes, or undefined when the text is not one. */
 function parseMegabytes(text: string): number | undefined {
   const trimmed = text.trim()
-  if (!/^\d+$/.test(trimmed)) return undefined
+  if (!/^\d+$/.test(trimmed)) {
+    return undefined
+  }
   const value = Number(trimmed)
   return value >= MEMORY_MIN_MB && value <= MEMORY_MAX_MB ? value : undefined
 }
@@ -62,7 +64,9 @@ function MemoryCard() {
     (javaPath.trim() || null) !== settings.javaPath
 
   const save = async (): Promise<void> => {
-    if (!valid || maxValue === undefined || minValue === undefined) return
+    if (!valid || maxValue === undefined || minValue === undefined) {
+      return
+    }
     setSaving(true)
     try {
       await update({
@@ -122,7 +126,9 @@ function RuntimesCard() {
   useJobFinished(
     useCallback(
       (job) => {
-        if (job.kind === 'java-install') reload()
+        if (job.kind === 'java-install') {
+          reload()
+        }
       },
       [reload]
     )
@@ -219,7 +225,9 @@ function RuntimesCard() {
               aria-label={`${t('settings.java.override')} Java ${majorVersion}`}
               className="w-full font-mono text-[12px]"
               onBlur={(event) => {
-                if (event.target.value.trim() !== override) void saveOverride(majorVersion, event.target.value)
+                if (event.target.value.trim() !== override) {
+                  void saveOverride(majorVersion, event.target.value)
+                }
               }}
             />
           </div>

@@ -12,7 +12,9 @@ import { notifyChanged } from './data'
 
 /** Opens the sign-in window (main process); resolves to the account-login job, or null when it was closed. */
 function openSignInWindow(): Promise<Job | null> {
-  if (!window.volt) return Promise.reject(new Error('The Electron bridge (window.volt) is not available.'))
+  if (!window.volt) {
+    return Promise.reject(new Error('The Electron bridge (window.volt) is not available.'))
+  }
   return window.volt.signIn()
 }
 
@@ -33,9 +35,13 @@ export function useMicrosoftSignIn(onDone?: () => void) {
 
   // The job reports its own end; the account views and the auth state update through notifyChanged.
   useEffect(() => {
-    if (!jobId) return
+    if (!jobId) {
+      return
+    }
     return jobs.onJobFinished((finished) => {
-      if (finished.id !== jobId) return
+      if (finished.id !== jobId) {
+        return
+      }
       if (finished.state === 'done') {
         const result = finished.result
         const name = typeof result?.name === 'string' ? result.name : ''
@@ -55,7 +61,9 @@ export function useMicrosoftSignIn(onDone?: () => void) {
     try {
       const started = await openSignInWindow()
       // Closed without signing in: back to the start state, nothing to report.
-      if (started === null) return
+      if (started === null) {
+        return
+      }
       // Registering the job makes the jobs provider poll it and report when it ends.
       jobs.track(started)
       setJobId(started.id)

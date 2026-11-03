@@ -19,7 +19,9 @@ export function StopAllButton({
   const toast = useToast()
   const [confirming, setConfirming] = useState(false)
   const running = entries.filter((entry) => entry.state !== 'launching').length
-  if (running === 0) return null
+  if (running === 0) {
+    return null
+  }
 
   const setDialog = (open: boolean): void => {
     setConfirming(open)
@@ -33,8 +35,11 @@ export function StopAllButton({
         variant="danger"
         icon="lucide:power"
         onClick={() => {
-          if (running > 1) setDialog(true)
-          else void stopAll().catch((error: unknown) => toast.error(error))
+          if (running > 1) {
+            setDialog(true)
+          } else {
+            void stopAll().catch((error: unknown) => toast.error(error))
+          }
         }}
       >
         {t('games.stopAll')}

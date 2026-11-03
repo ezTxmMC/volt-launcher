@@ -9,9 +9,15 @@ export type NameProblem = 'empty' | 'tooLong' | 'duplicate'
  */
 export function nameProblem(name: string, existing: readonly string[] | undefined): NameProblem | null {
   const trimmed = name.trim()
-  if (trimmed === '') return 'empty'
-  if (trimmed.length > MAX_NAME_LENGTH) return 'tooLong'
+  if (trimmed === '') {
+    return 'empty'
+  }
+  if (trimmed.length > MAX_NAME_LENGTH) {
+    return 'tooLong'
+  }
   const wanted = trimmed.toLowerCase()
-  if (existing?.some((other) => other.trim().toLowerCase() === wanted)) return 'duplicate'
+  if (existing?.some((other) => other.trim().toLowerCase() === wanted)) {
+    return 'duplicate'
+  }
   return null
 }

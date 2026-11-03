@@ -23,16 +23,22 @@ const followedGames = new Map<string, ReturnType<typeof setInterval>>()
  */
 function followRunningGame(profileId: string): void {
   const volt = window.volt
-  if (!volt || followedGames.has(profileId)) return
+  if (!volt || followedGames.has(profileId)) {
+    return
+  }
   void volt.hideWindow()
   const timer = setInterval(() => {
     api.game.status(profileId).then(
       (status) => {
-        if (status.running) return
+        if (status.running) {
+          return
+        }
         clearInterval(timer)
         followedGames.delete(profileId)
         // Another profile's game may still hide the launcher; it comes back when the last one exits.
-        if (followedGames.size === 0) void volt.showWindow()
+        if (followedGames.size === 0) {
+          void volt.showWindow()
+        }
       },
       () => undefined // keep waiting; the next tick tries again
     )
@@ -65,19 +71,29 @@ export function PlayControls({ profile, onChanged }: { profile: Profile; onChang
 
   // The game started while this page is open: hide the launcher.
   useEffect(() => {
-    if (!game) return
+    if (!game) {
+      return
+    }
     const previous = wasRunning.current
     wasRunning.current = game.running
-    if (game.running && previous === false && hideOnLaunch) followRunningGame(profile.id)
+    if (game.running && previous === false && hideOnLaunch) {
+      followRunningGame(profile.id)
+    }
   }, [game, hideOnLaunch, profile.id])
 
   useJobFinished((job) => {
-    if (!jobIds.includes(job.id)) return
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
+    if (!jobIds.includes(job.id)) {
+      return
+    }
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    }
     // The launch job ends once the game process has been started.
     if (job.state === 'done' && job.kind === 'launch' && hideOnLaunch) {
       void api.game.status(profile.id).then((status) => {
-        if (status.running) followRunningGame(profile.id)
+        if (status.running) {
+          followRunningGame(profile.id)
+        }
       }, () => undefined)
     }
     reloadStatus()
@@ -95,7 +111,9 @@ export function PlayControls({ profile, onChanged }: { profile: Profile; onChang
       // The launch hook tracks its job itself; the install job is tracked here.
       const job = await (action === 'install' ? api.game.install(profile.id) : launchGame(profile.id))
       setJobIds((current) => [...current, job.id])
-      if (action === 'install') track(job)
+      if (action === 'install') {
+        track(job)
+      }
     } catch (error) {
       toast.error(error)
     } finally {

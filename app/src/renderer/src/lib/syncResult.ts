@@ -29,7 +29,9 @@ const strings = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
 
 function applyOf(raw: unknown): SyncApplySummary | null {
-  if (typeof raw !== 'object' || raw === null) return null
+  if (typeof raw !== 'object' || raw === null) {
+    return null
+  }
   const row = raw as Record<string, unknown>
   return {
     profileId: typeof row['profileId'] === 'string' ? row['profileId'] : null,
@@ -60,7 +62,9 @@ export function combineApplies(applies: readonly SyncApplySummary[], busyProfile
  */
 export function summarizeSyncJob(job: Job): SyncJobSummary | null {
   const result = job.result
-  if (!result) return null
+  if (!result) {
+    return null
+  }
   if (Array.isArray(result['profiles'])) {
     const applies = result['profiles'].flatMap((row) => applyOf(row) ?? [])
     return combineApplies(applies, strings(result['skipped']))

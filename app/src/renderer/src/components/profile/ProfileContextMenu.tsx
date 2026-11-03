@@ -62,7 +62,9 @@ export function ProfileContextMenu({ profile, running, x, y, onClose, onChanged,
               void window.volt
                 ?.openPath(profile.gameDir)
                 .then((problem) => {
-                  if (problem) toast.error(problem)
+                  if (problem) {
+                    toast.error(problem)
+                  }
                 })
                 .catch(failed)
           }

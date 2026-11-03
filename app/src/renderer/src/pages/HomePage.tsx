@@ -26,14 +26,18 @@ export function HomePage() {
 
   // A finished launch sets lastPlayed on the backend; reload so the choice of the most recent profile is current.
   useJobFinished((job) => {
-    if (job.kind === 'launch') reload()
+    if (job.kind === 'launch') {
+      reload()
+    }
   })
 
   if (!accounts.data) {
     return accounts.error ? <ErrorNotice message={accounts.error} onRetry={accounts.reload} /> : <LoadingBlock />
   }
   const account = accounts.data.accounts.find((entry) => entry.selected)
-  if (!account) return null
+  if (!account) {
+    return null
+  }
 
   if (!profiles) {
     return error ? <ErrorNotice message={error} onRetry={reload} /> : <LoadingBlock />

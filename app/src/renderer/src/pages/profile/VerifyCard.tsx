@@ -23,9 +23,13 @@ export function VerifyCard({ profile }: { profile: Profile }) {
   const [starting, setStarting] = useState(false)
 
   useJobFinished((job) => {
-    if (job.id !== jobId) return
+    if (job.id !== jobId) {
+      return
+    }
     setJobId(null)
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    }
     reload()
   })
 

@@ -57,8 +57,12 @@ function paramsOf(request: SearchRequest): SearchParams {
 }
 
 function hasMoreOf(result: SearchResult, offset: number, limit: number): boolean {
-  if (typeof result.hasMore === 'boolean') return result.hasMore
-  if (typeof result.total === 'number') return offset + result.items.length < result.total
+  if (typeof result.hasMore === 'boolean') {
+    return result.hasMore
+  }
+  if (typeof result.total === 'number') {
+    return offset + result.items.length < result.total
+  }
   return result.items.length >= limit
 }
 
@@ -73,12 +77,16 @@ export function useProviderSearch(request: SearchRequest | null): SearchView {
   const [tick, setTick] = useState(0)
 
   useEffect(() => {
-    if (!key) return
+    if (!key) {
+      return
+    }
     const current = JSON.parse(key) as SearchRequest
     let cancelled = false
     api.providers.search(current.provider, paramsOf(current)).then(
       (result) => {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         const offset = (current.page - 1) * current.limit
         setState({
           key,
@@ -89,7 +97,9 @@ export function useProviderSearch(request: SearchRequest | null): SearchView {
         })
       },
       (error: unknown) => {
-        if (!cancelled) setState({ key, items: [], total: null, hasMore: false, error: errorMessage(error) })
+        if (!cancelled) {
+          setState({ key, items: [], total: null, hasMore: false, error: errorMessage(error) })
+        }
       }
     )
     return () => {

@@ -8,7 +8,9 @@ type Domain = 'accounts' | 'skins'
 const listeners: Record<Domain, Set<() => void>> = { accounts: new Set(), skins: new Set() }
 
 export function notifyChanged(domain: Domain): void {
-  for (const listener of listeners[domain]) listener()
+  for (const listener of listeners[domain]) {
+    listener()
+  }
 }
 
 function onChanged(domain: Domain, listener: () => void): () => void {

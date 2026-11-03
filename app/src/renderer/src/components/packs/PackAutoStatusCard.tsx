@@ -57,7 +57,9 @@ export function PackAutoStatusCard() {
 
   // When the job ends, the results and the counters are read again.
   useEffect(() => {
-    if (jobId && finished) reload()
+    if (jobId && finished) {
+      reload()
+    }
   }, [jobId, finished, reload])
 
   const start = async (request: () => Promise<Job>): Promise<void> => {

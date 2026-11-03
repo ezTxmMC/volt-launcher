@@ -65,24 +65,38 @@ function hasNsisUninstaller(): boolean {
 
 /** How this copy of the launcher was installed. Anything not recognised is 'manual'. */
 export async function detectInstallKind(): Promise<InstallKind> {
-  if (process.platform === 'win32') return hasNsisUninstaller() ? 'nsis' : 'manual'
+  if (process.platform === 'win32') {
+    return hasNsisUninstaller() ? 'nsis' : 'manual'
+  }
   if (process.platform === 'darwin') {
     const bundle = macBundlePath()
     return bundle && isWritable(dirname(bundle)) ? 'mac-app' : 'manual'
   }
   if (process.platform === 'linux') {
-    if (process.env.APPIMAGE) return 'appimage'
-    if (process.env.FLATPAK_ID) return 'flatpak'
-    if (await commandSucceeds('dpkg-query', ['-S', process.execPath])) return 'deb'
-    if (await commandSucceeds('rpm', ['-qf', process.execPath])) return 'rpm'
+    if (process.env.APPIMAGE) {
+      return 'appimage'
+    }
+    if (process.env.FLATPAK_ID) {
+      return 'flatpak'
+    }
+    if (await commandSucceeds('dpkg-query', ['-S', process.execPath])) {
+      return 'deb'
+    }
+    if (await commandSucceeds('rpm', ['-qf', process.execPath])) {
+      return 'rpm'
+    }
   }
   return 'manual'
 }
 
 /** Which backend download the install kind needs. Flatpak and manual installs only get the installer file. */
 export function assetFor(kind: InstallKind): UpdateAssetKind {
-  if (kind === 'deb') return 'deb'
-  if (kind === 'rpm') return 'rpm'
+  if (kind === 'deb') {
+    return 'deb'
+  }
+  if (kind === 'rpm') {
+    return 'rpm'
+  }
   return 'installer'
 }
 
@@ -99,7 +113,9 @@ function ownedUpdateFile(requested: string): string {
   if (rel === '' || isAbsolute(rel) || rel.split(sep)[0] === '..') {
     throw new Error('The update file is not inside the updates folder.')
   }
-  if (!statSync(file).isFile()) throw new Error('The update file does not exist.')
+  if (!statSync(file).isFile()) {
+    throw new Error('The update file does not exist.')
+  }
   return file
 }
 
@@ -124,7 +140,9 @@ async function installNsis(file: string): Promise<UpdateApplyResult> {
 /** The AppImage is replaced in place: the running file keeps its inode, so the rename is safe. */
 function replaceAppImage(file: string): UpdateApplyResult {
   const target = process.env.APPIMAGE
-  if (!target) return { ok: false, manual: true }
+  if (!target) {
+    return { ok: false, manual: true }
+  }
   const staged = `${target}.new`
   try {
     copyFileSync(file, staged)
@@ -141,7 +159,9 @@ function replaceAppImage(file: string): UpdateApplyResult {
 
 async function replaceMacApp(zip: string): Promise<UpdateApplyResult> {
   const bundle = macBundlePath()
-  if (!bundle) return { ok: false, manual: true }
+  if (!bundle) {
+    return { ok: false, manual: true }
+  }
   const work = mkdtempSync(join(tmpdir(), 'volt-update-'))
   const extracted = join(work, 'extracted')
   await execFileAsync('ditto', ['-x', '-k', zip, extracted])
@@ -179,7 +199,9 @@ export async function applyUpdate(
   requested: unknown,
   backend: { stop: () => Promise<void>; start: () => Promise<void> }
 ): Promise<UpdateApplyResult> {
-  if (typeof requested !== 'string' || requested.length === 0) return { ok: false, message: 'Invalid path.' }
+  if (typeof requested !== 'string' || requested.length === 0) {
+    return { ok: false, message: 'Invalid path.' }
+  }
   let file: string
   try {
     file = ownedUpdateFile(requested)
@@ -198,10 +220,14 @@ export async function applyUpdate(
     }
     const result = await applyKind(kind, file)
     // The install did not happen (cancelled, failed): the launcher stays open, so its backend must run again.
-    if (!result.ok && stopped) void backend.start()
+    if (!result.ok && stopped) {
+      void backend.start()
+    }
     return result
   } catch (error) {
-    if (stopped) void backend.start()
+    if (stopped) {
+      void backend.start()
+    }
     return { ok: false, message: messageOf(error) }
   }
 }

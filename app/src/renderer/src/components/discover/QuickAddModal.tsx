@@ -43,7 +43,9 @@ export function QuickAddModal({ project, onClose }: { project: ProjectSummary; o
 
   const install = async (): Promise<void> => {
     const target = profiles?.find((profile) => profile.id === selectedId)
-    if (!target) return
+    if (!target) {
+      return
+    }
     setBusy(true)
     try {
       const job = await api.providers.installContent(target.id, {

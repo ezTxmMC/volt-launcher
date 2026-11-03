@@ -51,7 +51,9 @@ const SIZES = { sm: 'h-8 px-2.5 text-[13px]', md: 'h-10 px-3 text-[15px]' } as c
  * list must be offset by the dialog's padding box. For document.body the origin is the viewport.
  */
 function originOf(container: HTMLElement): { x: number; y: number; bottom: number } {
-  if (container === document.body) return { x: 0, y: 0, bottom: window.innerHeight }
+  if (container === document.body) {
+    return { x: 0, y: 0, bottom: window.innerHeight }
+  }
   const box = container.getBoundingClientRect()
   const x = box.left + container.clientLeft
   const y = box.top + container.clientTop
@@ -79,7 +81,9 @@ function placeList(rect: DOMRect, count: number, origin: ReturnType<typeof origi
 /** Index of the first enabled option from start in the given direction, or -1. */
 function enabledFrom<T extends string>(options: ReadonlyArray<SelectOption<T>>, start: number, step: 1 | -1): number {
   for (let index = start; index >= 0 && index < options.length; index += step) {
-    if (!options[index]?.disabled) return index
+    if (!options[index]?.disabled) {
+      return index
+    }
   }
   return -1
 }
@@ -116,7 +120,9 @@ export function Select<T extends string>({
 
   const openList = (): void => {
     const trigger = triggerRef.current
-    if (!trigger || disabled || options.length === 0) return
+    if (!trigger || disabled || options.length === 0) {
+      return
+    }
     const container = trigger.closest('dialog') ?? document.body
     setPlacement({
       container,
@@ -128,38 +134,54 @@ export function Select<T extends string>({
 
   const close = (restoreFocus: boolean): void => {
     setPlacement(null)
-    if (restoreFocus) triggerRef.current?.focus()
+    if (restoreFocus) {
+      triggerRef.current?.focus()
+    }
   }
 
   const choose = (index: number): void => {
     const option = options[index]
-    if (!option || option.disabled) return
-    if (option.value !== value) onChange(option.value)
+    if (!option || option.disabled) {
+      return
+    }
+    if (option.value !== value) {
+      onChange(option.value)
+    }
     close(true)
   }
 
   // Focus moves into the list when it opens.
   useEffect(() => {
-    if (isOpen) listRef.current?.focus({ preventScroll: true })
+    if (isOpen) {
+      listRef.current?.focus({ preventScroll: true })
+    }
   }, [isOpen])
 
   // The highlighted option stays visible while the keyboard moves it.
   useEffect(() => {
-    if (isOpen) document.getElementById(`${optionPrefix}${active}`)?.scrollIntoView({ block: 'nearest' })
+    if (isOpen) {
+      document.getElementById(`${optionPrefix}${active}`)?.scrollIntoView({ block: 'nearest' })
+    }
   }, [isOpen, active, optionPrefix])
 
   // A press outside closes the list; scrolling or resizing moves it along with the trigger.
   useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen) {
+      return
+    }
     const onPointerDown = (event: PointerEvent): void => {
       const target = event.target as Node
-      if (triggerRef.current?.contains(target) || listRef.current?.contains(target)) return
+      if (triggerRef.current?.contains(target) || listRef.current?.contains(target)) {
+        return
+      }
       setPlacement(null)
     }
     const reposition = (event: Event): void => {
       const trigger = triggerRef.current
       // Scrolling inside the list itself does not move it; resize events target window, not a node.
-      if (!trigger || (event.target instanceof Node && listRef.current?.contains(event.target))) return
+      if (!trigger || (event.target instanceof Node && listRef.current?.contains(event.target))) {
+        return
+      }
       const rect = trigger.getBoundingClientRect()
       setPlacement((current) =>
         current ? { ...current, ...placeList(rect, options.length, originOf(current.container)) } : current
@@ -177,7 +199,9 @@ export function Select<T extends string>({
 
   const move = (start: number, step: 1 | -1): void => {
     const next = enabledFrom(options, start, step)
-    if (next >= 0) setActive(next)
+    if (next >= 0) {
+      setActive(next)
+    }
   }
 
   // Typing a word jumps to the next option starting with it; repeating one letter cycles those options.
@@ -208,7 +232,9 @@ export function Select<T extends string>({
       close(true)
       return
     }
-    if (event.ctrlKey || event.metaKey || event.altKey) return
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return
+    }
     if (key === 'Escape') {
       // Stops the enclosing modal dialog from closing as well.
       event.preventDefault()
@@ -250,7 +276,9 @@ export function Select<T extends string>({
         onKeyDown={(event) => {
           if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             event.preventDefault()
-            if (!isOpen) openList()
+            if (!isOpen) {
+              openList()
+            }
           }
         }}
         className={`flex w-full min-w-0 items-center justify-between gap-2 rounded-lg border bg-surface-input text-left text-fg outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent/40 disabled:cursor-not-allowed disabled:opacity-50 ${
@@ -278,7 +306,9 @@ export function Select<T extends string>({
             onKeyDown={onListKeyDown}
             onBlur={(event) => {
               const next = event.relatedTarget as Node | null
-              if (!next || !(triggerRef.current?.contains(next) || listRef.current?.contains(next))) setPlacement(null)
+              if (!next || !(triggerRef.current?.contains(next) || listRef.current?.contains(next))) {
+                setPlacement(null)
+              }
             }}
             style={{
               left: placement.left,
@@ -300,7 +330,9 @@ export function Select<T extends string>({
                   aria-selected={isSelected}
                   aria-disabled={option.disabled || undefined}
                   onMouseEnter={() => {
-                    if (!option.disabled) setActive(index)
+                    if (!option.disabled) {
+                      setActive(index)
+                    }
                   }}
                   onClick={() => choose(index)}
                   className={`flex items-center gap-2 rounded-md px-2.5 py-2 leading-5 select-none ${

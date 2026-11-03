@@ -55,7 +55,9 @@ export function UpdatesSection() {
 
   // How this copy was installed decides the button. Without the bridge (plain browser) it is a download.
   useEffect(() => {
-    if (!window.volt) return
+    if (!window.volt) {
+      return
+    }
     window.volt.update
       .kind()
       .then(setInstallKind)
@@ -75,10 +77,15 @@ export function UpdatesSection() {
     try {
       const outcome = await window.volt.update.apply(result.path)
       // On success the launcher quits and restarts, so the "installing" state stays on screen.
-      if (outcome.ok) return
+      if (outcome.ok) {
+        return
+      }
       setApplying(false)
-      if (outcome.manual) setInstallManual(true)
-      else setInstallError(outcome.message || '')
+      if (outcome.manual) {
+        setInstallManual(true)
+      } else {
+        setInstallError(outcome.message || '')
+      }
     } catch (error) {
       setApplying(false)
       setInstallError(errorMessage(error))
@@ -88,7 +95,9 @@ export function UpdatesSection() {
   useJobFinished(
     useCallback(
       (job) => {
-        if (job.kind !== 'update-download') return
+        if (job.kind !== 'update-download') {
+          return
+        }
         if (job.state === 'done' && job.result) {
           const result = job.result as unknown as UpdateDownloadResult
           setDownloaded(result)
@@ -107,7 +116,9 @@ export function UpdatesSection() {
   const apply = async (patch: Parameters<typeof update>[0], recheck = false): Promise<void> => {
     try {
       await update(patch)
-      if (recheck) void check(true)
+      if (recheck) {
+        void check(true)
+      }
     } catch (error) {
       toast.error(error)
     }
@@ -135,7 +146,9 @@ export function UpdatesSection() {
       return
     }
     const problem = await window.volt.openPath(directory)
-    if (problem) toast.error(problem)
+    if (problem) {
+      toast.error(problem)
+    }
   }
 
   const openRelease = async (): Promise<void> => {

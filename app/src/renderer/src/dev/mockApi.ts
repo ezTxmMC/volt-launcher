@@ -281,9 +281,15 @@ function otherActiveProfile(profileId: string): Profile | undefined {
 /** The game phase a running job of the profile stands for. */
 function jobPhase(profileId: string): GamePhase {
   for (const { job } of jobs.values()) {
-    if (job.state !== 'running' || job.profileId !== profileId) continue
-    if (job.kind === 'install-game' || job.kind === 'launch') return job.kind
-    if (job.kind === 'profile-verify') return 'verify'
+    if (job.state !== 'running' || job.profileId !== profileId) {
+      continue
+    }
+    if (job.kind === 'install-game' || job.kind === 'launch') {
+      return job.kind
+    }
+    if (job.kind === 'profile-verify') {
+      return 'verify'
+    }
   }
   return 'idle'
 }
@@ -303,7 +309,9 @@ function evaluate(entry: MockJob): Job {
       job.finishedAt = nowIso()
       const outcome = entry.onDone()
       job.result = typeof outcome === 'object' && outcome !== null ? outcome : null
-      if (typeof job.result?.['profileId'] === 'string') job.profileId = job.result['profileId']
+      if (typeof job.result?.['profileId'] === 'string') {
+        job.profileId = job.result['profileId']
+      }
     }
   }
   return { ...job }
@@ -396,14 +404,22 @@ function projectGameVersions(project: ProjectSummary): string[] {
 }
 
 function projectLoaders(project: ProjectSummary): string[] {
-  if (project.kind === 'modpack') return ['neoforge']
-  if (project.kind !== 'mod') return []
+  if (project.kind === 'modpack') {
+    return ['neoforge']
+  }
+  if (project.kind !== 'mod') {
+    return []
+  }
   return seedOf(project.id) % 2 === 0 ? ['fabric', 'quilt'] : ['forge', 'neoforge']
 }
 
 function sortProjects(list: ProjectSummary[], sort: string): ProjectSummary[] {
-  if (sort === 'updated') return [...list].sort((a, b) => a.name.localeCompare(b.name))
-  if (sort === 'follows' || sort === 'newest') return [...list].reverse()
+  if (sort === 'updated') {
+    return [...list].sort((a, b) => a.name.localeCompare(b.name))
+  }
+  if (sort === 'follows' || sort === 'newest') {
+    return [...list].reverse()
+  }
   return list
 }
 
@@ -431,9 +447,15 @@ function buildProjects(provider: ProviderId): ProjectSummary[] {
   const out: ProjectSummary[] = []
   for (const kind of Object.keys(NAMES) as ContentKind[]) {
     const supported = PROVIDERS.find((candidate) => candidate.id === provider)?.kinds.includes(kind) ?? false
-    if (!supported) continue
+    if (!supported) {
+      continue
+    }
     const names = [...(NAMES[kind] ?? [])]
-    if (kind === 'mod') for (let index = 1; index <= 40; index++) names.push(`Sample Mod ${String(index).padStart(2, '0')}`)
+    if (kind === 'mod') {
+      for (let index = 1; index <= 40; index++) {
+        names.push(`Sample Mod ${String(index).padStart(2, '0')}`)
+      }
+    }
     names.forEach((name, index) => {
       const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-')
       out.push({
@@ -464,7 +486,9 @@ const PROJECTS: Record<ProviderId, ProjectSummary[]> = {
 
 function findProject(provider: ProviderId, id: string): ProjectSummary {
   const found = PROJECTS[provider]?.find((project) => project.id === id)
-  if (!found) throw new MockError(`Projekt ${id} nicht gefunden`)
+  if (!found) {
+    throw new MockError(`Projekt ${id} nicht gefunden`)
+  }
   return found
 }
 
@@ -575,7 +599,9 @@ const syncPackLinks = new Map<string, MockLink[]>([
 
 function syncPackRowOf(id: string | undefined): MockPackRow {
   const found = syncPackRows.find((row) => row.id === id)
-  if (!found) throw new MockError(`HTTP 404: Pack ${id ?? ''} nicht gefunden`)
+  if (!found) {
+    throw new MockError(`HTTP 404: Pack ${id ?? ''} nicht gefunden`)
+  }
   return found
 }
 
@@ -613,7 +639,9 @@ interface MockApplyResult {
 
 /** Why the mock cannot install an entry into a profile (mirrors the failure texts of the backend). */
 function installFailure(profile: Profile, entry: SyncPackEntry): string | null {
-  if (entry.kind === 'mod' && profile.loader === 'vanilla') return 'this profile has no mod loader'
+  if (entry.kind === 'mod' && profile.loader === 'vanilla') {
+    return 'this profile has no mod loader'
+  }
   if (entry.name === 'ModernFix' && profile.loader === 'forge') {
     return `no version of ${entry.name} fits Minecraft ${profile.minecraftVersion} / ${profile.loader}`
   }
@@ -631,9 +659,15 @@ function applyLink(profile: Profile, link: MockLink, retry: boolean): MockApplyR
   const row = syncPackRowOf(link.packId)
   const inPack = (projectId: string): boolean => row.entries.some((entry) => entry.projectId === projectId)
   const result: MockApplyResult = { profileId: profile.id, packId: row.id, installed: [], overridden: [], removed: [], skipped: [] }
-  if (retry) link.declined = []
+  if (retry) {
+    link.declined = []
+  }
   link.failed = []
-  for (const file of link.files) if (!inPack(file.projectId) && !file.dependency) result.removed.push(file.name)
+  for (const file of link.files) {
+    if (!inPack(file.projectId) && !file.dependency) {
+      result.removed.push(file.name)
+    }
+  }
   link.files = link.files.filter((file) => inPack(file.projectId))
   link.overridden = link.overridden.filter((ref) => inPack(ref.projectId))
   link.declined = link.declined.filter((ref) => inPack(ref.projectId))
@@ -699,7 +733,9 @@ function entriesFromProfile(profileId: string): SyncPackEntry[] {
   const entries: SyncPackEntry[] = []
   for (const file of modsOf(profileId)) {
     const source = file.source
-    if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge') || seen.has(source.projectId)) continue
+    if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge') || seen.has(source.projectId)) {
+      continue
+    }
     seen.add(source.projectId)
     entries.push({ provider: source.provider, projectId: source.projectId, kind: 'mod', name: source.name, iconUrl: null })
   }
@@ -738,7 +774,9 @@ type Handler = (match: string[], body: Record<string, unknown>, query: Query) =>
 
 function profileById(id: string | undefined): Profile {
   const found = profiles.find((profile) => profile.id === id)
-  if (!found) throw new MockError(`Profil ${id ?? ''} nicht gefunden`)
+  if (!found) {
+    throw new MockError(`Profil ${id ?? ''} nicht gefunden`)
+  }
   return found
 }
 
@@ -746,14 +784,18 @@ const SYNC_KEYS: readonly SyncedFolder[] = ['shaderpacks', 'resourcepacks', 'sav
 
 /** Like the backend: an unknown key is a 400; the answer keeps SYNC_KEYS order and has no duplicates. */
 function checkSyncKeys(requested: unknown[]): SyncedFolder[] {
-  if (requested.some((key) => !SYNC_KEYS.includes(key as SyncedFolder))) throw new MockError('HTTP 400: Unbekannter Ordner')
+  if (requested.some((key) => !SYNC_KEYS.includes(key as SyncedFolder))) {
+    throw new MockError('HTTP 400: Unbekannter Ordner')
+  }
   return SYNC_KEYS.filter((key) => requested.includes(key))
 }
 
 /** Mirrors the backend contract: the full list in, the profile plus a syncReport for the changed folders out. */
 function setSyncedFolders(profile: Profile, requested: unknown[]): Profile & { syncReport: SyncReportEntry[] } {
   const after = checkSyncKeys(requested)
-  if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: stop the game before changing shared folders')
+  if (runningGames.get(profile.id)?.running) {
+    throw new MockError('HTTP 409: stop the game before changing shared folders')
+  }
   const before = profile.synced ?? []
   const syncReport: SyncReportEntry[] = SYNC_KEYS.filter((key) => before.includes(key) !== after.includes(key)).map((key) =>
     after.includes(key)
@@ -777,15 +819,23 @@ function modsOf(id: string | undefined): ModFile[] {
 
 function modOf(id: string | undefined, fileName: string | undefined): ModFile {
   const found = modsOf(id).find((candidate) => candidate.fileName === decodeURIComponent(fileName ?? ''))
-  if (!found) throw new MockError('Mod nicht gefunden')
+  if (!found) {
+    throw new MockError('Mod nicht gefunden')
+  }
   return found
 }
 
 function applyUpdate(file: ModFile): void {
-  if (!file.update) return
+  if (!file.update) {
+    return
+  }
   file.fileName = file.update.fileName
-  if (file.metadata) file.metadata.version = file.update.versionNumber
-  if (file.source) file.source.versionNumber = file.update.versionNumber
+  if (file.metadata) {
+    file.metadata.version = file.update.versionNumber
+  }
+  if (file.source) {
+    file.source.versionNumber = file.update.versionNumber
+  }
   file.update = null
 }
 
@@ -798,12 +848,16 @@ const uuid = (): string => {
 
 /** A PNG data URL painted on a canvas (the dev page always runs in a browser). */
 function pixelPng(width: number, height: number, paint: (ctx: CanvasRenderingContext2D) => void): string {
-  if (typeof document === 'undefined') return ''
+  if (typeof document === 'undefined') {
+    return ''
+  }
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const ctx = canvas.getContext('2d')
-  if (!ctx) return ''
+  if (!ctx) {
+    return ''
+  }
   paint(ctx)
   return canvas.toDataURL('image/png')
 }
@@ -828,7 +882,9 @@ let offlineMode = false
 
 function accountRowOf(id: string | undefined): AccountRow {
   const found = accountRows.find((row) => row.id === decodeURIComponent(id ?? ''))
-  if (!found) throw new MockError('Konto nicht gefunden')
+  if (!found) {
+    throw new MockError('Konto nicht gefunden')
+  }
   return found
 }
 
@@ -866,7 +922,9 @@ function sessionView(): AccountSession {
 /** The current skin of the selected Microsoft account: the standard skin texture for every sample account. */
 function currentSkinView(): CurrentSkin {
   const row = accountRowOf(selectedAccountId)
-  if (row.type !== 'microsoft') throw new MockError('sign_in_required: Sign in with a Microsoft account to show your skin.')
+  if (row.type !== 'microsoft') {
+    throw new MockError('sign_in_required: Sign in with a Microsoft account to show your skin.')
+  }
   return {
     name: row.name,
     uuid: row.id,
@@ -913,12 +971,16 @@ let selectedSkinId: string | null = null
 
 function skinRowOf(id: string | undefined): SkinRow {
   const found = skinRows.find((row) => row.id === decodeURIComponent(id ?? ''))
-  if (!found) throw new MockError('Skin nicht gefunden')
+  if (!found) {
+    throw new MockError('Skin nicht gefunden')
+  }
   return found
 }
 
 function skinView(row: SkinRow): Skin {
-  if (row.image === null) row.image = makeSkinPng(row.hue, row.slim)
+  if (row.image === null) {
+    row.image = makeSkinPng(row.hue, row.slim)
+  }
   return {
     id: row.id,
     name: row.name,
@@ -953,33 +1015,43 @@ function rowsOf<T>(table: Map<string, T[]>, profileId: string): T[] {
 function worldOf(profileId: string | undefined, folder: string | undefined): WorldInfo {
   const name = decodeURIComponent(folder ?? '')
   const found = rowsOf(worldRows, profileId ?? '').find((world) => world.folderName === name)
-  if (!found) throw new MockError(`Welt ${name} nicht gefunden`)
+  if (!found) {
+    throw new MockError(`Welt ${name} nicht gefunden`)
+  }
   return found
 }
 
 function serverAt(profileId: string | undefined, index: string | undefined): ServerInfo {
   const found = rowsOf(serverRows, profileId ?? '')[Number(index)]
-  if (!found) throw new MockError('Server nicht gefunden')
+  if (!found) {
+    throw new MockError('Server nicht gefunden')
+  }
   return found
 }
 
 function screenshotOf(profileId: string | undefined, fileName: string | undefined): ScreenshotInfo {
   const name = decodeURIComponent(fileName ?? '')
   const found = rowsOf(screenshotRows, profileId ?? '').find((shot) => shot.fileName === name)
-  if (!found) throw new MockError('Screenshot nicht gefunden')
+  if (!found) {
+    throw new MockError('Screenshot nicht gefunden')
+  }
   return found
 }
 
 function logOf(profileId: string, logId: string): LogInfo {
   const found = rowsOf(logRows, profileId).find((log) => log.id === logId)
-  if (!found) throw new MockError('Log nicht gefunden')
+  if (!found) {
+    throw new MockError('Log nicht gefunden')
+  }
   return found
 }
 
 function backupOf(profileId: string | undefined, backupId: string | undefined): BackupInfo {
   const id = decodeURIComponent(backupId ?? '')
   const found = rowsOf(backupRows, profileId ?? '').find((backup) => backup.id === id)
-  if (!found) throw new MockError('Backup nicht gefunden')
+  if (!found) {
+    throw new MockError('Backup nicht gefunden')
+  }
   return found
 }
 
@@ -1115,12 +1187,18 @@ const accountRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     'POST',
     /^\/api\/accounts\/callback$/,
     (_m, body) => {
-      if (typeof body['error'] === 'string') throw new MockError(String(body['error_description'] ?? body['error']))
-      if (typeof body['code'] !== 'string') throw new MockError('Die Anmeldung enthält keinen Code.')
+      if (typeof body['error'] === 'string') {
+        throw new MockError(String(body['error_description'] ?? body['error']))
+      }
+      if (typeof body['code'] !== 'string') {
+        throw new MockError('Die Anmeldung enthält keinen Code.')
+      }
       return startJob('account-login', 'Anmeldung bei Microsoft', 1500, () => {
         const existing = accountRows.find((row) => row.type === 'microsoft' && row.name === 'Mock_Alex')
         const row = existing ?? { id: uuid(), name: 'Mock_Alex', type: 'microsoft' as const, isDefault: false }
-        if (!existing) accountRows.push(row)
+        if (!existing) {
+          accountRows.push(row)
+        }
         selectAccount(row)
         return { id: row.id, name: row.name }
       })
@@ -1161,7 +1239,9 @@ const accountRoutes: Array<[HttpMethod, RegExp, Handler]> = [
         return accountsView()
       }
       const last = microsoftAccounts()[microsoftAccounts().length - 1]
-      if (!last) throw new MockError('Ohne Microsoft-Konto gibt es keinen Online-Modus.')
+      if (!last) {
+        throw new MockError('Ohne Microsoft-Konto gibt es keinen Online-Modus.')
+      }
       selectAccount(last)
       return accountsView()
     }
@@ -1179,9 +1259,13 @@ const accountRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/accounts\/([^/]+)$/,
     (m) => {
       const row = accountRowOf(m[1])
-      if (row.isDefault) throw new MockError('Das Standardkonto kann nicht entfernt werden.')
+      if (row.isDefault) {
+        throw new MockError('Das Standardkonto kann nicht entfernt werden.')
+      }
       accountRows.splice(accountRows.indexOf(row), 1)
-      if (selectedAccountId === row.id) selectAccount(accountRowOf(DEFAULT_ACCOUNT_ID))
+      if (selectedAccountId === row.id) {
+        selectAccount(accountRowOf(DEFAULT_ACCOUNT_ID))
+      }
       return accountsView()
     }
   ]
@@ -1194,7 +1278,9 @@ const skinRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/skins$/,
     (_m, body) => {
       const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
-      if (name === '') throw new MockError('Der Skin braucht einen Namen.')
+      if (name === '') {
+        throw new MockError('Der Skin braucht einen Namen.')
+      }
       const raw = typeof body['imageBase64'] === 'string' ? body['imageBase64'] : ''
       const row: SkinRow = {
         id: uuid(),
@@ -1215,7 +1301,9 @@ const skinRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     (m, body) => {
       const row = skinRowOf(m[1])
       const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
-      if (name === '') throw new MockError('Der Skin braucht einen Namen.')
+      if (name === '') {
+        throw new MockError('Der Skin braucht einen Namen.')
+      }
       row.name = name
       return { skin: skinView(row) }
     }
@@ -1226,7 +1314,9 @@ const skinRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     (m) => {
       const row = skinRowOf(m[1])
       skinRows.splice(skinRows.indexOf(row), 1)
-      if (selectedSkinId === row.id) selectedSkinId = null
+      if (selectedSkinId === row.id) {
+        selectedSkinId = null
+      }
       return { deleted: row.id }
     }
   ],
@@ -1255,7 +1345,9 @@ const gameDataRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     (m, body) => {
       const world = worldOf(m[1], m[2])
       const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
-      if (name !== '') world.name = name
+      if (name !== '') {
+        world.name = name
+      }
       return { world: { ...world } }
     }
   ],
@@ -1309,7 +1401,9 @@ const gameDataRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     (m, body) => {
       const list = rowsOf(serverRows, m[1] ?? '')
       const address = typeof body['address'] === 'string' ? body['address'].trim() : ''
-      if (address === '') throw new MockError('Die Adresse fehlt.')
+      if (address === '') {
+        throw new MockError('Die Adresse fehlt.')
+      }
       const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
       const server: ServerInfo = { index: list.length, name: name || address, address, icon: '', acceptTextures: false }
       list.push(server)
@@ -1321,8 +1415,12 @@ const gameDataRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/servers\/(\d+)$/,
     (m, body) => {
       const server = serverAt(m[1], m[2])
-      if (typeof body['name'] === 'string') server.name = body['name']
-      if (typeof body['address'] === 'string') server.address = body['address']
+      if (typeof body['name'] === 'string') {
+        server.name = body['name']
+      }
+      if (typeof body['address'] === 'string') {
+        server.address = body['address']
+      }
       return { server: { ...server } }
     }
   ],
@@ -1398,7 +1496,9 @@ const gameDataRoutes: Array<[HttpMethod, RegExp, Handler]> = [
       const profileId = m[1] ?? ''
       const logId = decodeURIComponent(m[2] ?? '')
       logOf(profileId, logId)
-      if (logId !== 'launcher') throw new MockError('Nur die Launcher-Konsole kann geleert werden.')
+      if (logId !== 'launcher') {
+        throw new MockError('Nur die Launcher-Konsole kann geleert werden.')
+      }
       logTexts.set(`${profileId}|${logId}`, '')
       return { cleared: logId }
     }
@@ -1468,7 +1568,9 @@ const packFiles = new Map<string, ModFile[]>()
 
 function packFilesOf(id: string | undefined, type: string, world: string | null): ModFile[] {
   profileById(id)
-  if (type === 'mods') return modsOf(id)
+  if (type === 'mods') {
+    return modsOf(id)
+  }
   const key = `${id}|${type}|${type === 'datapacks' ? world ?? '' : ''}`
   if (!packFiles.has(key)) {
     const seed: ModFile[] = type === 'datapacks'
@@ -1491,14 +1593,18 @@ function packFilesOf(id: string | undefined, type: string, world: string | null)
 
 function packFileOf(id: string | undefined, type: string, fileName: string | undefined, world: string | null): ModFile {
   const found = packFilesOf(id, type, world).find((file) => file.fileName === decodeURIComponent(fileName ?? ''))
-  if (!found) throw new MockError(`Datei ${fileName ?? ''} nicht gefunden`)
+  if (!found) {
+    throw new MockError(`Datei ${fileName ?? ''} nicht gefunden`)
+  }
   return found
 }
 
 /** Modpack status in the contract's shapes: `{linked: false}` or the linked fields (plus the older `modpack`). */
 function modpackStatusOf(profile: Profile) {
   const source = profile.source
-  if (!source) return { linked: false }
+  if (!source) {
+    return { linked: false }
+  }
   const project = (PROJECTS[source.provider] ?? []).find((entry) => entry.id === source.projectId)
   const listed = project ? projectVersions(project, null, null).find((version) => version.id === source.versionId) : undefined
   return {
@@ -1549,7 +1655,9 @@ const contentRoutes: Array<[HttpMethod, RegExp, Handler]> = [
       const list = packFilesOf(seg(m, 1), seg(m, 2), query.get('world'))
       let changed = 0
       for (const file of list) {
-        if (file.enabled !== enabled) changed += 1
+        if (file.enabled !== enabled) {
+          changed += 1
+        }
         file.enabled = enabled
         file.fileName = enabled ? file.fileName.replace(/\.disabled$/, '') : `${file.fileName.replace(/\.disabled$/, '')}.disabled`
       }
@@ -1604,7 +1712,9 @@ const contentRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/modpack\/connect$/,
     (m, body) => {
       const profile = profileById(seg(m, 1))
-      if (profile.source) throw new MockError('Das Profil ist bereits mit einem Modpack verbunden.')
+      if (profile.source) {
+        throw new MockError('Das Profil ist bereits mit einem Modpack verbunden.')
+      }
       const provider = String(body['provider'] ?? '') as ProviderId
       const project = findProject(provider, String(body['projectId'] ?? ''))
       // Records the version only; nothing is installed.
@@ -1617,7 +1727,9 @@ const contentRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/modpack\/disconnect$/,
     (m) => {
       const profile = profileById(seg(m, 1))
-      if (!profile.source) throw new MockError('Das Profil ist mit keinem Modpack verbunden.')
+      if (!profile.source) {
+        throw new MockError('Das Profil ist mit keinem Modpack verbunden.')
+      }
       profile.source = null
       return modpackStatusOf(profile)
     }
@@ -1666,7 +1778,9 @@ const logoImages = new Map<string, string>()
 /** Small PNGs for the logo cases, painted once. */
 function logoPng(name: 'custom' | 'modpack' | 'vanilla'): string {
   const cached = logoImages.get(name)
-  if (cached !== undefined) return cached
+  if (cached !== undefined) {
+    return cached
+  }
   const png =
     name === 'vanilla'
       ? pixelPng(16, 16, (ctx) => {
@@ -1676,9 +1790,13 @@ function logoPng(name: 'custom' | 'modpack' | 'vanilla'): string {
           ctx.fillStyle = '#5ea83a'
           ctx.fillRect(0, 0, 16, 6)
           ctx.fillStyle = '#4b8a2b'
-          for (let x = 0; x < 16; x += 3) ctx.fillRect(x, 3, 1, 2)
+          for (let x = 0; x < 16; x += 3) {
+            ctx.fillRect(x, 3, 1, 2)
+          }
           ctx.fillStyle = '#5d4029'
-          for (let y = 8; y < 16; y += 3) ctx.fillRect((y * 5) % 14, y, 2, 1)
+          for (let y = 8; y < 16; y += 3) {
+            ctx.fillRect((y * 5) % 14, y, 2, 1)
+          }
         })
       : name === 'modpack'
         ? pixelPng(32, 32, (ctx) => {
@@ -1699,9 +1817,15 @@ function logoPng(name: 'custom' | 'modpack' | 'vanilla'): string {
 
 /** The answer the backend gives: custom icon, then the linked modpack, then vanilla, then the loader. */
 function logoAnswer(profile: Profile): { kind: 'custom' | 'modpack' | 'vanilla' | 'loader'; loader: Loader; dataUrl: string | null } {
-  if (profile.id === 'c3d4e5f6a1b2') return { kind: 'custom', loader: profile.loader, dataUrl: logoPng('custom') }
-  if (profile.id === 'd4e5f6a1b2c3') return { kind: 'vanilla', loader: 'vanilla', dataUrl: logoPng('vanilla') }
-  if (profile.source?.kind === 'modpack') return { kind: 'modpack', loader: profile.loader, dataUrl: logoPng('modpack') }
+  if (profile.id === 'c3d4e5f6a1b2') {
+    return { kind: 'custom', loader: profile.loader, dataUrl: logoPng('custom') }
+  }
+  if (profile.id === 'd4e5f6a1b2c3') {
+    return { kind: 'vanilla', loader: 'vanilla', dataUrl: logoPng('vanilla') }
+  }
+  if (profile.source?.kind === 'modpack') {
+    return { kind: 'modpack', loader: profile.loader, dataUrl: logoPng('modpack') }
+  }
   return { kind: 'loader', loader: profile.loader, dataUrl: null }
 }
 
@@ -1733,7 +1857,9 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/syncpacks\/auto\/create$/,
     (_m, body) => {
       const version = String(body['minecraftVersion'] ?? '')
-      if (!MOCK_RELEASES.includes(version)) throw new MockError(`HTTP 400: Unbekannte Version ${version}`)
+      if (!MOCK_RELEASES.includes(version)) {
+        throw new MockError(`HTTP 400: Unbekannte Version ${version}`)
+      }
       if (syncPackAutoState.results.some((result) => result.minecraftVersion === version && result.status === 'created')) {
         throw new MockError(`HTTP 409: Ein Profil für ${version} existiert bereits`)
       }
@@ -1749,8 +1875,12 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/syncpacks\/from-profile$/,
     (_m, body) => {
       const name = String(body['name'] ?? '').trim()
-      if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
-      if (syncPackNameTaken(name)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+      if (name === '') {
+        throw new MockError('HTTP 400: Der Name fehlt')
+      }
+      if (syncPackNameTaken(name)) {
+        throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+      }
       const row: MockPackRow = {
         id: hex(12),
         name,
@@ -1771,9 +1901,13 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/syncpacks$/,
     (_m, body) => {
       const name = String(body['name'] ?? '').trim()
-      if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
-      if (syncPackNameTaken(name)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
-      const entries = Array.isArray(body['entries']) ? (body['entries'] as SyncPackEntry[]) : []
+      if (name === '') {
+        throw new MockError('HTTP 400: Der Name fehlt')
+      }
+      if (syncPackNameTaken(name)) {
+        throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+      }
+      const entries =Array.isArray(body['entries']) ? (body['entries'] as SyncPackEntry[]) : []
       const row: MockPackRow = { id: hex(12), name, entries: entries.map((entry) => ({ ...entry })), createdAt: nowIso() }
       syncPackRows.push(row)
       return syncPackView(row)
@@ -1786,11 +1920,17 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
       const row = syncPackRowOf(m[1])
       const name = typeof body['name'] === 'string' ? body['name'].trim() : undefined
       if (name !== undefined) {
-        if (name === '') throw new MockError('HTTP 400: Der Name fehlt')
-        if (syncPackNameTaken(name, row.id)) throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+        if (name === '') {
+          throw new MockError('HTTP 400: Der Name fehlt')
+        }
+        if (syncPackNameTaken(name, row.id)) {
+          throw new MockError(`HTTP 409: Der Name ${name} ist schon vergeben`)
+        }
         row.name = name
       }
-      if (Array.isArray(body['entries'])) row.entries = (body['entries'] as SyncPackEntry[]).map((entry) => ({ ...entry }))
+      if (Array.isArray(body['entries'])) {
+        row.entries = (body['entries'] as SyncPackEntry[]).map((entry) => ({ ...entry }))
+      }
       // Linked profiles see the change on their next sync, as with the backend.
       return syncPackView(row)
     }
@@ -1823,7 +1963,9 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
             continue
           }
           for (const link of syncPackLinks.get(profileId) ?? []) {
-            if (link.packId === row.id) results.push(applyLink(profileById(profileId), link, false))
+            if (link.packId === row.id) {
+              results.push(applyLink(profileById(profileId), link, false))
+            }
           }
         }
         return { packId: row.id, profiles: results, skipped }
@@ -1837,12 +1979,18 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     (m, body) => {
       const profile = profileById(m[1])
       const row = syncPackRowOf(String(body['packId'] ?? ''))
-      if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: Das Profil ist beschäftigt')
+      if (runningGames.get(profile.id)?.running) {
+        throw new MockError('HTTP 409: Das Profil ist beschäftigt')
+      }
       const retry = body['retry'] === true
       const existing = linksOf(profile.id).find((link) => link.packId === row.id)
-      if (existing && !retry) throw new MockError('HTTP 409: Das Pack ist schon verknüpft')
+      if (existing && !retry) {
+        throw new MockError('HTTP 409: Das Pack ist schon verknüpft')
+      }
       return startJob('syncpack', `Installiere Pack „${row.name}“`, 2500, () => {
-        if (existing) return { ...applyLink(profile, existing, true) }
+        if (existing) {
+          return { ...applyLink(profile, existing, true) }
+        }
         const link: MockLink = { packId: row.id, files: [], overridden: [], declined: [], failed: [] }
         const links = syncPackLinks.get(profile.id) ?? []
         syncPackLinks.set(profile.id, [...links, link])
@@ -1855,10 +2003,14 @@ const syncPackRoutes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/syncpacks\/(\w+)$/,
     (m, _body, query) => {
       const profile = profileById(m[1])
-      if (runningGames.get(profile.id)?.running) throw new MockError('HTTP 409: Das Spiel läuft')
+      if (runningGames.get(profile.id)?.running) {
+        throw new MockError('HTTP 409: Das Spiel läuft')
+      }
       const links = syncPackLinks.get(profile.id) ?? []
       const link = links.find((candidate) => candidate.packId === m[2])
-      if (!link) throw new MockError('HTTP 404: Das Pack ist nicht verknüpft')
+      if (!link) {
+        throw new MockError('HTTP 404: Das Pack ist nicht verknüpft')
+      }
       const names = link.files.map((file) => file.fileName)
       const removeFiles = query.get('removeFiles') === 'true'
       syncPackLinks.set(
@@ -2048,8 +2200,12 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       const picked = items.map((item) => {
         const launcher = IMPORT_SCAN.launchers.find((entry) => entry.id === item.launcher)
         const candidate = launcher?.profiles.find((entry) => entry.key === item.key)
-        if (!candidate) throw new MockError(`Profil ${item.key} nicht gefunden`)
-        if (!candidate.importable) throw new MockError(`Profil „${candidate.name}“ kann nicht importiert werden.`)
+        if (!candidate) {
+          throw new MockError(`Profil ${item.key} nicht gefunden`)
+        }
+        if (!candidate.importable) {
+          throw new MockError(`Profil „${candidate.name}“ kann nicht importiert werden.`)
+        }
         return candidate
       })
       return startJob('import', `Importiere ${picked.length} Profile`, 4000, () => {
@@ -2081,7 +2237,9 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/jobs\/(\w+)\/cancel$/,
     (m) => {
       const entry = jobs.get(m[1] ?? '')
-      if (!entry) throw new MockError('Job nicht gefunden')
+      if (!entry) {
+        throw new MockError('Job nicht gefunden')
+      }
       entry.cancelled = true
       return evaluate(entry)
     }
@@ -2210,7 +2368,9 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       const list = modsOf(m[1])
       return startJob('mods-identify', 'Mods werden erkannt', 2200, () => {
         for (const file of list) {
-          if (!file.source && file.metadata?.modId === 'lithium') file.source = modrinthSource('gvQqBUqZ', '0.13.0', 'Lithium')
+          if (!file.source && file.metadata?.modId === 'lithium') {
+            file.source = modrinthSource('gvQqBUqZ', '0.13.0', 'Lithium')
+          }
         }
       })
     }
@@ -2316,7 +2476,9 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/providers\/(\w+)\/categories$/,
     (m, _b, query) => {
       // Only Modrinth publishes categories, as in the backend.
-      if (m[1] !== 'modrinth' || query.get('kind') !== 'mod') return []
+      if (m[1] !== 'modrinth' || query.get('kind') !== 'mod') {
+        return []
+      }
       return ['adventure', 'optimization', 'utility']
     }
   ],
@@ -2365,12 +2527,17 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
     /^\/api\/profiles\/(\w+)\/synced\/heal$/,
     (m) => {
       const profile = profileById(m[1])
-      if (runningGames.get(profile.id)?.running) return { report: [] }
+      if (runningGames.get(profile.id)?.running) {
+        return { report: [] }
+      }
       // Like the backend: only entries that were detached show up; the mock detaches servers.dat and config.
       const report: SyncHealEntry[] = []
       for (const key of profile.synced ?? []) {
-        if (key === 'servers' || key === 'options') report.push({ key, status: 'healed' })
-        else if (key === 'config') report.push({ key, status: 'failed', message: 'the entry is neither a file nor a link' })
+        if (key === 'servers' || key === 'options') {
+          report.push({ key, status: 'healed' })
+        } else if (key === 'config') {
+          report.push({ key, status: 'failed', message: 'the entry is neither a file nor a link' })
+        }
       }
       return { report }
     }
@@ -2382,7 +2549,9 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       const profile = profileById(m[1])
       const project = findProject(body['provider'] as ProviderId, String(body['projectId']))
       const world = typeof body['world'] === 'string' ? body['world'] : null
-      if (project.kind === 'datapack' && !world) throw new MockError('HTTP 400: world is required for data packs')
+      if (project.kind === 'datapack' && !world) {
+        throw new MockError('HTTP 400: world is required for data packs')
+      }
       return startJob('content-install', `Installiere ${project.name} in ${profile.name}`, 3000, () => {
         if (project.kind === 'mod') {
           modsOf(profile.id).push(
@@ -2426,7 +2595,9 @@ const routes: Array<[HttpMethod, RegExp, Handler]> = [
       const profile = profileById(m[1])
       if (!settings.multiProfile) {
         const other = otherActiveProfile(profile.id)
-        if (other) throw new MockError(`HTTP 409: '${other.name}' läuft; mehrere Profile gleichzeitig zu starten ist in den Einstellungen ausgeschaltet`)
+        if (other) {
+          throw new MockError(`HTTP 409: '${other.name}' läuft; mehrere Profile gleichzeitig zu starten ist in den Einstellungen ausgeschaltet`)
+        }
       }
       return startJob('launch', `Starte ${profile.name}`, 2500, () => {
         profile.lastPlayed = nowIso()
@@ -2484,16 +2655,22 @@ profiles.slice(0, 2).forEach((profile, index) => {
 })
 
 // Demo of the running states: a game install on a profile and a pack install whose profile does not exist yet.
-if (profiles[0]) startJob('install-game', `Installiere Minecraft ${profiles[0].minecraftVersion}`, 90_000, undefined, profiles[0].id)
+if (profiles[0]) {
+  startJob('install-game', `Installiere Minecraft ${profiles[0].minecraftVersion}`, 90_000, undefined, profiles[0].id)
+}
 startJob('pack-install', 'Installiere Fabulously Optimized', 120_000)
 
 async function handle<T>(method: HttpMethod, rawPath: string, body: unknown): Promise<ApiResult<T>> {
   await sleep(LATENCY_MS)
   const url = new URL(rawPath, 'http://mock.invalid')
   for (const [routeMethod, pattern, handler] of routes) {
-    if (routeMethod !== method) continue
+    if (routeMethod !== method) {
+      continue
+    }
     const match = pattern.exec(url.pathname)
-    if (!match) continue
+    if (!match) {
+      continue
+    }
     const result = await handler(match, (body ?? {}) as Record<string, unknown>, url.searchParams)
     const status = method === 'POST' && result !== null && typeof result === 'object' && 'state' in result ? 202 : 200
     return { status, body: structuredClone(result) as T }

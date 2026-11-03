@@ -57,10 +57,14 @@ export function SkinViewer3D() {
   // The canvas follows the size of its frame.
   useEffect(() => {
     const frame = frameRef.current
-    if (!frame) return
+    if (!frame) {
+      return
+    }
     const fit = (): void => {
       const viewer = viewerRef.current
-      if (viewer && frame.clientWidth > 0 && frame.clientHeight > 0) viewer.setSize(frame.clientWidth, frame.clientHeight)
+      if (viewer && frame.clientWidth > 0 && frame.clientHeight > 0) {
+        viewer.setSize(frame.clientWidth, frame.clientHeight)
+      }
     }
     const observer = new ResizeObserver(fit)
     observer.observe(frame)
@@ -70,7 +74,9 @@ export function SkinViewer3D() {
   // Applies the answer: the viewer is created once, then skin and cape are replaced per answer.
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!data || !canvas) return
+    if (!data || !canvas) {
+      return
+    }
     let viewer = viewerRef.current
     if (!viewer) {
       try {
@@ -84,10 +90,14 @@ export function SkinViewer3D() {
     let cancelled = false
     viewer.loadSkin(data.dataUrl ?? DEFAULT_SKIN_DATA_URL, { model: data.model === 'slim' ? 'slim' : 'default' }).then(
       () => {
-        if (!cancelled) setReady(true)
+        if (!cancelled) {
+          setReady(true)
+        }
       },
       (error: unknown) => {
-        if (!cancelled) setTextureError(errorMessage(error))
+        if (!cancelled) {
+          setTextureError(errorMessage(error))
+        }
       }
     )
     if (data.capeDataUrl) {
@@ -101,7 +111,9 @@ export function SkinViewer3D() {
     }
   }, [data])
 
-  if (skin.error?.includes('sign_in_required')) return null
+  if (skin.error?.includes('sign_in_required')) {
+    return null
+  }
 
   const failure = skin.error ?? textureError
   const spinning = !failure && !unavailable && !ready

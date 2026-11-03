@@ -28,15 +28,22 @@ export function LogsPanel({ profile }: { profile: Profile }) {
   const showLatestCrash = async (): Promise<void> => {
     try {
       const result = await api.saves.latestCrash(profile.id)
-      if (result.log) setSelectedId(result.log.id)
-      else toast.info(t('saves.logs.noCrash'))
+      if (result.log) {
+        setSelectedId(result.log.id)
+      } else {
+        toast.info(t('saves.logs.noCrash'))
+      }
     } catch (failure) {
       toast.error(failure)
     }
   }
 
-  if (!logs && loading) return <LoadingBlock />
-  if (error && !logs) return <ErrorNotice message={error} onRetry={reload} />
+  if (!logs && loading) {
+    return <LoadingBlock />
+  }
+  if (error && !logs) {
+    return <ErrorNotice message={error} onRetry={reload} />
+  }
 
   return (
     <div className="grid gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
@@ -107,14 +114,18 @@ function LogViewer({ profile, log, onCleared }: { profile: Profile; log: LogInfo
     let cancelled = false
     api.saves.readLog(profile.id, log.id, -1).then(
       (chunk) => {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         setText(chunk.text)
         setOffset(chunk.nextOffset)
         setTruncated(chunk.truncated)
         setLoaded(true)
       },
       (failure: unknown) => {
-        if (!cancelled) toast.error(failure)
+        if (!cancelled) {
+          toast.error(failure)
+        }
       }
     )
     return () => {
@@ -124,12 +135,16 @@ function LogViewer({ profile, log, onCleared }: { profile: Profile; log: LogInfo
 
   // Following a live log: ask for what was written after the last offset.
   useEffect(() => {
-    if (!follow || !log.live) return
+    if (!follow || !log.live) {
+      return
+    }
     let cancelled = false
     const timer = window.setInterval(() => {
       api.saves.readLog(profile.id, log.id, offset).then(
         (chunk) => {
-          if (cancelled) return
+          if (cancelled) {
+            return
+          }
           if (chunk.offset !== offset) {
             // The file was replaced or cleared while following: start over from its tail.
             setReloadKey((key) => key + 1)
@@ -151,12 +166,16 @@ function LogViewer({ profile, log, onCleared }: { profile: Profile; log: LogInfo
 
   const jumpToEnd = useCallback(() => {
     const view = viewRef.current
-    if (view) view.scrollTop = view.scrollHeight
+    if (view) {
+      view.scrollTop = view.scrollHeight
+    }
   }, [])
 
   // Keep the newest line visible while following, and on the first load.
   useEffect(() => {
-    if (loaded && (follow || text !== '')) jumpToEnd()
+    if (loaded && (follow || text !== '')) {
+      jumpToEnd()
+    }
   }, [text, loaded, follow, jumpToEnd])
 
   return (

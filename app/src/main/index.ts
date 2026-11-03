@@ -27,7 +27,9 @@ function registerIpc(): void {
     try {
       return { ok: true, result: await backend.request(method, path, body) }
     } catch (error) {
-      if (error instanceof ApiRequestError) return { ok: false, status: error.status, message: error.message }
+      if (error instanceof ApiRequestError) {
+        return { ok: false, status: error.status, message: error.message }
+      }
       return { ok: false, status: 0, message: error instanceof Error ? error.message : String(error) }
     }
   })
@@ -39,8 +41,12 @@ function registerIpc(): void {
     mainWindow?.hide()
   })
   ipcMain.handle(IPC.showWindow, () => {
-    if (!mainWindow) return
-    if (mainWindow.isMinimized()) mainWindow.restore()
+    if (!mainWindow) {
+      return
+    }
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
+    }
     mainWindow.show()
     mainWindow.focus()
   })
@@ -50,9 +56,14 @@ function registerIpc(): void {
     mainWindow?.minimize()
   })
   ipcMain.handle(IPC.maximize, () => {
-    if (!mainWindow) return
-    if (mainWindow.isMaximized()) mainWindow.unmaximize()
-    else mainWindow.maximize()
+    if (!mainWindow) {
+      return
+    }
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize()
+    } else {
+      mainWindow.maximize()
+    }
   })
   ipcMain.handle(IPC.close, () => {
     mainWindow?.close()
@@ -65,7 +76,9 @@ function registerIpc(): void {
   })
 
   ipcMain.handle(IPC.openPath, async (_event, path: unknown): Promise<string> => {
-    if (typeof path !== 'string' || path.length === 0) return 'Invalid path.'
+    if (typeof path !== 'string' || path.length === 0) {
+      return 'Invalid path.'
+    }
     return shell.openPath(path)
   })
 
@@ -111,7 +124,9 @@ function createWindow(): void {
   window.once('ready-to-show', () => window.show())
   // Maximise state drives the maximise/restore icon of the top bar.
   const sendMaximized = (): void => {
-    if (!window.isDestroyed()) window.webContents.send(IPC.maximizedChangedEvent, window.isMaximized())
+    if (!window.isDestroyed()) {
+      window.webContents.send(IPC.maximizedChangedEvent, window.isMaximized())
+    }
   }
   window.on('maximize', sendMaximized)
   window.on('unmaximize', sendMaximized)
@@ -121,7 +136,9 @@ function createWindow(): void {
 
   // Links in rendered content open in the system browser, never inside the app.
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+      void shell.openExternal(url)
+    }
     return { action: 'deny' }
   })
   window.webContents.on('will-navigate', (event, url) => {
@@ -129,13 +146,18 @@ function createWindow(): void {
     const internal = rendererUrl ? url.startsWith(rendererUrl) : url.startsWith('file://')
     if (!internal) {
       event.preventDefault()
-      if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url)
+      if (url.startsWith('https://') || url.startsWith('http://')) {
+        void shell.openExternal(url)
+      }
     }
   })
 
   const rendererUrl = process.env['ELECTRON_RENDERER_URL']
-  if (!app.isPackaged && rendererUrl) void window.loadURL(rendererUrl)
-  else void window.loadFile(join(__dirname, '../renderer/index.html'))
+  if (!app.isPackaged && rendererUrl) {
+    void window.loadURL(rendererUrl)
+  } else {
+    void window.loadFile(join(__dirname, '../renderer/index.html'))
+  }
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -143,7 +165,9 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', () => {
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore()
+      }
       mainWindow.focus()
     }
   })
@@ -153,7 +177,9 @@ if (!app.requestSingleInstanceLock()) {
     createWindow()
     void backend.start()
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow()
+      }
     })
   })
 

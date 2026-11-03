@@ -13,13 +13,21 @@ export function GamesButton() {
   const [confirming, setConfirming] = useState(false)
 
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      return
+    }
     const onPointer = (event: PointerEvent): void => {
-      if (confirming) return
-      if (container.current && !container.current.contains(event.target as Node)) setOpen(false)
+      if (confirming) {
+        return
+      }
+      if (container.current && !container.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
     }
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && !confirming) setOpen(false)
+      if (event.key === 'Escape' && !confirming) {
+        setOpen(false)
+      }
     }
     document.addEventListener('pointerdown', onPointer)
     document.addEventListener('keydown', onKey)
@@ -32,7 +40,9 @@ export function GamesButton() {
   const label = t('games.title')
   const hasRunning = entries.some((entry) => entry.state !== 'launching')
   // Nothing runs: the button disappears (an open panel closes with it).
-  if (count === 0 && !open) return null
+  if (count === 0 && !open) {
+    return null
+  }
 
   return (
     <div ref={container} className="relative">

@@ -219,7 +219,9 @@ function buildScene(category: VersionCategory): string {
     const top = ROWS - count
     // Sky above the column: a few single pixels (stars or flowers).
     for (let y = 0; y < top; y++) {
-      if (random() < 0.05) parts.push(`<rect x="${x + 0.3}" y="${y + 0.3}" width="0.4" height="0.4" fill="${palette.accent}"/>`)
+      if (random() < 0.05) {
+        parts.push(`<rect x="${x + 0.3}" y="${y + 0.3}" width="0.4" height="0.4" fill="${palette.accent}"/>`)
+      }
     }
     if (top > 0 && random() < 0.16) {
       parts.push(`<rect x="${x + 0.25}" y="${top - 1 + 0.25}" width="0.5" height="0.5" fill="${palette.accent}"/>`)

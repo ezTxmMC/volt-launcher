@@ -14,8 +14,11 @@ export function readLastTarget(): string {
 
 export function rememberTarget(profileId: string): void {
   try {
-    if (profileId) sessionStorage.setItem(KEY, profileId)
-    else sessionStorage.removeItem(KEY)
+    if (profileId) {
+      sessionStorage.setItem(KEY, profileId)
+    } else {
+      sessionStorage.removeItem(KEY)
+    }
   } catch {
     // storage unavailable: the choice lasts for this visit only
   }
@@ -33,7 +36,9 @@ export function useInstallTarget(): [string, (profileId: string) => void] {
 
   // A deep link becomes the session's choice.
   useEffect(() => {
-    if (fromUrl) rememberTarget(fromUrl)
+    if (fromUrl) {
+      rememberTarget(fromUrl)
+    }
   }, [fromUrl])
 
   const choose = useCallback(
@@ -43,8 +48,11 @@ export function useInstallTarget(): [string, (profileId: string) => void] {
       setParams(
         (current) => {
           const next = new URLSearchParams(current)
-          if (profileId) next.set('profile', profileId)
-          else next.delete('profile')
+          if (profileId) {
+            next.set('profile', profileId)
+          } else {
+            next.delete('profile')
+          }
           return next
         },
         { replace: true }

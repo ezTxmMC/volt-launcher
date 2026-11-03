@@ -32,10 +32,15 @@ export function DiscoverTab({ profile }: { profile: Profile }) {
   const vanilla = profile.loader === 'vanilla'
 
   const renderAction = (project: ProjectSummary) => {
-    if (project.kind === 'modpack') return null
+    if (project.kind === 'modpack') {
+      return null
+    }
     let reason: string | undefined
-    if (project.kind === 'mod' && vanilla) reason = t('discover.noLoader')
-    else if (project.kind === 'datapack' && !world) reason = t('discover.noWorld')
+    if (project.kind === 'mod' && vanilla) {
+      reason = t('discover.noLoader')
+    } else if (project.kind === 'datapack' && !world) {
+      reason = t('discover.noWorld')
+    }
     return (
       <InstallButton
         state={install.stateOf(project)}

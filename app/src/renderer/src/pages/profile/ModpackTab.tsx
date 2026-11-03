@@ -44,11 +44,16 @@ export function ModpackTab({ profile }: { profile: Profile }) {
   const [disconnectOpen, setDisconnectOpen] = useState(false)
 
   useJobFinished((job) => {
-    if (!jobIds.includes(job.id)) return
+    if (!jobIds.includes(job.id)) {
+      return
+    }
     reload()
     reloadVersions()
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
-    else if (job.state === 'done') toast.success(t('job.finished', { title: job.title }))
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    } else if (job.state === 'done') {
+      toast.success(t('job.finished', { title: job.title }))
+    }
   })
 
   const ownJobs = jobs.filter((job) => jobIds.includes(job.id) && job.state === 'running')
@@ -71,8 +76,12 @@ export function ModpackTab({ profile }: { profile: Profile }) {
     }
   }
 
-  if (error) return <ErrorNotice message={error} onRetry={reload} />
-  if (!status && loading) return <LoadingBlock />
+  if (error) {
+    return <ErrorNotice message={error} onRetry={reload} />
+  }
+  if (!status && loading) {
+    return <LoadingBlock />
+  }
 
   return (
     <div className="grid gap-4">

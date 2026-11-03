@@ -34,8 +34,12 @@ export function ServersPanel({ profile }: { profile: Profile }) {
 
   // A finished launch: report its failure and refresh the game status.
   useJobFinished((job: Job) => {
-    if (!jobIds.includes(job.id)) return
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
+    if (!jobIds.includes(job.id)) {
+      return
+    }
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    }
     reloadGame()
   })
 

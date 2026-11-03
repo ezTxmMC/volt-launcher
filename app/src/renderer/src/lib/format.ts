@@ -6,8 +6,12 @@ export function formatNumber(value: number, language: Language): string {
     return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
   }
   const decimal = new Intl.NumberFormat('de', { maximumFractionDigits: 1 })
-  if (value >= 1_000_000) return `${decimal.format(value / 1_000_000)} Mio.`
-  if (value >= 1_000) return `${decimal.format(value / 1_000)} Tsd.`
+  if (value >= 1_000_000) {
+    return `${decimal.format(value / 1_000_000)} Mio.`
+  }
+  if (value >= 1_000) {
+    return `${decimal.format(value / 1_000)} Tsd.`
+  }
   return decimal.format(value)
 }
 
@@ -25,7 +29,9 @@ export function formatBytes(bytes: number, language: Language): string {
 
 export function formatDate(iso: string, language: Language): string {
   const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
+  if (Number.isNaN(date.getTime())) {
+    return iso
+  }
   return new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(date)
 }
 
@@ -39,11 +45,15 @@ const STEPS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
 
 export function formatRelative(iso: string, language: Language): string {
   const time = new Date(iso).getTime()
-  if (Number.isNaN(time)) return iso
+  if (Number.isNaN(time)) {
+    return iso
+  }
   const seconds = Math.round((time - Date.now()) / 1000)
   const formatter = new Intl.RelativeTimeFormat(language, { numeric: 'auto' })
   for (const [unit, size] of STEPS) {
-    if (Math.abs(seconds) >= size) return formatter.format(Math.round(seconds / size), unit)
+    if (Math.abs(seconds) >= size) {
+      return formatter.format(Math.round(seconds / size), unit)
+    }
   }
   return formatter.format(0, 'second')
 }
@@ -51,7 +61,9 @@ export function formatRelative(iso: string, language: Language): string {
 /** Parses an optional positive integer input; empty means "not set". */
 export function parseOptionalInt(text: string): number | null | undefined {
   const trimmed = text.trim()
-  if (trimmed === '') return null
+  if (trimmed === '') {
+    return null
+  }
   const value = Number(trimmed)
   return Number.isInteger(value) && value > 0 ? value : undefined
 }

@@ -16,7 +16,9 @@ interface Pick {
 function readStoredPick(): Pick | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
+    if (!raw) {
+      return null
+    }
     if (raw.startsWith('{')) {
       const parsed = JSON.parse(raw) as Partial<Pick>
       return typeof parsed.id === 'string' ? { id: parsed.id, at: typeof parsed.at === 'string' ? parsed.at : '' } : null
@@ -46,7 +48,9 @@ export function pickProfile(profiles: readonly Profile[], pick: Pick | null): Pr
     .sort((a, b) => Date.parse(b.lastPlayed) - Date.parse(a.lastPlayed))
   const latest = played[0]
   const picked = pick ? profiles.find((profile) => profile.id === pick.id) : undefined
-  if (picked && (!latest || Date.parse(pick!.at || '1970-01-01T00:00:00Z') > Date.parse(latest.lastPlayed))) return picked
+  if (picked && (!latest || Date.parse(pick!.at || '1970-01-01T00:00:00Z') > Date.parse(latest.lastPlayed))) {
+    return picked
+  }
   return latest ?? picked ?? profiles[0]
 }
 

@@ -36,9 +36,13 @@ function signatureOf(profile: Profile): string {
 
 function fetchLogo(id: string, signature: string): Promise<ProfileLogo | null> {
   const known = resolved.get(id)
-  if (known && known.signature === signature) return Promise.resolve(known.logo)
+  if (known && known.signature === signature) {
+    return Promise.resolve(known.logo)
+  }
   const running = inflight.get(id)
-  if (running && running.signature === signature) return running.promise
+  if (running && running.signature === signature) {
+    return running.promise
+  }
 
   const request = api.profiles.logo(id).then(
     (logo) => logo,
@@ -47,7 +51,9 @@ function fetchLogo(id: string, signature: string): Promise<ProfileLogo | null> {
   )
   const promise = request.then((logo) => {
     resolved.set(id, { signature, logo })
-    if (inflight.get(id)?.promise === promise) inflight.delete(id)
+    if (inflight.get(id)?.promise === promise) {
+      inflight.delete(id)
+    }
     return logo
   })
   inflight.set(id, { signature, promise })
@@ -66,10 +72,14 @@ export function useProfileLogo(profile: Profile): ProfileLogoResult {
   const [, setRevision] = useState(0)
 
   useEffect(() => {
-    if (resolved.get(id)?.signature === signature) return
+    if (resolved.get(id)?.signature === signature) {
+      return
+    }
     let active = true
     void fetchLogo(id, signature).then(() => {
-      if (active) setRevision((value) => value + 1)
+      if (active) {
+        setRevision((value) => value + 1)
+      }
     })
     return () => {
       active = false
@@ -77,6 +87,8 @@ export function useProfileLogo(profile: Profile): ProfileLogoResult {
   }, [id, signature])
 
   const known = resolved.get(id)
-  if (!known || known.signature !== signature) return { status: 'loading', logo: null }
+  if (!known || known.signature !== signature) {
+    return { status: 'loading', logo: null }
+  }
   return known.logo ? { status: 'ready', logo: known.logo } : { status: 'unavailable', logo: null }
 }

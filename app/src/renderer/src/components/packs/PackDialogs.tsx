@@ -12,8 +12,12 @@ import { Modal } from '@/components/ui/Modal'
 /** Shared name check: empty and taken names block the save; the backend answers the same rules with 400/409. */
 export function nameProblemOf(name: string, existingNames: readonly string[], current?: string): 'empty' | 'taken' | null {
   const trimmed = name.trim()
-  if (trimmed === '') return 'empty'
-  if (existingNames.some((existing) => existing.toLowerCase() === trimmed.toLowerCase() && existing !== current)) return 'taken'
+  if (trimmed === '') {
+    return 'empty'
+  }
+  if (existingNames.some((existing) => existing.toLowerCase() === trimmed.toLowerCase() && existing !== current)) {
+    return 'taken'
+  }
   return null
 }
 
@@ -37,7 +41,9 @@ export function NewPackDialog({
   const canSave = !saving && problem === null
 
   const save = async (): Promise<void> => {
-    if (!canSave) return
+    if (!canSave) {
+      return
+    }
     setSaving(true)
     setError(null)
     try {
@@ -110,7 +116,9 @@ export function RenameDialog({
   const canSave = !saving && problem === null && name.trim() !== pack.name
 
   const save = async (): Promise<void> => {
-    if (!canSave) return
+    if (!canSave) {
+      return
+    }
     setSaving(true)
     setError(null)
     try {
@@ -184,7 +192,9 @@ export function FromProfileDialog({
   const canSave = !saving && profileId !== '' && problem === null
 
   const save = async (): Promise<void> => {
-    if (!canSave) return
+    if (!canSave) {
+      return
+    }
     setSaving(true)
     setError(null)
     try {

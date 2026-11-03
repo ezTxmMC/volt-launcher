@@ -58,10 +58,15 @@ export function WorldsPanel({ profile }: { profile: Profile }) {
 
   // A finished job may have created or copied a world; refresh and report our own jobs.
   useJobFinished((job: Job) => {
-    if (!jobIds.includes(job.id)) return
+    if (!jobIds.includes(job.id)) {
+      return
+    }
     reload()
-    if (job.state === 'failed') toast.error(job.error ?? job.title)
-    else if (job.state === 'done') toast.success(t('job.finished', { title: job.title }))
+    if (job.state === 'failed') {
+      toast.error(job.error ?? job.title)
+    } else if (job.state === 'done') {
+      toast.success(t('job.finished', { title: job.title }))
+    }
   })
 
   const ownJobs = jobs.filter((job) => jobIds.includes(job.id) && job.state === 'running')
@@ -212,11 +217,15 @@ export function WorldsPanel({ profile }: { profile: Profile }) {
 function WorldIcon({ profileId, world }: { profileId: string; world: WorldInfo }) {
   const [src, setSrc] = useState<string | null>(null)
   useEffect(() => {
-    if (!world.hasIcon) return
+    if (!world.hasIcon) {
+      return
+    }
     let cancelled = false
     api.saves.worldIcon(profileId, world.folderName).then(
       (result) => {
-        if (!cancelled) setSrc(result.dataUrl)
+        if (!cancelled) {
+          setSrc(result.dataUrl)
+        }
       },
       () => undefined
     )

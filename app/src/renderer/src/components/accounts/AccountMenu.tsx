@@ -29,27 +29,39 @@ export function AccountMenu() {
 
   useEffect(() => {
     return jobs.onJobFinished((job) => {
-      if (job.kind === 'account-login') notifyChanged('accounts')
+      if (job.kind === 'account-login') {
+        notifyChanged('accounts')
+      }
       if (job.kind === 'skin-apply') {
         notifyChanged('skins')
         notifyChanged('accounts')
         const result = job.result
         const skin = result?.skin
         const name = typeof skin === 'object' && skin !== null && 'name' in skin && typeof skin.name === 'string' ? skin.name : ''
-        if (job.state === 'done') toast.success(t('skins.applied', { name }))
-        if (job.state === 'failed') toast.error(job.error ?? t('skins.applyFailed'))
+        if (job.state === 'done') {
+          toast.success(t('skins.applied', { name }))
+        }
+        if (job.state === 'failed') {
+          toast.error(job.error ?? t('skins.applyFailed'))
+        }
       }
     })
   }, [jobs, t, toast])
 
   // Close on a click outside the menu or on Escape.
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      return
+    }
     const onPointer = (event: MouseEvent): void => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false)
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false)
+      }
     }
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
     }
     document.addEventListener('mousedown', onPointer)
     document.addEventListener('keydown', onKey)
@@ -77,7 +89,9 @@ export function AccountMenu() {
   }
 
   const choose = (account: Account): void => {
-    if (account.selected) return
+    if (account.selected) {
+      return
+    }
     void run(async () => {
       await api.accounts.select(account.id)
       toast.info(t('accounts.selected', { name: account.name }))

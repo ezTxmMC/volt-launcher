@@ -45,7 +45,9 @@ export function FormModal({
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
-    if (missing || busy) return
+    if (missing || busy) {
+      return
+    }
     setBusy(true)
     try {
       await onSubmit(values)
@@ -103,7 +105,9 @@ export function CopyWorldModal({
     let cancelled = false
     api.profiles.list().then(
       (list) => {
-        if (!cancelled) setProfiles(list.filter((profile) => profile.id !== excludeId))
+        if (!cancelled) {
+          setProfiles(list.filter((profile) => profile.id !== excludeId))
+        }
       },
       (error: unknown) => toast.error(error)
     )
@@ -117,7 +121,9 @@ export function CopyWorldModal({
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
-    if (!selected || busy) return
+    if (!selected || busy) {
+      return
+    }
     setBusy(true)
     try {
       await onSubmit(selected)

@@ -14,12 +14,18 @@ export interface PackLink {
  * Null when the profile is not linked.
  */
 export function packLinkOf(status: ModpackStatus | undefined): PackLink | null {
-  if (!status) return null
+  if (!status) {
+    return null
+  }
   const source = status.modpack ?? null
   const linked = status.linked ?? source !== null
-  if (!linked) return null
+  if (!linked) {
+    return null
+  }
   const provider = status.provider ?? source?.provider
-  if (!provider) return null
+  if (!provider) {
+    return null
+  }
   return {
     provider,
     projectId: status.projectId ?? source?.projectId ?? '',
@@ -40,8 +46,12 @@ export function newestFirst(versions: readonly ProjectVersion[]): ProjectVersion
 
 /** Arrow keys of a radio group as a step: 1 forward, -1 back, 0 for any other key. */
 export function stepOf(key: string): 1 | -1 | 0 {
-  if (key === 'ArrowDown' || key === 'ArrowRight') return 1
-  if (key === 'ArrowUp' || key === 'ArrowLeft') return -1
+  if (key === 'ArrowDown' || key === 'ArrowRight') {
+    return 1
+  }
+  if (key === 'ArrowUp' || key === 'ArrowLeft') {
+    return -1
+  }
   return 0
 }
 

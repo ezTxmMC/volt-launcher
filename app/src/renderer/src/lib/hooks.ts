@@ -28,10 +28,14 @@ export function useAsync<T>(load: () => Promise<T>): AsyncResult<T> {
     let cancelled = false
     load().then(
       (data) => {
-        if (!cancelled) setState({ source: load, data, error: null })
+        if (!cancelled) {
+          setState({ source: load, data, error: null })
+        }
       },
       (error: unknown) => {
-        if (!cancelled) setState((previous) => ({ source: load, data: previous.data, error: errorMessage(error) }))
+        if (!cancelled) {
+          setState((previous) => ({ source: load, data: previous.data, error: errorMessage(error) }))
+        }
       }
     )
     return () => {

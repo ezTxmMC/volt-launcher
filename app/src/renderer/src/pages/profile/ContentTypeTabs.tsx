@@ -27,8 +27,12 @@ export function DataPacksTab({ profile }: { profile: Profile }) {
   const { data, error, loading, reload } = useAsync(load)
   const [chosen, setChosen] = useState('')
 
-  if (error) return <ErrorNotice message={error} onRetry={reload} />
-  if (!data && loading) return <LoadingBlock />
+  if (error) {
+    return <ErrorNotice message={error} onRetry={reload} />
+  }
+  if (!data && loading) {
+    return <LoadingBlock />
+  }
   const worlds = data?.worlds ?? []
   if (worlds.length === 0) {
     return <p className="py-10 text-center text-muted">{t('content.noWorlds')}</p>

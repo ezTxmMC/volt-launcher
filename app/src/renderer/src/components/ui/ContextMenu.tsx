@@ -63,7 +63,9 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
   // Place the menu once it has its real size: flip to the left or upwards when it would leave the viewport.
   useLayoutEffect(() => {
     const menu = menuRef.current
-    if (!menu) return
+    if (!menu) {
+      return
+    }
     const { width, height } = menu.getBoundingClientRect()
     const left = x + width + EDGE > window.innerWidth ? Math.max(EDGE, x - width) : x
     const top = y + height + EDGE > window.innerHeight ? Math.max(EDGE, y - height) : y
@@ -72,8 +74,11 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
 
   // Move focus to the active item; with no reachable item, to the menu itself.
   useEffect(() => {
-    if (active >= 0) itemRefs.current[active]?.focus({ preventScroll: true })
-    else menuRef.current?.focus({ preventScroll: true })
+    if (active >= 0) {
+      itemRefs.current[active]?.focus({ preventScroll: true })
+    } else {
+      menuRef.current?.focus({ preventScroll: true })
+    }
   }, [active])
 
   // Return focus to whatever opened the menu when it closes.
@@ -84,7 +89,9 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
 
   useEffect(() => {
     const onPointerOutside = (event: Event): void => {
-      if (!menuRef.current?.contains(event.target as Node)) dismiss()
+      if (!menuRef.current?.contains(event.target as Node)) {
+        dismiss()
+      }
     }
     const onKey = (event: KeyboardEvent): void => {
       const indices = reachable(items)
@@ -97,8 +104,12 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
         dismiss()
         return
       }
-      if (indices.length === 0) return
-      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+      if (indices.length === 0) {
+        return
+      }
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        return
+      }
       event.preventDefault()
       setActive((current) => {
         const at = indices.indexOf(current)
@@ -139,7 +150,9 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
       className="volt-menu fixed z-[80] grid min-w-[220px] max-w-[calc(100vw-16px)] gap-0.5 rounded-xl border border-[var(--accent-border)] bg-surface-strong p-1.5 shadow-pop backdrop-blur-xl outline-none"
     >
       {items.map((entry, index) => {
-        if (isSeparator(entry)) return <div key={entry.id} role="separator" className="my-1 h-px bg-line" />
+        if (isSeparator(entry)) {
+          return <div key={entry.id} role="separator" className="my-1 h-px bg-line" />
+        }
         const isActive = index === active
         const tint = entry.danger ? (isActive ? 'bg-danger-soft' : '') : isActive ? 'bg-accent-soft' : ''
         return (
@@ -154,10 +167,14 @@ export function ContextMenu({ x, y, label, items, onClose }: ContextMenuProps) {
             disabled={entry.disabled}
             title={entry.title}
             onPointerEnter={() => {
-              if (!entry.disabled) setActive(index)
+              if (!entry.disabled) {
+                setActive(index)
+              }
             }}
             onClick={() => {
-              if (entry.disabled) return
+              if (entry.disabled) {
+                return
+              }
               dismiss()
               entry.onSelect()
             }}

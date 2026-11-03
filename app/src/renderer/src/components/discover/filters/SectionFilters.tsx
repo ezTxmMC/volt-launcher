@@ -21,7 +21,9 @@ export function LoaderFilter({ loaders, value, onChange }: LoaderFilterProps) {
   const [expanded, setExpanded] = useState(false)
   const choices = loaderChoices(loaders)
   let visible = expanded ? choices : choices.slice(0, LOADER_PREVIEW)
-  if (value && !visible.includes(value)) visible = [...visible, value]
+  if (value && !visible.includes(value)) {
+    visible = [...visible, value]
+  }
 
   return (
     <div role="group" aria-label={t('discover.section.loader')} className="grid gap-0.5">

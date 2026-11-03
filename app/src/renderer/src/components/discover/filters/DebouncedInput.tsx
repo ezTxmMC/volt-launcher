@@ -38,7 +38,9 @@ export function DebouncedInput({
   }, [onCommit])
 
   useEffect(() => {
-    if (draft === value) return
+    if (draft === value) {
+      return
+    }
     const timer = window.setTimeout(() => commitRef.current(draft), delay)
     return () => window.clearTimeout(timer)
   }, [draft, value, delay])
@@ -53,7 +55,9 @@ export function DebouncedInput({
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === 'Enter' && draft !== value) commitRef.current(draft)
+          if (event.key === 'Enter' && draft !== value) {
+            commitRef.current(draft)
+          }
         }}
         placeholder={placeholder}
         aria-label={ariaLabel}

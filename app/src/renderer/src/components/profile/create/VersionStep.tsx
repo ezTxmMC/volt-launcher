@@ -39,8 +39,12 @@ const FILTER_LABELS: Record<VersionFilter, MessageKey> = {
 }
 
 function typeLabel(type: string): MessageKey {
-  if (type === 'release') return 'createProfile.version.type.release'
-  if (type === 'snapshot') return 'createProfile.version.type.snapshot'
+  if (type === 'release') {
+    return 'createProfile.version.type.release'
+  }
+  if (type === 'snapshot') {
+    return 'createProfile.version.type.snapshot'
+  }
   return 'createProfile.version.type.other'
 }
 

@@ -38,7 +38,9 @@ export function PackEntryGroups({
     <div className="grid gap-4">
       {SYNC_PACK_KINDS.map((kind) => {
         const group = entries.filter((entry) => entry.kind === kind)
-        if (group.length === 0) return null
+        if (group.length === 0) {
+          return null
+        }
         return (
           <div key={kind} className="grid gap-1.5">
             <h4 className="flex items-center gap-2 text-[13px] font-semibold text-muted">

@@ -17,9 +17,13 @@ const keyOf = (provider: ProviderId, projectId: string): string => `${provider}:
 export function loadProjectIcon(provider: ProviderId, projectId: string): Promise<string | null> {
   const key = keyOf(provider, projectId)
   const known = resolved.get(key)
-  if (known !== undefined) return Promise.resolve(known)
+  if (known !== undefined) {
+    return Promise.resolve(known)
+  }
   const inFlight = running.get(key)
-  if (inFlight) return inFlight
+  if (inFlight) {
+    return inFlight
+  }
 
   const request = new Promise<ProjectDetail>((resolve) => resolve(api.providers.project(provider, projectId)))
     .then(
@@ -43,18 +47,26 @@ export function useProjectIcon(provider: ProviderId | null | undefined, projectI
   const [settled, setSettled] = useState<{ key: string; url: string | null } | null>(null)
 
   useEffect(() => {
-    if (!provider || !projectId || resolved.has(keyOf(provider, projectId))) return
+    if (!provider || !projectId || resolved.has(keyOf(provider, projectId))) {
+      return
+    }
     const ownKey = keyOf(provider, projectId)
     let active = true
     void loadProjectIcon(provider, projectId).then((url) => {
-      if (active) setSettled({ key: ownKey, url })
+      if (active) {
+        setSettled({ key: ownKey, url })
+      }
     })
     return () => {
       active = false
     }
   }, [provider, projectId])
 
-  if (key === null) return null
-  if (resolved.has(key)) return resolved.get(key) ?? null
+  if (key === null) {
+    return null
+  }
+  if (resolved.has(key)) {
+    return resolved.get(key) ?? null
+  }
   return settled?.key === key ? settled.url : null
 }

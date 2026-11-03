@@ -29,7 +29,9 @@ export function VersionPicker({
 }) {
   const { t, language } = useI18n()
 
-  if (error) return <ErrorNotice message={error} onRetry={onRetry} />
+  if (error) {
+    return <ErrorNotice message={error} onRetry={onRetry} />
+  }
   if (loading) {
     return (
       <p className="flex items-center gap-2 text-subtle">
@@ -38,11 +40,15 @@ export function VersionPicker({
       </p>
     )
   }
-  if (versions.length === 0) return <p className="text-muted">{t('profile.modpack.connect.versionsEmpty')}</p>
+  if (versions.length === 0) {
+    return <p className="text-muted">{t('profile.modpack.connect.versionsEmpty')}</p>
+  }
 
   const gameVersionsOf = (version: ProjectVersion): string => {
     const list = version.gameVersions
-    if (list.length === 0) return ''
+    if (list.length === 0) {
+      return ''
+    }
     const shown = list.slice(0, MAX_GAME_VERSIONS).join(', ')
     const more = list.length > MAX_GAME_VERSIONS ? ` +${list.length - MAX_GAME_VERSIONS}` : ''
     return t('profile.modpack.connect.gameVersions', { versions: `${shown}${more}` })
@@ -50,12 +56,16 @@ export function VersionPicker({
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     const step = stepOf(event.key)
-    if (step === 0) return
+    if (step === 0) {
+      return
+    }
     event.preventDefault()
     const index = Math.max(0, versions.findIndex((version) => version.id === selectedId))
     const nextIndex = (index + step + versions.length) % versions.length
     const next = versions[nextIndex]
-    if (!next) return
+    if (!next) {
+      return
+    }
     onSelect(next.id)
     event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]')[nextIndex]?.focus()
   }

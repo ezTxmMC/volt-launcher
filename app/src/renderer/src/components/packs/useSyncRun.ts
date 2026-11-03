@@ -22,7 +22,9 @@ export function useSyncRun(onFinished?: (job: Job) => void): {
   const current = useRef<string | null>(null)
 
   useJobFinished((job) => {
-    if (job.id !== current.current) return
+    if (job.id !== current.current) {
+      return
+    }
     current.current = null
     setRunning(false)
     setSummary(job.state === 'done' ? summarizeSyncJob(job) : null)

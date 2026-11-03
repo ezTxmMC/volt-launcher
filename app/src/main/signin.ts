@@ -28,7 +28,9 @@ export function parseRedirect(raw: string): Redirect | null {
   } catch {
     return null
   }
-  if (url.origin !== REDIRECT_ORIGIN || url.pathname !== REDIRECT_PATH) return null
+  if (url.origin !== REDIRECT_ORIGIN || url.pathname !== REDIRECT_PATH) {
+    return null
+  }
   return {
     state: url.searchParams.get('state') ?? '',
     code: url.searchParams.get('code') ?? undefined,
@@ -66,7 +68,9 @@ async function completeLogin(backend: BackendManager, login: LoginStart, redirec
     : { state: redirect.state, code: redirect.code }
   try {
     const response = await backend.request('POST', '/api/accounts/callback', body)
-    if (!isJob(response.body)) return { ok: false, message: 'The backend returned no sign-in job.' }
+    if (!isJob(response.body)) {
+      return { ok: false, message: 'The backend returned no sign-in job.' }
+    }
     return { ok: true, job: response.body }
   } catch (error) {
     return { ok: false, message: messageOf(error) }
@@ -85,7 +89,9 @@ let activeWindow: BrowserWindow | null = null
 export async function signInWithMicrosoft(backend: BackendManager, parent: BrowserWindow | null): Promise<SignInEnvelope> {
   if (pending) {
     if (activeWindow && !activeWindow.isDestroyed()) {
-      if (activeWindow.isMinimized()) activeWindow.restore()
+      if (activeWindow.isMinimized()) {
+        activeWindow.restore()
+      }
       activeWindow.focus()
     }
     return { ok: false, message: 'A sign-in is already running.' }
@@ -130,14 +136,18 @@ async function runSignIn(backend: BackendManager, parent: BrowserWindow | null):
     let settled = false
     let redirecting = false
     const settle = (value: SignInEnvelope): void => {
-      if (settled) return
+      if (settled) {
+        return
+      }
       settled = true
       clearTimeout(timer)
       activeWindow = null
       resolve(value)
     }
     const closeWindow = (): void => {
-      if (!window.isDestroyed()) window.close()
+      if (!window.isDestroyed()) {
+        window.close()
+      }
     }
 
     const timer = setTimeout(() => {
@@ -147,9 +157,13 @@ async function runSignIn(backend: BackendManager, parent: BrowserWindow | null):
 
     const onRedirect = (event: Electron.Event, url: string): void => {
       const redirect = parseRedirect(url)
-      if (!redirect) return
+      if (!redirect) {
+        return
+      }
       event.preventDefault()
-      if (redirecting || settled) return
+      if (redirecting || settled) {
+        return
+      }
       redirecting = true
       void completeLogin(backend, login, redirect).then((result) => {
         settle(result)
@@ -161,7 +175,9 @@ async function runSignIn(backend: BackendManager, parent: BrowserWindow | null):
 
     // Microsoft may open a popup; it is loaded into this window instead of a new one.
     window.webContents.setWindowOpenHandler(({ url }) => {
-      if (url.startsWith('https://')) void window.loadURL(url)
+      if (url.startsWith('https://')) {
+        void window.loadURL(url)
+      }
       return { action: 'deny' }
     })
 
@@ -170,7 +186,9 @@ async function runSignIn(backend: BackendManager, parent: BrowserWindow | null):
 
     // The redirect prevented in onRedirect aborts the page load; that is not a failure.
     window.loadURL(login.url).catch((error: unknown) => {
-      if (!redirecting) settle({ ok: false, message: messageOf(error) })
+      if (!redirecting) {
+        settle({ ok: false, message: messageOf(error) })
+      }
     })
   })
 }

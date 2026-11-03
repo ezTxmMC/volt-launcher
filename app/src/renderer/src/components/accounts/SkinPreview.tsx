@@ -82,10 +82,14 @@ export function SkinPreview({
     let cancelled = false
     const loaded = new Image()
     loaded.onload = () => {
-      if (!cancelled) setImage(loaded)
+      if (!cancelled) {
+        setImage(loaded)
+      }
     }
     loaded.onerror = () => {
-      if (!cancelled) setImage(null)
+      if (!cancelled) {
+        setImage(null)
+      }
     }
     loaded.src = src
     return () => {
@@ -95,9 +99,13 @@ export function SkinPreview({
 
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas || !image) return
+    if (!canvas || !image) {
+      return
+    }
     const context = canvas.getContext('2d')
-    if (!context) return
+    if (!context) {
+      return
+    }
     const legacy = image.height === 32
     const { base, overlay } = parts(slim, back, legacy)
     canvas.width = 16 * scale
@@ -121,7 +129,9 @@ export function SkinPreview({
       context.restore()
     }
     base.forEach(draw)
-    if (!legacy) overlay.forEach(draw)
+    if (!legacy) {
+      overlay.forEach(draw)
+    }
   }, [image, slim, back, scale])
 
   return (

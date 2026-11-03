@@ -62,12 +62,16 @@ import type {
 import type { HttpMethod, UpdateAssetKind } from '@shared/bridge'
 
 function bridge() {
-  if (!window.volt) throw new Error('The Electron bridge (window.volt) is not available.')
+  if (!window.volt) {
+    throw new Error('The Electron bridge (window.volt) is not available.')
+  }
   return window.volt
 }
 
 export function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
+  if (error instanceof Error) {
+    return error.message
+  }
   return typeof error === 'string' ? error : 'Unknown error'
 }
 
@@ -87,7 +91,9 @@ async function request<T>(method: HttpMethod, path: string, body?: unknown): Pro
     return result.body
   } catch (error) {
     if (errorMessage(error).includes('sign_in_required')) {
-      for (const listener of signInListeners) listener()
+      for (const listener of signInListeners) {
+        listener()
+      }
     }
     throw error
   }
@@ -96,7 +102,9 @@ async function request<T>(method: HttpMethod, path: string, body?: unknown): Pro
 function query(params: Record<string, string | number | undefined>): string {
   const search = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== '') search.set(key, String(value))
+    if (value !== undefined && value !== '') {
+      search.set(key, String(value))
+    }
   }
   const text = search.toString()
   return text ? `?${text}` : ''

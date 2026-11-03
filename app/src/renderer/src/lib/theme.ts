@@ -5,7 +5,9 @@ const STORAGE_KEY = 'volt.theme'
 export function readCachedTheme(): ThemeSetting {
   try {
     const value = localStorage.getItem(STORAGE_KEY)
-    if (value === 'dark' || value === 'light' || value === 'system') return value
+    if (value === 'dark' || value === 'light' || value === 'system') {
+      return value
+    }
   } catch {
     // storage unavailable
   }
@@ -13,7 +15,9 @@ export function readCachedTheme(): ThemeSetting {
 }
 
 export function resolveTheme(theme: ThemeSetting): 'dark' | 'light' {
-  if (theme !== 'system') return theme
+  if (theme !== 'system') {
+    return theme
+  }
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
 }
 

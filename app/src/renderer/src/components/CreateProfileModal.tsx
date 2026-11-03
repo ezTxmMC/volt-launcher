@@ -59,35 +59,47 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
   const dirty = name !== '' || search !== ''
 
   const goTo = (target: WizardStep): void => {
-    if (busy || target === step) return
+    if (busy || target === step) {
+      return
+    }
     setDirection(target > step ? 1 : -1)
     setStep(target)
     setConfirmDiscard(false)
   }
 
   const next = (): void => {
-    if (step < 3 && canNext) goTo((step + 1) as WizardStep)
+    if (step < 3 && canNext) {
+      goTo((step + 1) as WizardStep)
+    }
   }
 
   const back = (): void => {
-    if (step > 1) goTo((step - 1) as WizardStep)
+    if (step > 1) {
+      goTo((step - 1) as WizardStep)
+    }
   }
 
   // A different loader or version invalidates the loader version picked for the old choice.
   const chooseLoader = (option: Loader): void => {
-    if (option === loader) return
+    if (option === loader) {
+      return
+    }
     setLoader(option)
     setLoaderVersion('')
   }
 
   const chooseVersion = (id: string): void => {
-    if (id === minecraftVersion) return
+    if (id === minecraftVersion) {
+      return
+    }
     setMinecraftVersion(id)
     setLoaderVersion('')
   }
 
   const submit = async (): Promise<void> => {
-    if (!canCreate) return
+    if (!canCreate) {
+      return
+    }
     setBusy(true)
     setCreateError(null)
     try {
@@ -113,28 +125,47 @@ export function CreateProfileModal({ onClose }: { onClose: () => void }) {
 
   // Closing with typed input asks first; the confirmation is shown inside the dialog.
   const requestClose = (): void => {
-    if (busy) return
-    if (dirty) setConfirmDiscard(true)
-    else onClose()
+    if (busy) {
+      return
+    }
+    if (dirty) {
+      setConfirmDiscard(true)
+    } else {
+      onClose()
+    }
   }
 
   const onKeyDown = (event: KeyboardEvent): void => {
-    if (event.isComposing) return
+    if (event.isComposing) {
+      return
+    }
     const target = event.target instanceof Element ? event.target : null
     // An open dropdown list handles its own keys (its Escape closes only the list).
-    if (target?.closest('[role="listbox"]')) return
+    if (target?.closest('[role="listbox"]')) {
+      return
+    }
     if (event.key === 'Escape') {
       // Stops the native <dialog> from closing by itself; the wizard decides.
       event.preventDefault()
-      if (confirmDiscard) setConfirmDiscard(false)
-      else requestClose()
+      if (confirmDiscard) {
+        setConfirmDiscard(false)
+      } else {
+        requestClose()
+      }
       return
     }
-    if (event.key !== 'Enter' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (event.key !== 'Enter' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+      return
+    }
     // Buttons, links and text areas keep their own Enter behaviour.
-    if (confirmDiscard || target?.closest('button, a, textarea, [role="option"]')) return
-    if (step === 3) void submit()
-    else next()
+    if (confirmDiscard || target?.closest('button, a, textarea, [role="option"]')) {
+      return
+    }
+    if (step === 3) {
+      void submit()
+    } else {
+      next()
+    }
   }
 
   // The window listener is registered once and always calls the handler of the latest render.

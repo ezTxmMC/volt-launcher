@@ -15,7 +15,9 @@ export const DEFAULT_LANGUAGE: Language = 'de'
 function readCachedLanguage(): Language {
   try {
     const value = localStorage.getItem(STORAGE_KEY)
-    if (value === 'de' || value === 'en') return value
+    if (value === 'de' || value === 'en') {
+      return value
+    }
   } catch {
     // storage unavailable
   }
@@ -50,7 +52,9 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     const dictionary = DICTIONARIES[language]
     const t: Translate = (key, params) => {
       const template = dictionary[key]
-      if (!params) return template
+      if (!params) {
+        return template
+      }
       return template.replace(/\{(\w+)\}/g, (match, name: string) => String(params[name] ?? match))
     }
     return { language, setLanguage, t }
@@ -61,6 +65,8 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
 export function useI18n(): I18nValue {
   const value = useContext(I18nContext)
-  if (!value) throw new Error('useI18n must be used inside I18nProvider')
+  if (!value) {
+    throw new Error('useI18n must be used inside I18nProvider')
+  }
   return value
 }

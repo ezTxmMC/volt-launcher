@@ -15,7 +15,9 @@ const BINARY = /^volt-backend(\.exe)?$/i
 /** Splits a command line into its first token (the executable) and the rest; the first token may be quoted. */
 function executableOf(commandLine: string): string {
   const trimmed = commandLine.trimStart()
-  if (trimmed.startsWith('"')) return trimmed.slice(1, Math.max(1, trimmed.indexOf('"', 1)))
+  if (trimmed.startsWith('"')) {
+    return trimmed.slice(1, Math.max(1, trimmed.indexOf('"', 1)))
+  }
   // Unix paths may contain spaces: the executable is everything before the first " --" option.
   const cut = trimmed.indexOf(' --')
   return cut < 0 ? trimmed : trimmed.slice(0, cut)
@@ -23,10 +25,14 @@ function executableOf(commandLine: string): string {
 
 /** Whether the command line is a volt-backend started with exactly this data directory. */
 export function isBackendOfDataDir(commandLine: string, dataDir: string): boolean {
-  if (!BINARY.test(basename(executableOf(commandLine)))) return false
+  if (!BINARY.test(basename(executableOf(commandLine)))) {
+    return false
+  }
   const option = `--data-dir ${dataDir}`
   const at = commandLine.indexOf(option)
-  if (at < 0) return false
+  if (at < 0) {
+    return false
+  }
   const next = commandLine.charAt(at + option.length)
   return next === '' || next === ' ' || next === '"'
 }
@@ -49,11 +55,17 @@ function parseLines(output: string, separator: string): BackendProcess[] {
   const out: BackendProcess[] = []
   for (const raw of output.split(/\r?\n/)) {
     const line = raw.trim()
-    if (line === '') continue
+    if (line === '') {
+      continue
+    }
     const cut = line.indexOf(separator)
-    if (cut < 0) continue
+    if (cut < 0) {
+      continue
+    }
     const pid = Number.parseInt(line.slice(0, cut), 10)
-    if (Number.isInteger(pid) && pid > 0) out.push({ pid, commandLine: line.slice(cut + 1).trim() })
+    if (Number.isInteger(pid) && pid > 0) {
+      out.push({ pid, commandLine: line.slice(cut + 1).trim() })
+    }
   }
   return out
 }
@@ -94,15 +106,21 @@ export async function killStaleBackends(dataDir: string, keep: ReadonlyArray<num
     }
   }
   const deadline = Date.now() + 3000
-  while (stale.some((entry) => alive(entry.pid)) && Date.now() < deadline) await sleep(100)
+  while (stale.some((entry) => alive(entry.pid)) && Date.now() < deadline) {
+    await sleep(100)
+  }
   for (const entry of stale) {
-    if (!alive(entry.pid)) continue
+    if (!alive(entry.pid)) {
+      continue
+    }
     try {
       process.kill(entry.pid, 'SIGKILL')
     } catch {
       // gone in the meantime
     }
   }
-  if (stale.length > 0) await sleep(150)
+  if (stale.length > 0) {
+    await sleep(150)
+  }
   return stale.length
 }

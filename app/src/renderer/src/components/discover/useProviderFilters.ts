@@ -64,13 +64,17 @@ export function useProviderFilters(
   const key = providerId && kind ? `${providerId}|${kind}` : ''
 
   const load = useCallback(async (): Promise<FiltersLoad> => {
-    if (!providerId || !kind) return { key: '' }
+    if (!providerId || !kind) {
+      return { key: '' }
+    }
     let raw: ProviderFilters
     try {
       raw = await api.providers.filters(providerId, kind)
     } catch (error) {
       const message = errorMessage(error)
-      if (!isMissingEndpoint(message)) return { key, error: message }
+      if (!isMissingEndpoint(message)) {
+        return { key, error: message }
+      }
       return { key, filters: await legacyFilters(providerId, kind, providerSorts) }
     }
     return { key, filters: fromBackend(raw) }

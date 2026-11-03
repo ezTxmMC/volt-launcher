@@ -47,8 +47,11 @@ export function ImportProfilesDialog({
     const id = itemId({ launcher: launcherId, key: profile.key })
     setSelected((current) => {
       const next = new Set(current)
-      if (checked) next.add(id)
-      else next.delete(id)
+      if (checked) {
+        next.add(id)
+      } else {
+        next.delete(id)
+      }
       return next
     })
   }
@@ -57,7 +60,9 @@ export function ImportProfilesDialog({
   const selectNone = (): void => setSelected(new Set())
 
   const start = async (): Promise<void> => {
-    if (busy || picked.length === 0) return
+    if (busy || picked.length === 0) {
+      return
+    }
     setBusy(true)
     setSubmitError(null)
     try {

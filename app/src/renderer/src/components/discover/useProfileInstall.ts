@@ -39,9 +39,13 @@ export function useProfileInstall(
   const profileId = profile?.id
 
   const load = useCallback(async (): Promise<ModFile[]> => {
-    if (!profileId) return []
+    if (!profileId) {
+      return []
+    }
     const lists = await Promise.all(LISTED.map((type) => api.content.list(profileId, type)))
-    if (world) lists.push(await api.content.list(profileId, 'datapacks', world))
+    if (world) {
+      lists.push(await api.content.list(profileId, 'datapacks', world))
+    }
     return lists.flat()
   }, [profileId, world])
   const { data, error, reload } = useAsync(load)
@@ -50,7 +54,9 @@ export function useProfileInstall(
 
   useJobFinished((job) => {
     const hit = [...pending.entries()].find(([, jobId]) => jobId === job.id)
-    if (!hit) return
+    if (!hit) {
+      return
+    }
     setPending((current) => {
       const next = new Map(current)
       next.delete(hit[0])
@@ -61,18 +67,26 @@ export function useProfileInstall(
 
   const installed = useMemo(() => {
     const keys = new Set<string>()
-    for (const file of data ?? []) if (file.source) keys.add(keyOf(file.source.provider, file.source.projectId))
+    for (const file of data ?? []) {
+      if (file.source) {
+        keys.add(keyOf(file.source.provider, file.source.projectId))
+      }
+    }
     return keys
   }, [data])
 
   const stateOf = (project: ProjectSummary): InstallState => {
     const key = keyOf(project.provider, project.id)
-    if (pending.has(key)) return 'installing'
+    if (pending.has(key)) {
+      return 'installing'
+    }
     return installed.has(key) ? 'installed' : 'idle'
   }
 
   const install = async (project: ProjectSummary): Promise<void> => {
-    if (!profile || !CONTENT_TYPE_OF[project.kind]) return
+    if (!profile || !CONTENT_TYPE_OF[project.kind]) {
+      return
+    }
     const key = keyOf(project.provider, project.id)
     setPending((current) => new Map(current).set(key, ''))
     try {

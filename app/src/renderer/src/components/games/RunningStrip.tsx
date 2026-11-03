@@ -7,7 +7,9 @@ import { StopAllButton } from './StopAllButton'
 export function RunningStrip() {
   const { t } = useI18n()
   const { entries } = useGames()
-  if (entries.length === 0) return null
+  if (entries.length === 0) {
+    return null
+  }
   const hasRunning = entries.some((entry) => entry.state !== 'launching')
   return (
     <section aria-label={t('games.strip')} className="grid gap-1 rounded-xl border border-success/25 bg-success-soft px-3 py-2.5">

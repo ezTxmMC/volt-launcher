@@ -35,7 +35,9 @@ const DISCOVER_KIND: Record<ContentType, string> = {
 
 /** The folder of a content type, as the user sees it in the game directory. */
 function folderOf(profile: Profile, type: ContentType, world?: string): string {
-  if (type === 'datapacks') return `${profile.gameDir}/saves/${world ?? ''}/datapacks`
+  if (type === 'datapacks') {
+    return `${profile.gameDir}/saves/${world ?? ''}/datapacks`
+  }
   return `${profile.gameDir}/${type}`
 }
 
@@ -74,8 +76,11 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
     reload()
     reloadWarnings()
     if (jobIds.includes(job.id)) {
-      if (job.state === 'failed') toast.error(job.error ?? job.title)
-      else if (job.state === 'done') toast.success(t('job.finished', { title: job.title }))
+      if (job.state === 'failed') {
+        toast.error(job.error ?? job.title)
+      } else if (job.state === 'done') {
+        toast.success(t('job.finished', { title: job.title }))
+      }
     }
   })
 
@@ -88,7 +93,9 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
   )
   const visible = useMemo(() => {
     const needle = filter.trim().toLowerCase()
-    if (!needle) return sorted
+    if (!needle) {
+      return sorted
+    }
     return sorted.filter((file) => `${displayName(file)} ${file.fileName}`.toLowerCase().includes(needle))
   }, [sorted, filter])
   const updateCount = sorted.filter((file) => file.update !== null).length
@@ -141,7 +148,9 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
     try {
       const result = await api.content.toggleAll(profile.id, type, enabled, world)
       toast.success(t('content.toggleAllDone', { changed: result.changed }))
-      if (result.skipped.length > 0) toast.error(t('content.toggleAllSkipped', { count: result.skipped.length }))
+      if (result.skipped.length > 0) {
+        toast.error(t('content.toggleAllSkipped', { count: result.skipped.length }))
+      }
       reload()
       reloadWarnings()
     } catch (error) {
@@ -153,7 +162,9 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
 
   const openFolder = async (): Promise<void> => {
     const problem = await window.volt?.openPath(folderOf(profile, type, world))
-    if (problem) toast.error(problem)
+    if (problem) {
+      toast.error(problem)
+    }
   }
 
   const needsWorld = type === 'datapacks' && !world
@@ -326,7 +337,9 @@ export function ContentPanel({ profile, type, world }: { profile: Profile; type:
 /** The pack entry a file stands for, or null when its source is unknown or not one packs can use. */
 function packEntryOf(file: ModFile, kind: SyncPackEntry['kind']): SyncPackEntry | null {
   const source = file.source
-  if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge')) return null
+  if (!source || (source.provider !== 'modrinth' && source.provider !== 'curseforge')) {
+    return null
+  }
   return { provider: source.provider, projectId: source.projectId, kind, name: displayName(file), iconUrl: null }
 }
 

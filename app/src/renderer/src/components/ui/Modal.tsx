@@ -27,8 +27,12 @@ export function Modal({
 
   useEffect(() => {
     const dialog = ref.current
-    if (!dialog) return
-    if (!dialog.open) dialog.showModal()
+    if (!dialog) {
+      return
+    }
+    if (!dialog.open) {
+      dialog.showModal()
+    }
     // showModal() would focus the close button; prefer the first form control instead.
     dialog.querySelector<HTMLElement>('input, select, textarea')?.focus()
   }, [])
@@ -42,7 +46,9 @@ export function Modal({
         close()
       }}
       onClick={(event) => {
-        if (event.target === ref.current) close()
+        if (event.target === ref.current) {
+          close()
+        }
       }}
       className="volt-dialog m-auto w-[calc(100%-2rem)] rounded-[14px] border border-[var(--accent-border)] bg-surface-strong p-0 text-fg shadow-pop backdrop-blur-xl"
       style={{ maxWidth: wide ? '44rem' : '480px' }}

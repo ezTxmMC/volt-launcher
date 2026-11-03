@@ -23,7 +23,9 @@ export function autoVersionsOrDefault(value: unknown): SyncPackAutoVersions {
 
 /** Keeps only non-empty strings (pack ids). */
 export function packIdsOrEmpty(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
+  if (!Array.isArray(value)) {
+    return []
+  }
   return value.filter((id): id is string => typeof id === 'string' && id !== '')
 }
 

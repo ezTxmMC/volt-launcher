@@ -37,17 +37,27 @@ export function TextInput({ className = 'w-full', ...rest }: InputHTMLAttributes
 
 /** Plain text of option children, including arrays and fragments. */
 function textOf(node: ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') return String(node)
-  if (Array.isArray(node)) return node.map(textOf).join('')
-  if (isValidElement<{ children?: ReactNode }>(node)) return textOf(node.props.children)
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node)
+  }
+  if (Array.isArray(node)) {
+    return node.map(textOf).join('')
+  }
+  if (isValidElement<{ children?: ReactNode }>(node)) {
+    return textOf(node.props.children)
+  }
   return ''
 }
 
 /** Turns <option> children (the native API the call sites use) into the options of the custom Select. */
 function optionsFrom(children: ReactNode): SelectOption<string>[] {
   return Children.toArray(children).flatMap((child) => {
-    if (!isValidElement<ComponentProps<'option'>>(child)) return []
-    if (child.type === Fragment) return optionsFrom(child.props.children)
+    if (!isValidElement<ComponentProps<'option'>>(child)) {
+      return []
+    }
+    if (child.type === Fragment) {
+      return optionsFrom(child.props.children)
+    }
     const label = textOf(child.props.children)
     const value = child.props.value !== undefined ? String(child.props.value) : label
     return [{ value, label, disabled: child.props.disabled }]

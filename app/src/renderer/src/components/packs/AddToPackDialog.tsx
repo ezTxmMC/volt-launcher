@@ -38,7 +38,9 @@ export function AddToPackDialog({ entry, onClose }: { entry: SyncPackEntry; onCl
   const canSave = data !== undefined && !saving && !already && nameProblem === null
 
   const save = async (): Promise<void> => {
-    if (!canSave) return
+    if (!canSave) {
+      return
+    }
     setSaving(true)
     setFailure(null)
     try {
@@ -113,8 +115,14 @@ export function AddToPackDialog({ entry, onClose }: { entry: SyncPackEntry; onCl
 
 /** The pack kind a content type maps to; data packs are not part of packs. */
 export function packKindOf(type: 'mods' | 'resourcepacks' | 'shaderpacks' | 'datapacks'): SyncPackKind | null {
-  if (type === 'mods') return 'mod'
-  if (type === 'resourcepacks') return 'resourcepack'
-  if (type === 'shaderpacks') return 'shader'
+  if (type === 'mods') {
+    return 'mod'
+  }
+  if (type === 'resourcepacks') {
+    return 'resourcepack'
+  }
+  if (type === 'shaderpacks') {
+    return 'shader'
+  }
   return null
 }

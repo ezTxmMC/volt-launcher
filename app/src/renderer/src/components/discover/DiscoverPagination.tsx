@@ -13,7 +13,9 @@ export function pageEntries(page: number, pages: number): Array<number | 'gap'> 
   const entries: Array<number | 'gap'> = []
   wanted.forEach((candidate, index) => {
     const previous = wanted[index - 1]
-    if (previous !== undefined && candidate - previous > 1) entries.push('gap')
+    if (previous !== undefined && candidate - previous > 1) {
+      entries.push('gap')
+    }
     entries.push(candidate)
   })
   return entries

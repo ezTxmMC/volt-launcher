@@ -52,7 +52,9 @@ function errorMessageOf(body: unknown, fallback: string): string {
     const error = (body as { error: unknown }).error
     if (typeof error === 'object' && error !== null && 'message' in error) {
       const message = (error as { message: unknown }).message
-      if (typeof message === 'string' && message.length > 0) return message
+      if (typeof message === 'string' && message.length > 0) {
+        return message
+      }
     }
   }
   return fallback
@@ -90,7 +92,9 @@ export class BackendManager {
 
   private setStatus(status: BackendStatus): void {
     this.status = status
-    for (const listener of this.listeners) listener(status)
+    for (const listener of this.listeners) {
+      listener(status)
+    }
   }
 
   private fail(message: string): void {
@@ -120,8 +124,12 @@ export class BackendManager {
       mkdirSync(dataDir, { recursive: true })
       // A backend left over from an earlier run (crash, update) would write the same data directory.
       const ended = await killStaleBackends(dataDir, [this.child?.pid])
-      if (ended > 0) this.appendLog(Buffer.from(`[launcher] ended ${ended} stale backend process(es)\n`))
-      if (generation !== this.generation) return
+      if (ended > 0) {
+        this.appendLog(Buffer.from(`[launcher] ended ${ended} stale backend process(es)\n`))
+      }
+      if (generation !== this.generation) {
+        return
+      }
 
       const child = spawn(
         binary,
@@ -135,16 +143,24 @@ export class BackendManager {
       child.stdout?.on('data', (chunk: Buffer) => this.appendLog(chunk))
       child.stderr?.on('data', (chunk: Buffer) => this.appendLog(chunk))
       child.on('error', (error) => {
-        if (generation === this.generation) this.fail(`Could not start the backend: ${error.message}`)
+        if (generation === this.generation) {
+          this.fail(`Could not start the backend: ${error.message}`)
+        }
       })
       child.on('exit', (code, signal) => {
-        if (this.child === child) this.child = null
-        if (generation !== this.generation || this.stopping) return
+        if (this.child === child) {
+          this.child = null
+        }
+        if (generation !== this.generation || this.stopping) {
+          return
+        }
         this.fail(`The backend exited unexpectedly (${signal ?? `exit code ${code ?? '?'}`}).`)
       })
 
       const healthy = await this.waitUntilHealthy(generation)
-      if (generation !== this.generation) return
+      if (generation !== this.generation) {
+        return
+      }
       if (healthy) {
         this.setStatus({ state: 'ready', message: null, log: null })
       } else if (this.status.state !== 'error') {
@@ -152,20 +168,26 @@ export class BackendManager {
         this.fail(`The backend did not answer within ${STARTUP_TIMEOUT_MS / 1000} seconds.`)
       }
     } catch (error) {
-      if (generation === this.generation) this.fail(error instanceof Error ? error.message : String(error))
+      if (generation === this.generation) {
+        this.fail(error instanceof Error ? error.message : String(error))
+      }
     }
   }
 
   private async waitUntilHealthy(generation: number): Promise<boolean> {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS
     while (Date.now() < deadline) {
-      if (generation !== this.generation || this.child === null || this.status.state === 'error') return false
+      if (generation !== this.generation || this.child === null || this.status.state === 'error') {
+        return false
+      }
       try {
         const response = await fetch(`http://127.0.0.1:${this.port}/api/health`, {
           headers: { 'X-Volt-Token': this.token },
           signal: AbortSignal.timeout(1_000)
         })
-        if (response.ok) return true
+        if (response.ok) {
+          return true
+        }
       } catch {
         // not listening yet
       }
@@ -178,11 +200,15 @@ export class BackendManager {
   killNow(): void {
     this.stopping = true
     const child = this.child
-    if (child === null || child.exitCode !== null) return
+    if (child === null || child.exitCode !== null) {
+      return
+    }
     child.kill('SIGTERM')
     // Last resort so a hung backend never outlives the launcher.
     process.once('exit', () => {
-      if (child.exitCode === null) child.kill('SIGKILL')
+      if (child.exitCode === null) {
+        child.kill('SIGKILL')
+      }
     })
   }
 
@@ -196,11 +222,15 @@ export class BackendManager {
     // A pending start() or health wait gives up (its generation is no longer current).
     this.generation++
     const child = this.child
-    if (child === null || child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+    if (child === null || child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve()
+    }
     return new Promise<void>((resolve) => {
       let finished = false
       const done = (): void => {
-        if (finished) return
+        if (finished) {
+          return
+        }
         finished = true
         clearTimeout(timer)
         resolve()
@@ -208,7 +238,9 @@ export class BackendManager {
       child.once('exit', done)
       child.kill('SIGTERM')
       const timer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL')
+        }
         // The kill cannot be refused for our own child; do not wait forever for the exit event anyway.
         setTimeout(done, 1500)
       }, graceMs)
@@ -222,7 +254,9 @@ export class BackendManager {
   }
 
   async request(method: HttpMethod, path: string, body: unknown): Promise<ApiResult> {
-    if (this.status.state !== 'ready') throw new ApiRequestError('The backend is not running.', 0)
+    if (this.status.state !== 'ready') {
+      throw new ApiRequestError('The backend is not running.', 0)
+    }
     const hasBody = body !== undefined && body !== null && method !== 'GET'
     let response: Response
     try {

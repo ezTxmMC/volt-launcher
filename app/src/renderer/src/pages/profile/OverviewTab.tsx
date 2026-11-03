@@ -33,7 +33,9 @@ function DuplicateModal({ profile, onClose, onStarted }: { profile: Profile; onC
   const [busy, setBusy] = useState(false)
 
   const submit = async (): Promise<void> => {
-    if (busy || name.trim() === '') return
+    if (busy || name.trim() === '') {
+      return
+    }
     setBusy(true)
     try {
       const job = await api.profiles.duplicate(profile.id, name.trim())
@@ -88,7 +90,9 @@ export function OverviewTab({ profile }: { profile: Profile; onChanged: () => vo
 
   // The copy is opened when its job succeeds; a failed copy shows its error.
   useJobFinished((job) => {
-    if (job.id !== copyJobId) return
+    if (job.id !== copyJobId) {
+      return
+    }
     setCopyJobId(null)
     if (job.state === 'done' && typeof job.result?.profileId === 'string') {
       toast.success(t('profile.duplicate.done', { name: String(job.result.name ?? '') }))
@@ -100,7 +104,9 @@ export function OverviewTab({ profile }: { profile: Profile; onChanged: () => vo
 
   const openFolder = async (): Promise<void> => {
     const problem = await window.volt?.openPath(profile.gameDir)
-    if (problem) toast.error(problem)
+    if (problem) {
+      toast.error(problem)
+    }
   }
 
   return (

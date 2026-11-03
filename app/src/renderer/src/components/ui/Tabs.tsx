@@ -36,7 +36,9 @@ export function Tabs<T extends string>({
   // Measure the active tab after layout, and again whenever the list or a tab changes size.
   useLayoutEffect(() => {
     const list = listRef.current
-    if (!list) return
+    if (!list) {
+      return
+    }
     const measure = (): void => {
       const active = list.querySelector<HTMLElement>('[aria-selected="true"]')
       if (!active) {

@@ -48,7 +48,9 @@ export function PacksPage() {
 
   // A finished link or sync changes the linked profiles of the packs.
   useJobFinished((job) => {
-    if (job.kind === 'syncpack') reload()
+    if (job.kind === 'syncpack') {
+      reload()
+    }
   })
 
   const packs = useMemo(() => data?.packs ?? [], [data])

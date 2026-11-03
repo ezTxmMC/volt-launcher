@@ -60,7 +60,9 @@ export function PackProfilesTab({ pack, onChanged }: { pack: SyncPack; onChanged
   }
   // A finished pack job changes what the profiles hold; the page reloads the pack itself.
   useJobFinished((job) => {
-    if (job.kind === 'syncpack') profiles.reload()
+    if (job.kind === 'syncpack') {
+      profiles.reload()
+    }
   })
 
   const run = useSyncRun()
@@ -87,7 +89,9 @@ export function PackProfilesTab({ pack, onChanged }: { pack: SyncPack; onChanged
 
   const linkPicked = async (): Promise<void> => {
     const ids = picked.filter((id) => unlinked.some((profile) => profile.id === id))
-    if (ids.length === 0 || blocked) return
+    if (ids.length === 0 || blocked) {
+      return
+    }
     setLinkResult(null)
     setLinking({ done: 0, total: ids.length })
     try {

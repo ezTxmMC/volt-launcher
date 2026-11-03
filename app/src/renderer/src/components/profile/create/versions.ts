@@ -13,8 +13,12 @@ export function includeSnapshotsFor(filter: VersionFilter): boolean {
 }
 
 export function matchesFilter(version: GameVersion, filter: VersionFilter): boolean {
-  if (filter === 'releases') return version.type === 'release'
-  if (filter === 'snapshots') return version.type !== 'release'
+  if (filter === 'releases') {
+    return version.type === 'release'
+  }
+  if (filter === 'snapshots') {
+    return version.type !== 'release'
+  }
   return true
 }
 
@@ -26,7 +30,9 @@ export function matchesText(version: GameVersion, query: string): boolean {
 /** The minor line of a version: "1.21" and "1.21.4" are both in line "1.21"; other ids (snapshots) are their own line. */
 export function lineKeyOf(id: string): string {
   const parts = id.split('.')
-  if (parts.length >= 2 && parts.every((part) => /^\d+$/.test(part))) return `${parts[0]}.${parts[1]}`
+  if (parts.length >= 2 && parts.every((part) => /^\d+$/.test(part))) {
+    return `${parts[0]}.${parts[1]}`
+  }
   return id
 }
 
@@ -43,16 +49,32 @@ export function categoryOf(key: string, type: string): VersionCategory {
   if (parts.length === 2 && parts.every((part) => /^\d+$/.test(part))) {
     const major = Number(parts[0])
     const minor = Number(parts[1])
-    if (major >= 26) return 'year'
-    if (major === 1 && minor >= 21) return 'v1_21'
-    if (major === 1 && minor === 20) return 'v1_20'
-    if (major === 1 && minor === 19) return 'v1_19'
-    if (major === 1 && minor === 18) return 'v1_18'
-    if (major === 1 && minor === 17) return 'v1_17'
-    if (major === 1 && minor === 16) return 'v1_16'
+    if (major >= 26) {
+      return 'year'
+    }
+    if (major === 1 && minor >= 21) {
+      return 'v1_21'
+    }
+    if (major === 1 && minor === 20) {
+      return 'v1_20'
+    }
+    if (major === 1 && minor === 19) {
+      return 'v1_19'
+    }
+    if (major === 1 && minor === 18) {
+      return 'v1_18'
+    }
+    if (major === 1 && minor === 17) {
+      return 'v1_17'
+    }
+    if (major === 1 && minor === 16) {
+      return 'v1_16'
+    }
     return 'older'
   }
-  if (type === 'release' || type.startsWith('old_')) return 'older'
+  if (type === 'release' || type.startsWith('old_')) {
+    return 'older'
+  }
   return 'snapshot'
 }
 
@@ -74,13 +96,18 @@ export function groupLines(versions: readonly GameVersion[]): VersionLine[] {
   for (const version of versions) {
     const key = lineKeyOf(version.id)
     const members = groups.get(key)
-    if (members) members.push(version)
-    else groups.set(key, [version])
+    if (members) {
+      members.push(version)
+    } else {
+      groups.set(key, [version])
+    }
   }
   const lines: VersionLine[] = []
   for (const [key, members] of groups) {
     const primary = members.find((member) => member.id === key) ?? members[0]
-    if (!primary) continue
+    if (!primary) {
+      continue
+    }
     lines.push({
       key,
       category: categoryOf(key, primary.type),

@@ -48,7 +48,9 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
   const { reload: reloadLinked } = linked
   const { reload: reloadAll } = all
   useJobFinished((job) => {
-    if (job.kind !== 'syncpack') return
+    if (job.kind !== 'syncpack') {
+      return
+    }
     reloadLinked()
     reloadAll()
   })
@@ -63,7 +65,9 @@ export function ProfileSyncPacks({ profile }: { profile: Profile }) {
   const chosen = available.some((pack) => pack.id === picked) ? picked : (available[0]?.id ?? '')
 
   const link = async (packId: string, retry: boolean): Promise<void> => {
-    if (packId === '' || blocked) return
+    if (packId === '' || blocked) {
+      return
+    }
     await run.start(() => api.profiles.syncPacks.link(profile.id, packId, retry))
     setPicked('')
   }

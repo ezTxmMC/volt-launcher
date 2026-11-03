@@ -70,7 +70,9 @@ function ProjectTags({ project, limit }: { project: ProjectSummary; limit: numbe
 export function QuickAddButton({ project, className = '' }: { project: ProjectSummary; className?: string }) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
-  if (project.kind === 'modpack') return null
+  if (project.kind === 'modpack') {
+    return null
+  }
   return (
     <>
       <button

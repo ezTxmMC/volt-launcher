@@ -60,7 +60,9 @@ export function ProgressBar({
       )}
     </div>
   )
-  if (!showPercent && !caption) return <div className={className}>{bar}</div>
+  if (!showPercent && !caption) {
+    return <div className={className}>{bar}</div>
+  }
   return (
     <div className={`flex min-w-0 flex-col gap-1 ${className}`}>
       <div className="flex items-center gap-2">

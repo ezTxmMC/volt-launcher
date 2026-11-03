@@ -45,11 +45,15 @@ export function PackPicker({ onPick }: { onPick: (pack: ProjectSummary) => void 
     let cancelled = false
     api.providers.search(provider, { q: term, kind: 'modpack', offset: 0, limit }).then(
       (result) => {
-        if (cancelled) return
+        if (cancelled) {
+          return
+        }
         setSearch({ key: requestKey, items: result.items, hasMore: result.hasMore ?? result.items.length >= limit, error: null })
       },
       (error: unknown) => {
-        if (!cancelled) setSearch({ key: requestKey, items: [], hasMore: false, error: errorMessage(error) })
+        if (!cancelled) {
+          setSearch({ key: requestKey, items: [], hasMore: false, error: errorMessage(error) })
+        }
       }
     )
     return () => {
@@ -70,12 +74,16 @@ export function PackPicker({ onPick }: { onPick: (pack: ProjectSummary) => void 
 
   const onProviderKey = (event: KeyboardEvent<HTMLDivElement>): void => {
     const step = stepOf(event.key)
-    if (step === 0) return
+    if (step === 0) {
+      return
+    }
     event.preventDefault()
     const index = PROVIDER_ORDER.indexOf(provider)
     const nextIndex = (index + step + PROVIDER_ORDER.length) % PROVIDER_ORDER.length
     const next = PROVIDER_ORDER[nextIndex]
-    if (!next) return
+    if (!next) {
+      return
+    }
     chooseProvider(next)
     event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]')[nextIndex]?.focus()
   }

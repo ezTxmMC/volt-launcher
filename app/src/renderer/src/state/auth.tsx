@@ -46,7 +46,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(
     () =>
       onSignInRequired(() => {
-        if (!refreshing.current) void refresh()
+        if (!refreshing.current) {
+          void refresh()
+        }
       }),
     [refresh]
   )
@@ -60,7 +62,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   if (view === null) {
-    if (loadError) return <AccountLoadErrorScreen message={loadError} onRetry={() => void refresh()} />
+    if (loadError) {
+      return <AccountLoadErrorScreen message={loadError} onRetry={() => void refresh()} />
+    }
     return <StartingScreen />
   }
 
@@ -69,6 +73,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 export function useAuth(): AuthValue {
   const value = useContext(AuthContext)
-  if (!value) throw new Error('useAuth must be used inside AuthProvider')
+  if (!value) {
+    throw new Error('useAuth must be used inside AuthProvider')
+  }
   return value
 }

@@ -15,14 +15,20 @@ export function BackendProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const bridge = window.volt
-    if (!bridge) return
+    if (!bridge) {
+      return
+    }
     let active = true
     const unsubscribe = bridge.onBackendStatus((next) => {
-      if (active) setStatus(next)
+      if (active) {
+        setStatus(next)
+      }
     })
     // Fetch after subscribing so no change between the two is lost.
     void bridge.backendStatus().then((current) => {
-      if (active) setStatus(current)
+      if (active) {
+        setStatus(current)
+      }
     })
     return () => {
       active = false

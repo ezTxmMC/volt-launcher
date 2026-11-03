@@ -26,8 +26,12 @@ import { SavesPage } from '@/pages/saves/SavesPage'
 /** Shows the splash or error screen until the backend answers; renders children once it is ready. */
 function BackendGate({ children }: { children: ReactNode }) {
   const status = useBackendStatus()
-  if (status.state === 'error') return <BackendErrorScreen status={status} />
-  if (status.state === 'starting') return <StartingScreen />
+  if (status.state === 'error') {
+    return <BackendErrorScreen status={status} />
+  }
+  if (status.state === 'starting') {
+    return <StartingScreen />
+  }
   return <>{children}</>
 }
 
